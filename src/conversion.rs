@@ -153,7 +153,7 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<String
         if !entity.ends_with('s') && params.len() == 1 && params.contains_key("id") {
             let pk_query = format!(
                 "  {}_by_pk(id: {}) {}",
-                entity,
+                entity_cap,
                 params.get("id").unwrap(),
                 selection
             );
@@ -465,7 +465,7 @@ fn sanitize_selection_set(input: &str) -> String {
 fn sanitize_fragment_arguments(fragment_text: &str) -> String {
     // Only sanitize the selection body after the fragment header
     // Find the first '{' and its matching '}' and strip args in between
-    let mut chars: Vec<char> = fragment_text.chars().collect();
+    let chars: Vec<char> = fragment_text.chars().collect();
     let Some(open_idx) = chars.iter().position(|c| *c == '{') else {
         return fragment_text.to_string();
     };
@@ -1318,7 +1318,7 @@ mod tests {
         let payload = create_test_payload("query { stream(id: \"123\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  stream_by_pk(id: \"123\") {\n    id name\n  }\n}"
+            "query": "query {\n  Stream_by_pk(id: \"123\") {\n    id name\n  }\n}"
         });
         assert_eq!(result, expected);
     }
@@ -1713,7 +1713,7 @@ mod tests {
         let payload = create_test_payload("query { stream(id: \"123\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let expected = json!({
-            "query": "query {\n  stream_by_pk(id: \"123\") {\n    id name\n  }\n}"
+            "query": "query {\n  Stream_by_pk(id: \"123\") {\n    id name\n  }\n}"
         });
         assert_eq!(result, expected);
     }
@@ -2360,6 +2360,145 @@ mod tests {
             "Should NOT have id wrapper for regular field 'token', got: {}",
             converted_query
         );
+    }
+
+    // Tests for capitalization of _by_pk queries
+    #[test]
+    fn test_single_entity_by_pk_capitalization() {
+        // Test that single entity queries use capitalized entity name for _by_pk
+        // Bug: pair(id: "0") was converting to pair_by_pk instead of Pair_by_pk
+        let payload = create_test_payload("query Pair { pair(id: \"0\") { id feed } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted_query = result["query"].as_str().unwrap();
+        println!("Converted query: {}", converted_query);
+        
+        // Should use capitalized entity name: Pair_by_pk not pair_by_pk
+        assert!(
+            converted_query.contains("Pair_by_pk(id: \"0\")"),
+            "Expected Pair_by_pk (capitalized) in converted query, got: {}",
+            converted_query
+        );
+        
+        // Should NOT contain lowercase version
+        assert!(
+            !converted_query.contains("pair_by_pk"),
+            "Should NOT contain lowercase pair_by_pk in converted query, got: {}",
+            converted_query
+        );
+    }
+
+    #[test]
+    fn test_single_entity_by_pk_capitalization_stream() {
+        // Test with stream entity
+        let payload = create_test_payload("query { stream(id: \"123\") { id name } }");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        let converted_query = result["query"].as_str().unwrap();
+        
+        // Should use capitalized entity name: Stream_by_pk not stream_by_pk
+        assert!(
+            converted_query.contains("Stream_by_pk(id: \"123\")"),
+            "Expected Stream_by_pk (capitalized) in converted query, got: {}",
+            converted_query
+        );
+        
+        // Should NOT contain lowercase version
+        assert!(
+            !converted_query.contains("stream_by_pk"),
+            "Should NOT contain lowercase stream_by_pk in converted query, got: {}",
+            converted_query
+        );
+    }
+
+    #[test]
+    fn test_single_entity_by_pk_capitalization_user() {
+        // Test with user entity (ends with 'r' not 's')
+        let payload = create_test_payload("query { user(id: \"0x123\") { id address } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted_query = result["query"].as_str().unwrap();
+        
+        // Should use capitalized entity name: User_by_pk not user_by_pk
+        assert!(
+            converted_query.contains("User_by_pk(id: \"0x123\")"),
+            "Expected User_by_pk (capitalized) in converted query, got: {}",
+            converted_query
+        );
+        
+        // Should NOT contain lowercase version
+        assert!(
+            !converted_query.contains("user_by_pk"),
+            "Should NOT contain lowercase user_by_pk in converted query, got: {}",
+            converted_query
+        );
+    }
+
+    #[test]
+    fn test_single_entity_by_pk_capitalization_batch() {
+        // Test with batch entity (ends with 'ch')
+        let payload = create_test_payload("query { batch(id: \"456\") { id label } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted_query = result["query"].as_str().unwrap();
+        
+        // Should use capitalized entity name: Batch_by_pk not batch_by_pk
+        assert!(
+            converted_query.contains("Batch_by_pk(id: \"456\")"),
+            "Expected Batch_by_pk (capitalized) in converted query, got: {}",
+            converted_query
+        );
+        
+        // Should NOT contain lowercase version
+        assert!(
+            !converted_query.contains("batch_by_pk"),
+            "Should NOT contain lowercase batch_by_pk in converted query, got: {}",
+            converted_query
+        );
+    }
+
+    #[test]
+    fn test_collection_query_maintains_capitalization() {
+        // Verify that collection queries (plural) still use capitalized entity names
+        let payload = create_test_payload("query { pairs(first: 10) { id feed } }");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        let converted_query = result["query"].as_str().unwrap();
+        
+        // Should use capitalized singular entity name for collection: Pair not pair
+        assert!(
+            converted_query.contains("Pair("),
+            "Expected Pair( (capitalized) in converted query, got: {}",
+            converted_query
+        );
+    }
+
+    #[test]
+    fn test_user_reported_bug_pair_by_pk() {
+        // This test reproduces the exact bug reported by the user:
+        // Original query: query Pair { pair(id: "0") { id feed } }
+        // Was converting to: pair_by_pk(id: "0") { id feed }
+        // Should convert to: Pair_by_pk(id: "0") { id feed }
+        //
+        // The error was: "field 'pair_by_pk' not found in type: 'query_root'"
+        // Because the schema expects Pair_by_pk (capitalized)
+        let payload = create_test_payload("query Pair { pair(id: \"0\") { id feed } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted_query = result["query"].as_str().unwrap();
+        println!("User reported bug - converted query: {}", converted_query);
+        
+        // Should use capitalized entity name: Pair_by_pk not pair_by_pk
+        assert!(
+            converted_query.contains("Pair_by_pk(id: \"0\")"),
+            "Expected Pair_by_pk (capitalized) in converted query, got: {}",
+            converted_query
+        );
+        
+        // Should NOT contain the buggy lowercase version
+        assert!(
+            !converted_query.contains("pair_by_pk"),
+            "Should NOT contain lowercase pair_by_pk in converted query, got: {}",
+            converted_query
+        );
+        
+        // Verify the full structure
+        assert!(converted_query.contains("id"));
+        assert!(converted_query.contains("feed"));
     }
 
 }
