@@ -30,9 +30,17 @@ pub fn convert_subgraph_to_hyperindex(
     // Parse the GraphQL query (simplified parsing for now)
     let converted_query = convert_query_structure(query, chain_id)?;
 
-    Ok(serde_json::json!({
+    // Build the result with query and optionally variables
+    let mut result = serde_json::json!({
         "query": converted_query
-    }))
+    });
+
+    // Extract and pass through variables if present
+    if let Some(variables) = payload.get("variables") {
+        result["variables"] = variables.clone();
+    }
+
+    Ok(result)
 }
 
 fn convert_query_structure(query: &str, chain_id: Option<&str>) -> Result<String, ConversionError> {
@@ -115,39 +123,36 @@ fn extract_fragments_and_main_query(query: &str) -> Result<(String, String), Con
 }
 
 fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<String, ConversionError> {
-    // Strip the outer query { } wrapper if present, including named operations like `query Name { ... }`
-    let stripped_owned;
-    let stripped_query = if main_query.trim().starts_with("query") {
+    // Extract query header (name and variable definitions) and body separately
+    let (query_header, stripped_query) = if main_query.trim().starts_with("query") {
         let content = main_query.trim();
         if let (Some(start_brace), Some(end_brace)) = (content.find('{'), content.rfind('}')) {
-            stripped_owned = content[start_brace + 1..end_brace].to_string();
-            &stripped_owned
+            // Extract everything before the first '{' as the header (e.g., "query Trades($pairid: String!)")
+            let header = content[..start_brace].trim().to_string();
+            // Extract everything inside the braces as the body
+            let body = content[start_brace + 1..end_brace].to_string();
+            tracing::debug!("Extracted query header: '{}', body length: {}", header, body.len());
+            (Some(header), body)
         } else {
-            main_query
+            (None, main_query.to_string())
         }
     } else if main_query.trim().starts_with('{') {
-        // Already a selection body
-        main_query
+        // Already a selection body, no header
+        (None, main_query.trim_start_matches('{').trim_end_matches('}').to_string())
     } else {
-        main_query
+        (None, main_query.to_string())
     };
 
-    // Extract multiple entities from the main query
-    let entities = extract_multiple_entities(stripped_query)?;
+    // Extract multiple entities from the main query body
+    let entities = extract_multiple_entities(&stripped_query)?;
 
     let mut converted_entities = Vec::new();
 
     for (entity, params, selection) in entities {
         let entity_cap = singularize_and_capitalize(&entity);
-        // Only include limit/offset if they are literals, not GraphQL variables (e.g., $first/$skip)
-        let limit = match params.get("first").cloned() {
-            Some(v) if v.trim_start().starts_with('$') => None,
-            other => other,
-        };
-        let offset = match params.get("skip").cloned() {
-            Some(v) if v.trim_start().starts_with('$') => None,
-            other => other,
-        };
+        // Extract limit/offset, preserving GraphQL variables (e.g., $first/$skip)
+        let limit = params.get("first").cloned();
+        let offset = params.get("skip").cloned();
 
         // Single-entity by primary key: singular entity, only 'id' param
         if !entity.ends_with('s') && params.len() == 1 && params.contains_key("id") {
@@ -175,14 +180,31 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<String
         //   (e.g., "pair" -> {nested: ["token"], regular: ["id", "name"]})
         let (nested_entity_fields, regular_fields, nested_entity_info) = extract_field_info_from_selection_recursive(&selection);
         
+        // Check if where is a variable reference (e.g., where: $where)
+        let where_is_variable = params.get("where")
+            .map(|w| w.trim_start().starts_with('$'))
+            .unwrap_or(false);
+
         // Convert filters to where clause (flattened)
-        let where_clause = convert_filters_to_where_clause(&converted_params, &nested_entity_fields, &regular_fields, &nested_entity_info)?;
+        // If where is a variable, it will be handled separately
+        let where_clause = if where_is_variable {
+            // If where is a variable, pass it through directly
+            if let Some(where_var) = params.get("where") {
+                format!("where: {}", where_var)
+            } else {
+                String::new()
+            }
+        } else {
+            convert_filters_to_where_clause(&converted_params, &nested_entity_fields, &regular_fields, &nested_entity_info)?
+        };
 
         let mut params_vec = Vec::new();
         if let Some(l) = limit.as_ref() {
+            // Include limit whether it's a literal or a variable (e.g., $first)
             params_vec.push(format!("limit: {}", l));
         }
         if let Some(o) = offset.as_ref() {
+            // Include offset whether it's a literal or a variable (e.g., $skip)
             params_vec.push(format!("offset: {}", o));
         }
         // Map orderBy/orderDirection to Hasura order_by
@@ -212,7 +234,19 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<String
         converted_entities.push(converted_entity);
     }
 
-    let converted_query = format!("query {{\n{}\n}}", converted_entities.join("\n"));
+    // Reconstruct the query with preserved header (including variable definitions)
+    let query_header_str = if let Some(header) = &query_header {
+        // If we have a header, use it (it already includes "query" keyword)
+        tracing::debug!("Using preserved query header: '{}'", header);
+        header.clone()
+    } else {
+        // Otherwise, use default "query"
+        tracing::debug!("No query header found, using default 'query'");
+        "query".to_string()
+    };
+    
+    let converted_query = format!("{} {{\n{}\n}}", query_header_str, converted_entities.join("\n"));
+    tracing::debug!("Final converted query: {}", converted_query);
     Ok(converted_query)
 }
 
@@ -1056,36 +1090,38 @@ fn convert_basic_filter_to_hasura_condition(
         return Ok(result);
     }
     
-    // Check if value is a simple scalar (not an object/array/variable)
+    // Check if value is a simple scalar (not an object/array)
     let trimmed_value = value.trim();
+    let is_variable = trimmed_value.trim_start().starts_with('$');
     let is_simple_scalar = !trimmed_value.starts_with('{') 
         && !trimmed_value.starts_with('[')
-        && !trimmed_value.trim_start().starts_with('$'); // Not a GraphQL variable
+        && !is_variable;
     
-    if is_simple_scalar {
-        // Check if field is explicitly a nested entity (from selection set)
-        let is_nested_from_selection = nested_entity_fields.contains(key);
-        
-        // Check if field is explicitly a regular primitive field (from selection set)
-        let is_regular_from_selection = regular_fields.contains(key);
-        
-        // Decision logic:
-        // - If explicitly nested in selection → treat as nested entity
-        // - If explicitly regular in selection → treat as regular field (don't convert)
-        // - If both sets are empty (processing nested filter) → treat as regular field
-        // - If not in selection set at all (and sets are not empty) → treat as nested entity
-        //   (heuristic: user is filtering on a field they didn't select, likely a nested entity reference by ID)
-        let both_sets_empty = nested_entity_fields.is_empty() && regular_fields.is_empty();
-        
-        if is_nested_from_selection || (!both_sets_empty && !is_regular_from_selection && !is_nested_from_selection) {
-            // This is a nested entity reference with a simple scalar value
-            // In subgraph: pair: "0" means "where pair id equals 0"
-            // In Envio/Hyperindex: this becomes pair: {id: {_eq: "0"}}
-            return Ok(format!("{}: {{id: {{_eq: {}}}}}", key, value));
-        }
+    // Check if field is explicitly a nested entity (from selection set)
+    let is_nested_from_selection = nested_entity_fields.contains(key);
+    
+    // Check if field is explicitly a regular primitive field (from selection set)
+    let is_regular_from_selection = regular_fields.contains(key);
+    
+    // Decision logic:
+    // - If explicitly nested in selection → treat as nested entity
+    // - If explicitly regular in selection → treat as regular field (don't convert)
+    // - If both sets are empty (processing nested filter) → treat as regular field
+    // - If not in selection set at all (and sets are not empty) → treat as nested entity
+    //   (heuristic: user is filtering on a field they didn't select, likely a nested entity reference by ID)
+    let both_sets_empty = nested_entity_fields.is_empty() && regular_fields.is_empty();
+    
+    let should_treat_as_nested_entity = is_nested_from_selection 
+        || (!both_sets_empty && !is_regular_from_selection && !is_nested_from_selection);
+    
+    if should_treat_as_nested_entity && (is_simple_scalar || is_variable) {
+        // This is a nested entity reference with a scalar value (literal or variable)
+        // In subgraph: pair: "0" or pair: $pairid means "where pair id equals value"
+        // In Envio/Hyperindex: this becomes pair: {id: {_eq: "0"}} or pair: {id: {_eq: $pairid}}
+        return Ok(format!("{}: {{id: {{_eq: {}}}}}", key, value));
     }
 
-    // Default case: treat as equality filter
+    // Default case: treat as equality filter (for regular fields, with or without variables)
     let result = format!("{}: {{_eq: {}}}", key, value);
     Ok(result)
 }
@@ -2499,6 +2535,252 @@ mod tests {
         // Verify the full structure
         assert!(converted_query.contains("id"));
         assert!(converted_query.contains("feed"));
+    }
+
+    #[test]
+    fn test_query_with_variables() {
+        // Test that variables are passed through correctly
+        let payload = json!({
+            "query": "query FactoriesAndBundles($first: Int!) { factories(first: $first) { id poolCount } bundles(first: $first) { id nativePriceUSD } }",
+            "variables": {
+                "first": 5
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        
+        // Verify query is converted
+        assert!(result.get("query").is_some());
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("Factory"));
+        assert!(query.contains("Bundle"));
+        
+        // Verify variables are passed through
+        assert!(result.get("variables").is_some());
+        let variables = result.get("variables").unwrap();
+        assert_eq!(variables["first"], 5);
+        
+        // Verify variable references in query are preserved (not converted to literals)
+        assert!(query.contains("$first"), "Variable reference $first should be preserved in converted query");
+    }
+
+    #[test]
+    fn test_query_without_variables() {
+        // Test that queries without variables still work
+        let payload = json!({
+            "query": "query { factories(first: 5) { id } }"
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        
+        // Should not have variables field
+        assert!(result.get("variables").is_none());
+        
+        // Query should still be converted
+        assert!(result.get("query").is_some());
+    }
+
+    #[test]
+    fn test_query_with_variables_and_chain_id() {
+        // Test variables work with chain_id
+        let payload = json!({
+            "query": "query GetTrades($limit: Int!) { trades(first: $limit) { id trader } }",
+            "variables": {
+                "limit": 100
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        
+        // Verify variables are passed through
+        assert_eq!(result["variables"]["limit"], 100);
+        
+        // Verify query includes chainId filter and preserves variable
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("chainId: {_eq: \"1\"}"));
+        assert!(query.contains("$limit"), "Variable reference $limit should be preserved");
+    }
+
+    #[test]
+    fn test_nested_entity_with_variable() {
+        // Test that nested entity filters with variables are converted correctly
+        // pair: $pairid should become pair: {id: {_eq: $pairid}}
+        let payload = json!({
+            "query": "query Trades($pairid: String!) { trades(where: { pair: $pairid }) { id pair { id } } }",
+            "variables": {
+                "pairid": "0"
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        
+        let query = result["query"].as_str().unwrap();
+        println!("Converted query: {}", query);
+        
+        // Verify variable definition is preserved in query header
+        assert!(
+            query.contains("query Trades($pairid: String!)"),
+            "Variable definition should be preserved in query header, got: {}",
+            query
+        );
+        
+        // Verify nested entity variable is converted correctly
+        assert!(
+            query.contains("pair: {id: {_eq: $pairid}}"),
+            "Expected pair: {{id: {{_eq: $pairid}}}} in converted query, got: {}",
+            query
+        );
+        
+        // Should NOT contain the incorrect format
+        assert!(
+            !query.contains("pair: {_eq: $pairid}"),
+            "Should NOT contain 'pair: {{_eq: $pairid}}' (missing id wrapper), got: {}",
+            query
+        );
+        
+        // Verify variables are passed through
+        assert_eq!(result["variables"]["pairid"], "0");
+    }
+
+    #[test]
+    fn test_nested_entity_with_variable_deep_nesting() {
+        // Test the actual query structure from the user's example
+        // pair: $pairid should become pair: {id: {_eq: $pairid}} even with deep nesting
+        let payload = json!({
+            "query": "query Trades($pairid: String!) { trades(where: { pair: $pairid }) { id pair { fee { liqFeeP } } } }",
+            "variables": {
+                "pairid": "0"
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        
+        let query = result["query"].as_str().unwrap();
+        println!("Converted query: {}", query);
+        
+        // Verify variable definition is preserved in query header
+        assert!(
+            query.contains("query Trades($pairid: String!)"),
+            "Variable definition should be preserved in query header, got: {}",
+            query
+        );
+        
+        // Verify nested entity variable is converted correctly
+        assert!(
+            query.contains("pair: {id: {_eq: $pairid}}"),
+            "Expected pair: {{id: {{_eq: $pairid}}}} in converted query, got: {}",
+            query
+        );
+        
+        // Should NOT contain the incorrect format
+        assert!(
+            !query.contains("pair: {_eq: $pairid}"),
+            "Should NOT contain 'pair: {{_eq: $pairid}}' (missing id wrapper), got: {}",
+            query
+        );
+        
+        // Verify variables are passed through
+        assert_eq!(result["variables"]["pairid"], "0");
+    }
+
+    #[test]
+    fn test_variable_with_object() {
+        // Test that object variables are passed through correctly
+        let payload = json!({
+            "query": "query GetTrades($where: TradeWhereInput!) { trades(where: $where) { id trader } }",
+            "variables": {
+                "where": {
+                    "isOpen": true,
+                    "trader": "0x123"
+                }
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        
+        // Verify variables are passed through with object structure
+        assert!(result.get("variables").is_some());
+        let variables = result.get("variables").unwrap();
+        assert_eq!(variables["where"]["isOpen"], true);
+        assert_eq!(variables["where"]["trader"], "0x123");
+        
+        // Verify variable reference is preserved in query and where clause is included
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("$where"), "Variable reference $where should be preserved");
+        assert!(query.contains("where: $where"), "Where clause with variable should be included in query");
+    }
+
+    #[test]
+    fn test_variable_with_array() {
+        // Test that array variables are passed through correctly
+        let payload = json!({
+            "query": "query GetTrades($ids: [String!]!) { trades(where: { id_in: $ids }) { id trader } }",
+            "variables": {
+                "ids": ["0", "1", "2"]
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        
+        // Verify variables are passed through with array structure
+        assert!(result.get("variables").is_some());
+        let variables = result.get("variables").unwrap();
+        assert!(variables["ids"].is_array());
+        assert_eq!(variables["ids"][0], "0");
+        assert_eq!(variables["ids"][1], "1");
+        assert_eq!(variables["ids"][2], "2");
+        
+        // Verify variable reference is preserved in query
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("$ids"), "Variable reference $ids should be preserved");
+    }
+
+    #[test]
+    fn test_variable_with_nested_object() {
+        // Test that nested object variables work
+        let payload = json!({
+            "query": "query GetTrades($filter: TradeFilterInput!) { trades(where: $filter) { id trader pair { id } } }",
+            "variables": {
+                "filter": {
+                    "pair": {
+                        "id": "0"
+                    },
+                    "isOpen": true
+                }
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        
+        // Verify nested object variables are passed through
+        assert!(result.get("variables").is_some());
+        let variables = result.get("variables").unwrap();
+        assert_eq!(variables["filter"]["pair"]["id"], "0");
+        assert_eq!(variables["filter"]["isOpen"], true);
+        
+        // Verify variable reference is preserved
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("$filter"), "Variable reference $filter should be preserved");
+    }
+
+    #[test]
+    fn test_variable_with_mixed_types() {
+        // Test variables with mixed types (scalar, object, array)
+        let payload = json!({
+            "query": "query GetTrades($limit: Int!, $where: TradeWhereInput!, $ids: [String!]) { trades(first: $limit, where: $where) { id trader } }",
+            "variables": {
+                "limit": 100,
+                "where": {
+                    "id_in": ["0", "1"],
+                    "isOpen": true
+                },
+                "ids": ["0", "1", "2"]
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        
+        // Verify all variable types are passed through correctly
+        let variables = result.get("variables").unwrap();
+        assert_eq!(variables["limit"], 100);
+        assert_eq!(variables["where"]["isOpen"], true);
+        assert!(variables["ids"].is_array());
+        
+        // Verify all variable references are preserved
+        let query = result["query"].as_str().unwrap();
+        assert!(query.contains("$limit"));
+        assert!(query.contains("$where"));
     }
 
 }
