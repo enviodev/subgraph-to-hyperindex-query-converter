@@ -2,6 +2,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use thiserror::Error;
 
+use crate::schema;
+
 #[derive(Error, Debug)]
 pub enum ConversionError {
     #[error("Invalid GraphQL query format")]
@@ -26,6 +28,19 @@ pub fn convert_subgraph_to_hyperindex(
         .ok_or(ConversionError::InvalidQueryFormat)?;
 
     tracing::info!("Converting query: {}", query);
+
+    // Check if this is an introspection query (uses __schema or __type)
+    // Introspection queries should pass through unchanged
+    if query.contains("__schema") || query.contains("__type") {
+        tracing::info!("Detected introspection query, passing through unchanged");
+        let mut result = serde_json::json!({
+            "query": query
+        });
+        if let Some(variables) = payload.get("variables") {
+            result["variables"] = variables.clone();
+        }
+        return Ok(result);
+    }
 
     // Parse the GraphQL query (simplified parsing for now)
     let converted_query = convert_query_structure(query, chain_id)?;
@@ -173,13 +188,6 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<String
             converted_params.insert("chainId".to_string(), format!("\"{}\"", chain_id));
         }
 
-        // Extract field information from selection set recursively
-        // - nested_entity_fields: top-level fields that appear as nested objects (e.g., "pair { id }")
-        // - regular_fields: top-level fields that appear as regular primitives (e.g., "id", "name")
-        // - nested_entity_info: map of nested entity names to their own nested/regular fields
-        //   (e.g., "pair" -> {nested: ["token"], regular: ["id", "name"]})
-        let (nested_entity_fields, regular_fields, nested_entity_info) = extract_field_info_from_selection_recursive(&selection);
-        
         // Check if where is a variable reference (e.g., where: $where)
         let where_is_variable = params.get("where")
             .map(|w| w.trim_start().starts_with('$'))
@@ -195,7 +203,7 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<String
                 String::new()
             }
         } else {
-            convert_filters_to_where_clause(&converted_params, &nested_entity_fields, &regular_fields, &nested_entity_info)?
+            convert_filters_to_where_clause(&converted_params, &entity_cap)?
         };
 
         let mut params_vec = Vec::new();
@@ -582,140 +590,10 @@ fn flatten_where_map(mut map: HashMap<String, String>) -> HashMap<String, String
     flat
 }
 
-fn extract_field_info_from_selection_recursive(
-    selection: &str,
-) -> (
-    std::collections::HashSet<String>,
-    std::collections::HashSet<String>,
-    std::collections::HashMap<String, (std::collections::HashSet<String>, std::collections::HashSet<String>)>,
-) {
-    // Extract field information from selection set recursively:
-    // - nested_entity_fields: top-level fields that appear as nested objects (e.g., "pair { id }")
-    // - regular_fields: top-level fields that appear as regular primitives (e.g., "id", "name")
-    // - nested_entity_info: map of nested entity names to their own (nested_fields, regular_fields)
-    //   This allows us to handle deeper nesting like "pair { token { id } }"
-    let mut nested_fields = std::collections::HashSet::new();
-    let mut regular_fields = std::collections::HashSet::new();
-    let mut nested_entity_info: std::collections::HashMap<String, (std::collections::HashSet<String>, std::collections::HashSet<String>)> = 
-        std::collections::HashMap::new();
-    
-    // Remove outer braces if present
-    let content = selection.trim().trim_start_matches('{').trim_end_matches('}').trim();
-    
-    let chars: Vec<char> = content.chars().collect();
-    let mut i = 0;
-    let mut current_field = String::new();
-    
-    while i < chars.len() {
-        let ch = chars[i];
-        
-        if ch.is_alphanumeric() || ch == '_' {
-            // Building a field name
-            current_field.push(ch);
-            i += 1;
-        } else if ch.is_whitespace() {
-            // Whitespace - check if next non-whitespace is '{'
-            if !current_field.is_empty() {
-                let mut j = i + 1;
-                // Skip all whitespace
-                while j < chars.len() && chars[j].is_whitespace() {
-                    j += 1;
-                }
-                // Check if next char is '{'
-                if j < chars.len() && chars[j] == '{' {
-                    // This field is followed by '{', so it's a nested entity
-                    let nested_entity_name = current_field.clone();
-                    nested_fields.insert(nested_entity_name.clone());
-                    current_field.clear();
-                    
-                    // Extract the nested object content
-                    let mut brace_count = 1;
-                    let nested_start = j + 1;
-                    j += 1;
-                    while j < chars.len() && brace_count > 0 {
-                        if chars[j] == '{' {
-                            brace_count += 1;
-                        } else if chars[j] == '}' {
-                            brace_count -= 1;
-                        }
-                        j += 1;
-                    }
-                    let nested_end = j - 1; // Before the closing '}'
-                    
-                    // Recursively extract field info from the nested entity's selection set
-                    let nested_content: String = chars[nested_start..nested_end].iter().collect();
-                    let (nested_nested, nested_regular, _) = extract_field_info_from_selection_recursive(&nested_content);
-                    nested_entity_info.insert(nested_entity_name, (nested_nested, nested_regular));
-                    
-                    i = j;
-                    continue;
-                } else {
-                    // Not a nested entity, it's a regular primitive field
-                    regular_fields.insert(current_field.clone());
-                    current_field.clear();
-                }
-            }
-            i += 1;
-        } else if ch == '{' {
-            // If we have a field name and encounter '{', it's a nested entity
-            if !current_field.is_empty() {
-                let nested_entity_name = current_field.clone();
-                nested_fields.insert(nested_entity_name.clone());
-                current_field.clear();
-                
-                // Extract the nested object content
-                let mut brace_count = 1;
-                let nested_start = i + 1;
-                i += 1;
-                while i < chars.len() && brace_count > 0 {
-                    if chars[i] == '{' {
-                        brace_count += 1;
-                    } else if chars[i] == '}' {
-                        brace_count -= 1;
-                    }
-                    i += 1;
-                }
-                let nested_end = i - 1; // Before the closing '}'
-                
-                // Recursively extract field info from the nested entity's selection set
-                let nested_content: String = chars[nested_start..nested_end].iter().collect();
-                let (nested_nested, nested_regular, _) = extract_field_info_from_selection_recursive(&nested_content);
-                nested_entity_info.insert(nested_entity_name, (nested_nested, nested_regular));
-            } else {
-                // No field name, just skip the braces
-                let mut brace_count = 1;
-                i += 1;
-                while i < chars.len() && brace_count > 0 {
-                    if chars[i] == '{' {
-                        brace_count += 1;
-                    } else if chars[i] == '}' {
-                        brace_count -= 1;
-                    }
-                    i += 1;
-                }
-            }
-        } else {
-            // Other character - if we have a field, it's a regular field
-            if !current_field.is_empty() {
-                regular_fields.insert(current_field.clone());
-                current_field.clear();
-            }
-            i += 1;
-        }
-    }
-    
-    // Handle any remaining field at the end
-    if !current_field.is_empty() {
-        regular_fields.insert(current_field);
-    }
-    
-    (nested_fields, regular_fields, nested_entity_info)
-}
-
 fn process_nested_filters_recursive(
     parent: &str,
     child_filters: HashMap<String, String>,
-    nested_entity_info: &std::collections::HashMap<String, (std::collections::HashSet<String>, std::collections::HashSet<String>)>,
+    parent_entity_name: &str,
 ) -> Result<String, ConversionError> {
     let mut child_conditions = Vec::new();
     let mut child_and_conditions = Vec::new();
@@ -727,9 +605,14 @@ fn process_nested_filters_recursive(
             let first_part = &parent[..dot_idx];
             let rest = &parent[dot_idx + 1..];
             
+            // Get the nested entity type for first_part
+            let nested_entity_type = schema::get_field_info(parent_entity_name, first_part)
+                .and_then(|info| info.nested_type_name)
+                .unwrap_or_else(|| first_part.to_string());
+            
             // Process "rest" with child_filters to get the nested condition for "rest"
             // This returns something like "token: {amount: {_eq: "0"}}"
-            let rest_condition = process_nested_filters_recursive(rest, child_filters, nested_entity_info)?;
+            let rest_condition = process_nested_filters_recursive(rest, child_filters, &nested_entity_type)?;
             
             // Extract the inner condition part (the part after "rest: ")
             // rest_condition is "rest: {...}", we want just "{...}"
@@ -746,11 +629,10 @@ fn process_nested_filters_recursive(
     }
     
     // Base case: parent is a simple field name (e.g., "pair")
-    // Get nested entity info for this parent entity
-    let (parent_nested_fields, parent_regular_fields) = nested_entity_info
-        .get(parent)
-        .map(|(n, r)| (n.clone(), r.clone()))
-        .unwrap_or_else(|| (std::collections::HashSet::new(), std::collections::HashSet::new()));
+    // Get the nested entity type for this parent field
+    let nested_entity_type = schema::get_field_info(parent_entity_name, parent)
+        .and_then(|info| info.nested_type_name)
+        .unwrap_or_else(|| parent.to_string());
 
     // Group child filters by field name to handle duplicates
     let mut grouped_child_filters: HashMap<String, Vec<(String, String)>> = HashMap::new();
@@ -775,14 +657,14 @@ fn process_nested_filters_recursive(
         if conditions.len() == 1 {
             // Single condition for this field
             let (k, v) = &conditions[0];
-            // Use the nested entity info for the parent to determine if child fields are nested entities
-            let condition = convert_basic_filter_to_hasura_condition(&k, &v, &parent_nested_fields, &parent_regular_fields)?;
+            // Use schema to determine if child fields are nested entities
+            let condition = convert_basic_filter_to_hasura_condition(&k, &v, &nested_entity_type)?;
             child_conditions.push(condition);
         } else {
             // Multiple conditions for the same field - wrap in _and
             for (k, v) in conditions {
-                // Use the nested entity info for the parent to determine if child fields are nested entities
-                let condition = convert_basic_filter_to_hasura_condition(&k, &v, &parent_nested_fields, &parent_regular_fields)?;
+                // Use schema to determine if child fields are nested entities
+                let condition = convert_basic_filter_to_hasura_condition(&k, &v, &nested_entity_type)?;
                 child_and_conditions.push(format!("{{{}}}", condition));
             }
         }
@@ -797,9 +679,7 @@ fn process_nested_filters_recursive(
 
 fn convert_filters_to_where_clause(
     params: &HashMap<String, String>,
-    nested_entity_fields: &std::collections::HashSet<String>,
-    regular_fields: &std::collections::HashSet<String>,
-    nested_entity_info: &std::collections::HashMap<String, (std::collections::HashSet<String>, std::collections::HashSet<String>)>,
+    entity_name: &str,
 ) -> Result<String, ConversionError> {
     // Recursively flatten the entire params map
     let mut flat_filters = flatten_where_map(params.clone());
@@ -868,12 +748,12 @@ fn convert_filters_to_where_clause(
         if conditions.len() == 1 {
             // Single condition for this field
             let (k, v) = &conditions[0];
-            let condition = convert_basic_filter_to_hasura_condition(&k, &v, nested_entity_fields, regular_fields)?;
+            let condition = convert_basic_filter_to_hasura_condition(&k, &v, entity_name)?;
             where_conditions.push(condition);
         } else {
             // Multiple conditions for the same field - wrap in _and
             for (k, v) in conditions {
-                let condition = convert_basic_filter_to_hasura_condition(&k, &v, nested_entity_fields, regular_fields)?;
+                let condition = convert_basic_filter_to_hasura_condition(&k, &v, entity_name)?;
                 and_conditions.push(format!("{{{}}}", condition));
             }
         }
@@ -887,7 +767,7 @@ fn convert_filters_to_where_clause(
         let nested_condition = process_nested_filters_recursive(
             &parent,
             child_filters,
-            nested_entity_info,
+            entity_name,
         )?;
         where_conditions.push(nested_condition);
     }
@@ -918,8 +798,7 @@ fn parse_nested_where_clause(
 fn convert_basic_filter_to_hasura_condition(
     key: &str,
     value: &str,
-    nested_entity_fields: &std::collections::HashSet<String>,
-    regular_fields: &std::collections::HashSet<String>,
+    entity_name: &str,
 ) -> Result<String, ConversionError> {
     if key == "where" {
         // Should never emit a 'where' key at this stage
@@ -1077,8 +956,7 @@ fn convert_basic_filter_to_hasura_condition(
 
     // Check if this is a nested entity reference
     // A nested entity reference is when:
-    // 1. The field name appears in the selection set as a nested object (e.g., "pair { id }")
-    //    OR the field is NOT in the regular_fields set (meaning it's not a primitive in the selection)
+    // 1. The field is a nested entity according to the schema
     // 2. The value is a simple scalar (string/number, not an object/array)
     // 3. The field doesn't have an operator suffix (already handled above)
     // 4. The field is not a system field like "chainId" (added programmatically)
@@ -1097,24 +975,10 @@ fn convert_basic_filter_to_hasura_condition(
         && !trimmed_value.starts_with('[')
         && !is_variable;
     
-    // Check if field is explicitly a nested entity (from selection set)
-    let is_nested_from_selection = nested_entity_fields.contains(key);
+    // Use schema to check if this field is a nested entity
+    let is_nested_entity = schema::is_nested_entity(entity_name, key);
     
-    // Check if field is explicitly a regular primitive field (from selection set)
-    let is_regular_from_selection = regular_fields.contains(key);
-    
-    // Decision logic:
-    // - If explicitly nested in selection → treat as nested entity
-    // - If explicitly regular in selection → treat as regular field (don't convert)
-    // - If both sets are empty (processing nested filter) → treat as regular field
-    // - If not in selection set at all (and sets are not empty) → treat as nested entity
-    //   (heuristic: user is filtering on a field they didn't select, likely a nested entity reference by ID)
-    let both_sets_empty = nested_entity_fields.is_empty() && regular_fields.is_empty();
-    
-    let should_treat_as_nested_entity = is_nested_from_selection 
-        || (!both_sets_empty && !is_regular_from_selection && !is_nested_from_selection);
-    
-    if should_treat_as_nested_entity && (is_simple_scalar || is_variable) {
+    if is_nested_entity && (is_simple_scalar || is_variable) {
         // This is a nested entity reference with a scalar value (literal or variable)
         // In subgraph: pair: "0" or pair: $pairid means "where pair id equals value"
         // In Envio/Hyperindex: this becomes pair: {id: {_eq: "0"}} or pair: {id: {_eq: $pairid}}
@@ -1337,6 +1201,16 @@ mod tests {
         json!({
             "query": query
         })
+    }
+
+    // Initialize test schema before running tests that need schema data
+    /// Initialize test schema for unit tests
+    /// This ALWAYS resets to the hardcoded test schema to ensure tests are deterministic
+    /// and don't depend on external schema changes or test execution order
+    fn init_test_schema_if_needed() {
+        // Always reset to test schema - don't check if empty
+        // This ensures tests are deterministic and use the hardcoded test schema
+        schema::init_test_schema();
     }
 
     #[test]
@@ -2068,6 +1942,7 @@ mod tests {
 
     #[test]
     fn test_nested_entity_reference_in_where_clause() {
+        init_test_schema_if_needed();
         // Test case for nested entity references in where clauses
         // In subgraph format, you can reference a nested entity directly: where: { pair: "0" }
         // In Envio/Hyperindex format, this must be converted to: where: { pair: {id: {_eq: "0"}} }
@@ -2141,8 +2016,9 @@ mod tests {
 
     #[test]
     fn test_nested_entity_reference_with_other_filters() {
+        init_test_schema_if_needed();
         // Test nested entity reference combined with other filters
-        // Note: pair must be in the selection set for it to be detected as a nested entity
+        // Uses schema to detect that pair is a nested entity
         let query = r#"query {
   trades(
     where: {
@@ -2177,8 +2053,9 @@ mod tests {
 
     #[test]
     fn test_nested_entity_reference_with_operators() {
+        init_test_schema_if_needed();
         // Test nested entity reference with comparison operators
-        // Note: pair must be in the selection set for it to be detected as a nested entity
+        // Uses schema to detect that pair is a nested entity
         let query = r#"query {
   trades(
     where: {
@@ -2214,6 +2091,7 @@ mod tests {
 
     #[test]
     fn test_nested_entity_reference_with_nested_field_filter() {
+        init_test_schema_if_needed();
         // Test that the nested structure approach allows filtering on other fields of the nested entity
         // This demonstrates why the nested structure is more flexible than _id suffix
         // Example: pair: {name: {_eq: "ETH"}} or pair: {symbol: {_contains: "USD"}}
@@ -2247,6 +2125,7 @@ mod tests {
 
     #[test]
     fn test_deeply_nested_entity_reference() {
+        init_test_schema_if_needed();
         // Test deeply nested entity reference: pair.token: "0"
         // where token is a nested entity within pair
         // Should convert to: pair: {token: {id: {_eq: "0"}}}
@@ -2281,6 +2160,7 @@ mod tests {
 
     #[test]
     fn test_deeply_nested_regular_field() {
+        init_test_schema_if_needed();
         // Test deeply nested regular field: pair.token.amount: "0"
         // where token is a nested entity within pair, and amount is a regular field within token
         // Should convert to: pair: {token: {amount: {_eq: "0"}}}
@@ -2324,6 +2204,7 @@ mod tests {
 
     #[test]
     fn test_nested_entity_with_non_id_field() {
+        init_test_schema_if_needed();
         // Test case: pair: {token: {name: "ETH"}}
         // where token is a nested entity, but we're filtering by 'name' (not the default 'id')
         // Should convert to: pair: {token: {name: {_eq: "ETH"}}}
@@ -2369,7 +2250,9 @@ mod tests {
 
     #[test]
     fn test_regular_field_in_selection() {
-        // If "token" is explicitly selected as a regular field, it should be treated as regular
+        init_test_schema_if_needed();
+        // With schema-based approach, "token" is defined as a regular field in the schema for Trade
+        // so it should be treated as regular (not nested)
         let query = r#"query {
   trades(
     where: {
@@ -2600,6 +2483,7 @@ mod tests {
 
     #[test]
     fn test_nested_entity_with_variable() {
+        init_test_schema_if_needed();
         // Test that nested entity filters with variables are converted correctly
         // pair: $pairid should become pair: {id: {_eq: $pairid}}
         let payload = json!({
@@ -2640,6 +2524,7 @@ mod tests {
 
     #[test]
     fn test_nested_entity_with_variable_deep_nesting() {
+        init_test_schema_if_needed();
         // Test the actual query structure from the user's example
         // pair: $pairid should become pair: {id: {_eq: $pairid}} even with deep nesting
         let payload = json!({

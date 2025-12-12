@@ -1169,6 +1169,7 @@ dependencies = [
  "axum",
  "dotenv",
  "graphql-parser",
+ "once_cell",
  "reqwest",
  "serde",
  "serde_json",
