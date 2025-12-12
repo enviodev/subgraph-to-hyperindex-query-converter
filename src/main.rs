@@ -2,7 +2,7 @@ use axum::{
     extract::{Json, Path},
     http::StatusCode,
     response::IntoResponse,
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use dotenv;
@@ -15,6 +15,7 @@ use tracing;
 use tracing_subscriber;
 
 mod conversion;
+mod schema;
 #[cfg(test)]
 mod integration_tests;
 
@@ -35,7 +36,14 @@ async fn main() {
         .route("/debug", post(handle_debug))
         .route("/chainId/:chain_id", post(handle_chain_query))
         .route("/chainId/:chain_id/debug", post(handle_chain_debug))
+        .route("/schema/test", get(test_introspection))
+        .route("/schema/refresh", post(refresh_schema_endpoint))
         .layer(cors);
+
+    // Initialize schema on startup
+    if let Err(e) = schema::initialize_schema().await {
+        tracing::warn!("Failed to initialize schema: {}. Will retry on first request.", e);
+    }
 
     let addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
     tracing::info!("listening on {}", addr);
@@ -43,91 +51,27 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn handle_query(Json(payload): Json<Value>) -> impl IntoResponse {
-    tracing::info!("Received query: {:?}", payload);
+/// Execute a query with automatic schema refresh retry on schema-related errors
+/// Returns (status_code, response_json)
+async fn execute_query_with_retry(
+    payload: &Value,
+    chain_id: Option<&str>,
+) -> (StatusCode, Json<Value>) {
+    // Ensure schema is initialized (lazy initialization)
+    if let Err(e) = schema::ensure_schema_initialized().await {
+        tracing::error!("Failed to ensure schema is initialized: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Schema initialization failed",
+                "details": e.to_string()
+            })),
+        );
+    }
 
-    match conversion::convert_subgraph_to_hyperindex(&payload, None) {
-        Ok(converted_query) => {
-            tracing::info!("Converted query: {:?}", converted_query);
-
-            // Forward the converted query to Hyperindex
-            match forward_to_hyperindex(&converted_query).await {
-                Ok(response) => {
-                    tracing::info!("Hyperindex response: {:?}", response);
-                    // If upstream returned GraphQL errors, surface them with debug info
-                    if response.get("errors").is_some() {
-                        let hyperindex_url =
-                            std::env::var("HYPERINDEX_URL").expect("HYPERINDEX_URL must be set");
-                        let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
-                        // Log both original and converted queries for debugging
-                        let original_query = payload
-                            .get("query")
-                            .and_then(|q| q.as_str())
-                            .unwrap_or_default();
-                        let converted_query_str = converted_query
-                            .get("query")
-                            .and_then(|q| q.as_str())
-                            .unwrap_or_default();
-                        tracing::error!(
-                            original_query = original_query,
-                            converted_query = converted_query_str,
-                            "Upstream GraphQL returned errors for converted query"
-                        );
-                        let debug = serde_json::json!({
-                            "originalQuery": original_query,
-                            "convertedQuery": converted_query_str,
-                            "hyperindexUrl": hyperindex_url,
-                        });
-                        return (
-                            StatusCode::BAD_GATEWAY,
-                            Json(serde_json::json!({
-                                "errors": response.get("errors").cloned().unwrap_or_default(),
-                                "debug": debug,
-                                "subgraphResponse": subgraph_debug,
-                            })),
-                        );
-                    }
-
-                    let transformed = transform_response_to_subgraph_shape(response);
-                    (StatusCode::OK, Json(transformed))
-                }
-                Err(e) => {
-                    tracing::error!("Hyperindex request error: {}", e);
-                    let hyperindex_url =
-                        std::env::var("HYPERINDEX_URL").expect("HYPERINDEX_URL must be set");
-                    let details = e.to_string();
-                    let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
-                    // Log both original and converted queries for debugging
-                    let original_query = payload
-                        .get("query")
-                        .and_then(|q| q.as_str())
-                        .unwrap_or_default();
-                    let converted_query_str = converted_query
-                        .get("query")
-                        .and_then(|q| q.as_str())
-                        .unwrap_or_default();
-                    tracing::error!(
-                        original_query = original_query,
-                        converted_query = converted_query_str,
-                        error = %details,
-                        "Error forwarding converted query to Hyperindex"
-                    );
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "error": "Hyperindex request failed",
-                            "details": details,
-                            "debug": {
-                                "originalQuery": original_query,
-                                "convertedQuery": converted_query_str,
-                                "hyperindexUrl": hyperindex_url,
-                            },
-                            "subgraphResponse": subgraph_debug,
-                        })),
-                    )
-                }
-            }
-        }
+    // Convert the query
+    let converted_query = match conversion::convert_subgraph_to_hyperindex(payload, chain_id) {
+        Ok(query) => query,
         Err(e) => {
             tracing::error!("Conversion error: {}", e);
             let reasoning = match &e {
@@ -142,7 +86,7 @@ async fn handle_query(Json(payload): Json<Value>) -> impl IntoResponse {
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
-            (
+            return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": "Conversion failed",
@@ -150,13 +94,187 @@ async fn handle_query(Json(payload): Json<Value>) -> impl IntoResponse {
                     "reasoning": reasoning,
                     "debug": {
                         "inputQuery": payload.get("query").and_then(|q| q.as_str()).unwrap_or_default(),
-                        "chainId": serde_json::Value::Null,
+                        "chainId": chain_id.map(|c| serde_json::Value::String(c.to_string())).unwrap_or(serde_json::Value::Null),
                     },
                     "subgraphResponse": subgraph_debug,
                 })),
-            )
+            );
         }
+    };
+
+    tracing::info!("Converted query: {:?}", converted_query);
+
+    // Prepare debug info for potential error responses
+    let hyperindex_url = std::env::var("HYPERINDEX_URL").expect("HYPERINDEX_URL must be set");
+    let original_query = payload
+        .get("query")
+        .and_then(|q| q.as_str())
+        .unwrap_or_default();
+    let converted_query_str = converted_query
+        .get("query")
+        .and_then(|q| q.as_str())
+        .unwrap_or_default();
+
+    // Try forwarding the query
+    let response = match forward_to_hyperindex(&converted_query).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::error!("Hyperindex request error: {}", e);
+            let details = e.to_string();
+            let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
+            tracing::error!(
+                original_query = original_query,
+                converted_query = converted_query_str,
+                error = %details,
+                "Error forwarding converted query to Hyperindex"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Hyperindex request failed",
+                    "details": details,
+                    "debug": {
+                        "originalQuery": original_query,
+                        "convertedQuery": converted_query_str,
+                        "hyperindexUrl": hyperindex_url,
+                        "chainId": chain_id.map(|c| serde_json::Value::String(c.to_string())).unwrap_or(serde_json::Value::Null),
+                    },
+                    "subgraphResponse": subgraph_debug,
+                })),
+            );
+        }
+    };
+
+    // Check for GraphQL errors
+    if let Some(errors) = response.get("errors") {
+        // Check if this looks like a schema-related error
+        if schema::is_schema_stale_error(errors) {
+            tracing::warn!(
+                "Detected schema-related error, refreshing schema and retrying query"
+            );
+
+            // Store original error info before retry
+            let original_errors = errors.clone();
+            let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
+            let mut original_debug = serde_json::json!({
+                "originalQuery": original_query,
+                "convertedQuery": converted_query_str,
+                "hyperindexUrl": hyperindex_url,
+            });
+            if let Some(chain_id) = chain_id {
+                original_debug["chainId"] = serde_json::Value::String(chain_id.to_string());
+            }
+
+            // Refresh schema
+            if let Err(refresh_err) = schema::refresh_schema().await {
+                tracing::error!("Failed to refresh schema: {}", refresh_err);
+                // Return original error even if refresh fails
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "errors": original_errors,
+                        "debug": original_debug,
+                        "subgraphResponse": subgraph_debug,
+                        "schemaRefreshAttempted": true,
+                        "schemaRefreshError": refresh_err.to_string(),
+                    })),
+                );
+            }
+
+            // Retry: convert query again with fresh schema
+            let retry_converted_query = match conversion::convert_subgraph_to_hyperindex(payload, chain_id) {
+                Ok(query) => query,
+                Err(e) => {
+                    tracing::error!("Conversion error on retry: {}", e);
+                    // Return original error, not the retry conversion error
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "errors": original_errors,
+                            "debug": original_debug,
+                            "subgraphResponse": subgraph_debug,
+                            "schemaRefreshAttempted": true,
+                            "retryConversionError": e.to_string(),
+                        })),
+                    );
+                }
+            };
+
+            // Retry: forward query again
+            let retry_response = match forward_to_hyperindex(&retry_converted_query).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    tracing::error!("Hyperindex request error on retry: {}", e);
+                    // Return original error, not the retry request error
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "errors": original_errors,
+                            "debug": original_debug,
+                            "subgraphResponse": subgraph_debug,
+                            "schemaRefreshAttempted": true,
+                            "retryRequestError": e.to_string(),
+                        })),
+                    );
+                }
+            };
+
+            // Check if retry succeeded
+            if let Some(retry_errors) = retry_response.get("errors") {
+                tracing::error!("Query still failed after schema refresh and retry");
+                // Return original error, not the retry error
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "errors": original_errors,
+                        "debug": original_debug,
+                        "subgraphResponse": subgraph_debug,
+                        "schemaRefreshAttempted": true,
+                        "retryStillFailed": true,
+                        "retryErrors": retry_errors,
+                    })),
+                );
+            }
+
+            // Retry succeeded!
+            tracing::info!("Query succeeded after schema refresh and retry");
+            let transformed = transform_response_to_subgraph_shape(retry_response);
+            return (StatusCode::OK, Json(transformed));
+        }
+
+        // Not a schema-related error, return it normally
+        let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
+        tracing::error!(
+            original_query = original_query,
+            converted_query = converted_query_str,
+            "Upstream GraphQL returned errors for converted query"
+        );
+        let mut debug = serde_json::json!({
+            "originalQuery": original_query,
+            "convertedQuery": converted_query_str,
+            "hyperindexUrl": hyperindex_url,
+        });
+        if let Some(chain_id) = chain_id {
+            debug["chainId"] = serde_json::Value::String(chain_id.to_string());
+        }
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "errors": errors.clone(),
+                "debug": debug,
+                "subgraphResponse": subgraph_debug,
+            })),
+        );
     }
+
+    // Success - no errors
+    let transformed = transform_response_to_subgraph_shape(response);
+    (StatusCode::OK, Json(transformed))
+}
+
+async fn handle_query(Json(payload): Json<Value>) -> impl IntoResponse {
+    tracing::info!("Received query: {:?}", payload);
+    execute_query_with_retry(&payload, None).await
 }
 
 async fn handle_chain_query(
@@ -168,125 +286,23 @@ async fn handle_chain_query(
         chain_id,
         payload
     );
-
-    match conversion::convert_subgraph_to_hyperindex(&payload, Some(&chain_id)) {
-        Ok(converted_query) => {
-            tracing::info!("Converted chain query: {:?}", converted_query);
-
-            // Forward the converted query to Hyperindex
-            match forward_to_hyperindex(&converted_query).await {
-                Ok(response) => {
-                    tracing::info!("Hyperindex response: {:?}", response);
-                    if response.get("errors").is_some() {
-                        let hyperindex_url =
-                            std::env::var("HYPERINDEX_URL").expect("HYPERINDEX_URL must be set");
-                        let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
-                        // Log both original and converted queries for debugging
-                        let original_query = payload
-                            .get("query")
-                            .and_then(|q| q.as_str())
-                            .unwrap_or_default();
-                        let converted_query_str = converted_query
-                            .get("query")
-                            .and_then(|q| q.as_str())
-                            .unwrap_or_default();
-                        tracing::error!(
-                            original_query = original_query,
-                            converted_query = converted_query_str,
-                            chain_id = %chain_id,
-                            "Upstream GraphQL returned errors for converted chain query"
-                        );
-                        let debug = serde_json::json!({
-                            "originalQuery": original_query,
-                            "convertedQuery": converted_query_str,
-                            "hyperindexUrl": hyperindex_url,
-                            "chainId": chain_id,
-                        });
-                        return (
-                            StatusCode::BAD_GATEWAY,
-                            Json(serde_json::json!({
-                                "errors": response.get("errors").cloned().unwrap_or_default(),
-                                "debug": debug,
-                                "subgraphResponse": subgraph_debug,
-                            })),
-                        );
-                    }
-
-                    let transformed = transform_response_to_subgraph_shape(response);
-                    (StatusCode::OK, Json(transformed))
-                }
-                Err(e) => {
-                    tracing::error!("Hyperindex request error: {}", e);
-                    let hyperindex_url =
-                        std::env::var("HYPERINDEX_URL").expect("HYPERINDEX_URL must be set");
-                    let details = e.to_string();
-                    let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
-                    // Log both original and converted queries for debugging
-                    let original_query = payload
-                        .get("query")
-                        .and_then(|q| q.as_str())
-                        .unwrap_or_default();
-                    let converted_query_str = converted_query
-                        .get("query")
-                        .and_then(|q| q.as_str())
-                        .unwrap_or_default();
-                    tracing::error!(
-                        original_query = original_query,
-                        converted_query = converted_query_str,
-                        chain_id = %chain_id,
-                        error = %details,
-                        "Error forwarding converted chain query to Hyperindex"
-                    );
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "error": "Hyperindex request failed",
-                            "details": details,
-                            "debug": {
-                                "originalQuery": original_query,
-                                "convertedQuery": converted_query_str,
-                                "hyperindexUrl": hyperindex_url,
-                                "chainId": chain_id,
-                            },
-                            "subgraphResponse": subgraph_debug,
-                        })),
-                    )
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!("Conversion error: {}", e);
-            let reasoning = match &e {
-                conversion::ConversionError::InvalidQueryFormat =>
-                    "The provided GraphQL query string could not be parsed. Ensure it is a valid single operation with balanced braces and proper syntax.",
-                conversion::ConversionError::MissingField(field) =>
-                    if field == "query" { "The request body must include a 'query' string field." } else { "A required field is missing from the request." },
-                conversion::ConversionError::UnsupportedFilter(_filter) =>
-                    "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
-                conversion::ConversionError::ComplexMetaQuery =>
-                    "Only _meta { block { number } } is supported. Remove extra fields like hash, timestamp, etc.",
-            };
-            let details = e.to_string();
-            let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "Conversion failed",
-                    "details": details,
-                    "reasoning": reasoning,
-                    "debug": {
-                        "inputQuery": payload.get("query").and_then(|q| q.as_str()).unwrap_or_default(),
-                        "chainId": chain_id,
-                    },
-                    "subgraphResponse": subgraph_debug,
-                })),
-            )
-        }
-    }
+    execute_query_with_retry(&payload, Some(&chain_id)).await
 }
 
 async fn handle_debug(Json(payload): Json<Value>) -> impl IntoResponse {
     tracing::info!("Received debug query: {:?}", payload);
+
+    // Ensure schema is initialized (lazy initialization)
+    if let Err(e) = schema::ensure_schema_initialized().await {
+        tracing::error!("Failed to ensure schema is initialized: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Schema initialization failed",
+                "details": e.to_string()
+            })),
+        );
+    }
 
     match conversion::convert_subgraph_to_hyperindex(&payload, None) {
         Ok(converted_query) => {
@@ -333,6 +349,18 @@ async fn handle_chain_debug(
         chain_id,
         payload
     );
+
+    // Ensure schema is initialized (lazy initialization)
+    if let Err(e) = schema::ensure_schema_initialized().await {
+        tracing::error!("Failed to ensure schema is initialized: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "Schema initialization failed",
+                "details": e.to_string()
+            })),
+        );
+    }
 
     match conversion::convert_subgraph_to_hyperindex(&payload, Some(&chain_id)) {
         Ok(converted_query) => {
@@ -438,6 +466,99 @@ fn pluralize_lowercase(name: &str) -> String {
         return format!("{}es", lower);
     }
     format!("{}s", lower)
+}
+
+async fn test_introspection() -> impl IntoResponse {
+    tracing::info!("Testing introspection query...");
+    
+    match schema::fetch_schema().await {
+        Ok(schema_response) => {
+            // Try to parse it
+            match schema::parse_and_cache_schema(&schema_response) {
+                Ok(_) => {
+                    // Get some sample data to show it works
+                    let sample_entity = "Trade";
+                    let sample_field = "pair";
+                    let is_nested = schema::is_nested_entity(sample_entity, sample_field);
+                    
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "success": true,
+                            "message": "Introspection query successful",
+                            "cached_entities": "Schema parsed and cached",
+                            "sample_check": {
+                                "entity": sample_entity,
+                                "field": sample_field,
+                                "is_nested_entity": is_nested
+                            },
+                            "raw_response_preview": {
+                                "data_present": schema_response.get("data").is_some(),
+                                "types_count": schema_response
+                                    .get("data")
+                                    .and_then(|d| d.get("__schema"))
+                                    .and_then(|s| s.get("types"))
+                                    .and_then(|t| t.as_array())
+                                    .map(|arr| arr.len())
+                            }
+                        })),
+                    )
+                }
+                Err(e) => {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error": "Failed to parse schema",
+                            "details": e.to_string(),
+                            "raw_response": schema_response
+                        })),
+                    )
+                }
+            }
+        }
+                Err(e) => {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error": "Failed to fetch schema",
+                            "details": e.to_string()
+                        })),
+                    )
+                }
+            }
+        }
+
+async fn refresh_schema_endpoint() -> impl IntoResponse {
+    tracing::info!("Refreshing schema via endpoint...");
+    
+    match schema::refresh_schema().await {
+        Ok(_) => {
+            let (entity_count, last_updated) = schema::get_cache_stats();
+            
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "message": "Schema refreshed successfully",
+                    "last_updated": last_updated,
+                    "cached_entities": entity_count
+                })),
+            )
+        }
+        Err(e) => {
+            tracing::error!("Failed to refresh schema: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "Failed to refresh schema",
+                    "details": e.to_string()
+                })),
+            )
+        }
+    }
 }
 
 async fn maybe_fetch_subgraph_debug(payload: Value) -> Option<Value> {
