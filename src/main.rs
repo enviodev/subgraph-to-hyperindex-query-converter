@@ -38,6 +38,7 @@ async fn main() {
         .route("/chainId/:chain_id/debug", post(handle_chain_debug))
         .route("/schema/test", get(test_introspection))
         .route("/schema/refresh", post(refresh_schema_endpoint))
+        .route("/schema/raw", get(schema_raw_endpoint))
         .layer(cors);
 
     // Initialize schema on startup
@@ -559,6 +560,15 @@ async fn refresh_schema_endpoint() -> impl IntoResponse {
             )
         }
     }
+}
+
+/// Return the current schema cache as JSON for debugging
+async fn schema_raw_endpoint() -> impl IntoResponse {
+    let cache_json = schema::get_schema_cache_json();
+    (
+        StatusCode::OK,
+        Json(cache_json),
+    )
 }
 
 async fn maybe_fetch_subgraph_debug(payload: Value) -> Option<Value> {

@@ -29,9 +29,19 @@ pub fn convert_subgraph_to_hyperindex(
 
     tracing::info!("Converting query: {}", query);
 
-    // Check if this is an introspection query (uses __schema or __type)
-    // Introspection queries should pass through unchanged
-    if query.contains("__schema") || query.contains("__type") {
+    // Check if this is an introspection query **only by operation name**.
+    // We ONLY bypass conversion when the operation name is `IntrospectionQuery`.
+    let trimmed = query.trim_start();
+    let is_introspection = if trimmed.starts_with("query") {
+        // Look at the header before the first '{'
+        let header_end = trimmed.find('{').unwrap_or_else(|| trimmed.len());
+        let header = &trimmed[..header_end];
+        header.contains("IntrospectionQuery")
+    } else {
+        false
+    };
+
+    if is_introspection {
         tracing::info!("Detected introspection query, passing through unchanged");
         let mut result = serde_json::json!({
             "query": query

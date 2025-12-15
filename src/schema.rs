@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fs;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -68,7 +69,21 @@ pub async fn fetch_schema() -> Result<Value, Box<dyn std::error::Error + Send + 
 
     // Check for errors
     if let Some(errors) = response_json.get("errors") {
-        return Err(format!("Introspection query failed: {}", serde_json::to_string(errors)?).into());
+        return Err(
+            format!(
+                "Introspection query failed: {}",
+                serde_json::to_string(errors)?
+            )
+            .into(),
+        );
+    }
+
+    // Best-effort: write the full introspection response to a local file for inspection.
+    // This is mainly for local debugging so you can see exactly what the schema looks like.
+    if let Ok(pretty) = serde_json::to_string_pretty(&response_json) {
+        if let Err(e) = fs::write("schema_introspection.json", pretty) {
+            tracing::warn!("Failed to write schema_introspection.json: {}", e);
+        }
     }
 
     Ok(response_json)
@@ -231,6 +246,34 @@ pub fn get_cache_stats() -> (usize, Option<u64>) {
     let entity_count = cache.len();
     let last_updated = *SCHEMA_LAST_UPDATED.read().unwrap();
     (entity_count, last_updated)
+}
+
+/// Get a JSON snapshot of the current schema cache for debugging/inspection
+pub fn get_schema_cache_json() -> Value {
+    let cache = SCHEMA_CACHE.read().unwrap();
+    let mut entities: HashMap<String, Value> = HashMap::new();
+
+    for (entity_name, fields) in cache.iter() {
+        let mut field_map: HashMap<String, Value> = HashMap::new();
+        for (field_name, info) in fields.iter() {
+            field_map.insert(
+                field_name.clone(),
+                serde_json::json!({
+                    "is_nested_entity": info.is_nested_entity,
+                    "nested_type_name": info.nested_type_name,
+                }),
+            );
+        }
+        entities.insert(entity_name.clone(), serde_json::json!(field_map));
+    }
+
+    serde_json::json!({
+        "entities": entities,
+        "stats": {
+            "entity_count": entities.len(),
+            "last_updated": *SCHEMA_LAST_UPDATED.read().unwrap(),
+        }
+    })
 }
 
 /// Check if GraphQL errors suggest a schema mismatch that could be fixed by refreshing
