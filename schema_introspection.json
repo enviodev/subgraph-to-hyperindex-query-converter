@@ -1,0 +1,6348 @@
+{
+  "data": {
+    "__schema": {
+      "types": [
+        {
+          "fields": null,
+          "kind": "SCALAR",
+          "name": "Boolean"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Boolean_comparison_exp"
+        },
+        {
+          "fields": [
+            {
+              "name": "epoch",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "rewardsPerToken",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "rewardsPerTokenDiff",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "sharePrice",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "sharePriceDiff",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "timestamp",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "EpochShare"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "EpochShare_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "EpochShare_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "EpochShare_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "EpochShare_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "EpochShare_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "liqFeeP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "minLevPos",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "oracleFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "Fee"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Fee_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Fee_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "Fee_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Fee_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Fee_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "longCollateral",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxCollateralP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxLeverage",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "minLeverage",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "name",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "shortCollateral",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "Group"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Group_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Group_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "Group_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Group_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Group_stream_cursor_value_input"
+        },
+        {
+          "fields": null,
+          "kind": "SCALAR",
+          "name": "Int"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Int_comparison_exp"
+        },
+        {
+          "fields": [
+            {
+              "name": "block",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "collateral",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "executionStarted",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "initiatedAt",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isActive",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isBuy",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "leverage",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "limitType",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "notional",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "openPrice",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "orderId",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "pair",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Pair",
+                "ofType": null
+              }
+            },
+            {
+              "name": "pair_id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "stopLossPrice",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "takeProfitPrice",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "tradeNotional",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "trader",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "uniqueId",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "updatedAt",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "Limit"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Limit_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Limit_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "Limit_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Limit_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Limit_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "assets",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "epoch",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "shares",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "timestamp",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "type",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "user",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "withdrawRequestEpoch",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "withdrawShares",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "withdrawUnlockEpoch",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "LpAction"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "LpAction_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "LpAction_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "LpAction_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "LpAction_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "LpAction_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "assetsDeposited",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "assetsDiscount",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "atTime",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isUnlocked",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lockDuration",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "shares",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "user",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "LpNFT"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "LpNFT_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "LpNFT_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "LpNFT_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "LpNFT_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "LpNFT_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "assets",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "hasLocked",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lockedAssets",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lockedShares",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "shares",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "user",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "LpShare"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "LpShare_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "LpShare_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "LpShare_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "LpShare_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "LpShare_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isCallbackPaused",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isTradingPaused",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "liqMarginThresholdP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "liqThresholdP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "marketOrdersTimeout",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxAllowedCollateral",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxNegativePnlOnOpenP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxPendingMarketOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxTradesPerPair",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalClosedVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalDevFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLIQOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLiquidationFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLossTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalMarketOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenLimitOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOracleFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalPnL",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalProfitTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalRolloverFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalSLOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalTPOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalUsers",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalVaultFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "MetaData"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "MetaData_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "MetaData_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "MetaData_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "MetaData_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "MetaData_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "amountSentToTrader",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "builder",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "builderFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "cancelReason",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "cancelreason",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "closePercent",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "collateral",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "devFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "executedAt",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "executedBlock",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "executedTx",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "fundingFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "initiatedAt",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "initiatedBlock",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "initiatedTx",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isBuy",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isCancelled",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isPending",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "leverage",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "limitID",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "liquidationFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "notional",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "oracleFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "orderAction",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "orderaction",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "orderType",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "ordertype",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "pair",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Pair",
+                "ofType": null
+              }
+            },
+            {
+              "name": "pair_id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "price",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "priceAfterImpact",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "priceImpactP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "profitPercent",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "rolloverFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalProfitPercent",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "tradeID",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "tradeNotional",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "trader",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "vaultFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "Order"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Order_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Order_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "Order_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Order_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Order_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "accFundingLong",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "accFundingShort",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "accRollover",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "accRolloverLong",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "accRolloverShort",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "brokerPremium",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "buyVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "curFundingLong",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "curFundingShort",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "curRollover",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "decayRate",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "fee",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Fee",
+                "ofType": null
+              }
+            },
+            {
+              "name": "fee_id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "feed",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "from",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "fundingFeeSlope",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "group",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Group",
+                "ofType": null
+              }
+            },
+            {
+              "name": "group_id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "hillInflectionPoint",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "hillNegScale",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "hillPosScale",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isNegativeRolloverAllowed",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lastFundingBlock",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lastFundingRate",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lastFundingTime",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lastFundingVelocity",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lastOiDelta",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lastRolloverBlock",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lastRolloverLongPure",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lastRolloverTime",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lastTradePrice",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "lastUpdateTimestamp",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "longOI",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "makerFeeP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "makerMaxLeverage",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxFundingFeePerBlock",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxFundingFeeVelocity",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxLeverage",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxOI",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxRolloverFeePerBlock",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxRolloverVolatility",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "netVolThreshold",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "overnightMaxLeverage",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "priceImpactK",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "rolloverFeePerBlock",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "rolloverFeeSlope",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "sFactorDownScaleP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "sFactorUpScaleP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "sellVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "shortOI",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "springFactor",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "takerFeeP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "to",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenLimitOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "tradeSizeRef",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "usageFeeP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "utilizationThresholdP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "vaultFeePercent",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "volume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "Pair"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Pair_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Pair_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "Pair_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Pair_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Pair_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "day",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "sharePrice",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "timestamp",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "ShareToAssetsPriceDaily"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "ShareToAssetsPriceDaily_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "ShareToAssetsPriceDaily_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "ShareToAssetsPriceDaily_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "ShareToAssetsPriceDaily_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "ShareToAssetsPriceDaily_stream_cursor_value_input"
+        },
+        {
+          "fields": null,
+          "kind": "SCALAR",
+          "name": "String"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "String_comparison_exp"
+        },
+        {
+          "fields": [
+            {
+              "name": "builder",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "builderFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "closeInitiated",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "closePrice",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "collateral",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "funding",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "highestLeverage",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "index",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isBuy",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isOpen",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Boolean",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "leverage",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "notional",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "openPrice",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "pair",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Pair",
+                "ofType": null
+              }
+            },
+            {
+              "name": "pair_id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "rollover",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "stopLossPrice",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "takeProfitPrice",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "timestamp",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "tradeID",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "tradeNotional",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "tradeType",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "tradetype",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "trader",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "Trade"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Trade_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Trade_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "Trade_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Trade_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Trade_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "keeperAllowance",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "netFundingPayment",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalCancelledOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalClosedCollateral",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalClosedVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalDevFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLIQOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLiquidationFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLossTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalMarketOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenLimitOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOracleFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalPnL",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalProfitTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalRolloverFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalSLOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalTPOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalVaultFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "userGroupStats",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "userPairStats",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "User"
+        },
+        {
+          "fields": [
+            {
+              "name": "group",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Group",
+                "ofType": null
+              }
+            },
+            {
+              "name": "group_id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "netFundingPayment",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalCancelledOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalClosedCollateral",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalClosedVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalDevFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLIQOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLiquidationFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLossTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalMarketOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenLimitOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOracleFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalPnL",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalProfitTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalRolloverFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalSLOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalTPOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalVaultFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "user",
+              "type": {
+                "kind": "OBJECT",
+                "name": "User",
+                "ofType": null
+              }
+            },
+            {
+              "name": "user_id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "UserGroupStat"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_aggregate_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_avg_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_max_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_min_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "UserGroupStat_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_stddev_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_stddev_pop_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_stddev_samp_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_stream_cursor_value_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_sum_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_var_pop_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_var_samp_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserGroupStat_variance_order_by"
+        },
+        {
+          "fields": [
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "netFundingPayment",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "pair",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Pair",
+                "ofType": null
+              }
+            },
+            {
+              "name": "pair_id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalCancelledOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalClosedCollateral",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalClosedVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalDevFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLIQOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLiquidationFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLossTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalMarketOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenLimitOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOpenVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalOracleFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalPnL",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalProfitTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalRolloverFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalSLOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalTPOrders",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalTrades",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalVaultFee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalVolume",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "user",
+              "type": {
+                "kind": "OBJECT",
+                "name": "User",
+                "ofType": null
+              }
+            },
+            {
+              "name": "user_id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "UserPairStat"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_aggregate_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_avg_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_max_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_min_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "UserPairStat_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_stddev_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_stddev_pop_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_stddev_samp_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_stream_cursor_value_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_sum_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_var_pop_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_var_samp_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "UserPairStat_variance_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "User_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "User_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "User_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "User_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "User_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "accPnlPerTokenUsed",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "assets",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "currentEpoch",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "currentEpochEnd",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "currentEpochStart",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "currentMaxSupply",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxDiscountP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "maxDiscountThresholdP",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "rewardsPerToken",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "sharePrice",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "shares",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "totalLockedUsers",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "withdrawWindow",
+              "type": {
+                "kind": "SCALAR",
+                "name": "numeric",
+                "ofType": null
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "Vault"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Vault_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Vault_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "Vault_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Vault_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "Vault_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "args",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__InputValue",
+                "ofType": null
+              }
+            },
+            {
+              "name": "description",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isRepeatable",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "locations",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "name",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "__Directive"
+        },
+        {
+          "fields": [
+            {
+              "name": "deprecationReason",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "description",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isDeprecated",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "name",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "__EnumValue"
+        },
+        {
+          "fields": [
+            {
+              "name": "args",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__InputValue",
+                "ofType": null
+              }
+            },
+            {
+              "name": "deprecationReason",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "description",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "isDeprecated",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "name",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "type",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__Type",
+                "ofType": null
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "__Field"
+        },
+        {
+          "fields": [
+            {
+              "name": "defaultValue",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "description",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "name",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "type",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__Type",
+                "ofType": null
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "__InputValue"
+        },
+        {
+          "fields": [
+            {
+              "name": "description",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "directives",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__Directive",
+                "ofType": null
+              }
+            },
+            {
+              "name": "mutationType",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__Type",
+                "ofType": null
+              }
+            },
+            {
+              "name": "queryType",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__Type",
+                "ofType": null
+              }
+            },
+            {
+              "name": "subscriptionType",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__Type",
+                "ofType": null
+              }
+            },
+            {
+              "name": "types",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__Type",
+                "ofType": null
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "__Schema"
+        },
+        {
+          "fields": [
+            {
+              "name": "description",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "enumValues",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__EnumValue",
+                "ofType": null
+              }
+            },
+            {
+              "name": "fields",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__Field",
+                "ofType": null
+              }
+            },
+            {
+              "name": "inputFields",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__InputValue",
+                "ofType": null
+              }
+            },
+            {
+              "name": "interfaces",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__Type",
+                "ofType": null
+              }
+            },
+            {
+              "name": "kind",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "ENUM",
+                  "name": "__TypeKind",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "name",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "ofType",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__Type",
+                "ofType": null
+              }
+            },
+            {
+              "name": "possibleTypes",
+              "type": {
+                "kind": "OBJECT",
+                "name": "__Type",
+                "ofType": null
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "__Type"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "__TypeKind"
+        },
+        {
+          "fields": [
+            {
+              "name": "bufferBlock",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "chainId",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "endBlock",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "eventsProcessed",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "firstEventBlock",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "isReady",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Boolean",
+                "ofType": null
+              }
+            },
+            {
+              "name": "progressBlock",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "readyAt",
+              "type": {
+                "kind": "SCALAR",
+                "name": "timestamptz",
+                "ofType": null
+              }
+            },
+            {
+              "name": "sourceBlock",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "startBlock",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "_meta"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "_meta_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "_meta_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "_meta_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "_meta_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "_meta_stream_cursor_value_input"
+        },
+        {
+          "fields": null,
+          "kind": "SCALAR",
+          "name": "cancelreason"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "cancelreason_comparison_exp"
+        },
+        {
+          "fields": [
+            {
+              "name": "block_height",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "chain_id",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "end_block",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "first_event_block_number",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "is_hyper_sync",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Boolean",
+                "ofType": null
+              }
+            },
+            {
+              "name": "latest_fetched_block_number",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "latest_processed_block",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "num_batches_fetched",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "num_events_processed",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "start_block",
+              "type": {
+                "kind": "SCALAR",
+                "name": "Int",
+                "ofType": null
+              }
+            },
+            {
+              "name": "timestamp_caught_up_to_head_or_endblock",
+              "type": {
+                "kind": "SCALAR",
+                "name": "timestamptz",
+                "ofType": null
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "chain_metadata"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "chain_metadata_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "chain_metadata_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "chain_metadata_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "chain_metadata_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "chain_metadata_stream_cursor_value_input"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "cursor_ordering"
+        },
+        {
+          "fields": null,
+          "kind": "SCALAR",
+          "name": "jsonb"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "jsonb_cast_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "jsonb_comparison_exp"
+        },
+        {
+          "fields": null,
+          "kind": "SCALAR",
+          "name": "numeric"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "numeric_comparison_exp"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "order_by"
+        },
+        {
+          "fields": null,
+          "kind": "SCALAR",
+          "name": "orderaction"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "orderaction_comparison_exp"
+        },
+        {
+          "fields": null,
+          "kind": "SCALAR",
+          "name": "ordertype"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "ordertype_comparison_exp"
+        },
+        {
+          "fields": [
+            {
+              "name": "EpochShare",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "EpochShare_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "EpochShare",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Fee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Fee_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Fee",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Group",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Group_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Group",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Limit",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Limit_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Limit",
+                "ofType": null
+              }
+            },
+            {
+              "name": "LpAction",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "LpAction_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "LpAction",
+                "ofType": null
+              }
+            },
+            {
+              "name": "LpNFT",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "LpNFT_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "LpNFT",
+                "ofType": null
+              }
+            },
+            {
+              "name": "LpShare",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "LpShare_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "LpShare",
+                "ofType": null
+              }
+            },
+            {
+              "name": "MetaData",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "MetaData_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "MetaData",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Order",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Order_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Order",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Pair",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Pair_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Pair",
+                "ofType": null
+              }
+            },
+            {
+              "name": "ShareToAssetsPriceDaily",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "ShareToAssetsPriceDaily_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "ShareToAssetsPriceDaily",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Trade",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Trade_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Trade",
+                "ofType": null
+              }
+            },
+            {
+              "name": "User",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "UserGroupStat",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "UserGroupStat_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "UserGroupStat",
+                "ofType": null
+              }
+            },
+            {
+              "name": "UserPairStat",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "UserPairStat_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "UserPairStat",
+                "ofType": null
+              }
+            },
+            {
+              "name": "User_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "User",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Vault",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Vault_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Vault",
+                "ofType": null
+              }
+            },
+            {
+              "name": "_meta",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "chain_metadata",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "raw_events",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "raw_events_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "raw_events",
+                "ofType": null
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "query_root"
+        },
+        {
+          "fields": [
+            {
+              "name": "block_fields",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "jsonb",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "block_hash",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "block_number",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "block_timestamp",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "chain_id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "contract_name",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "event_id",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "numeric",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "event_name",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "log_index",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "params",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "jsonb",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "serial",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "Int",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "src_address",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "String",
+                  "ofType": null
+                }
+              }
+            },
+            {
+              "name": "transaction_fields",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "SCALAR",
+                  "name": "jsonb",
+                  "ofType": null
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "raw_events"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "raw_events_bool_exp"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "raw_events_order_by"
+        },
+        {
+          "fields": null,
+          "kind": "ENUM",
+          "name": "raw_events_select_column"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "raw_events_stream_cursor_input"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "raw_events_stream_cursor_value_input"
+        },
+        {
+          "fields": [
+            {
+              "name": "EpochShare",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "EpochShare_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "EpochShare",
+                "ofType": null
+              }
+            },
+            {
+              "name": "EpochShare_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Fee",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Fee_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Fee",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Fee_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Group",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Group_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Group",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Group_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Limit",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Limit_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Limit",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Limit_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "LpAction",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "LpAction_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "LpAction",
+                "ofType": null
+              }
+            },
+            {
+              "name": "LpAction_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "LpNFT",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "LpNFT_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "LpNFT",
+                "ofType": null
+              }
+            },
+            {
+              "name": "LpNFT_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "LpShare",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "LpShare_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "LpShare",
+                "ofType": null
+              }
+            },
+            {
+              "name": "LpShare_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "MetaData",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "MetaData_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "MetaData",
+                "ofType": null
+              }
+            },
+            {
+              "name": "MetaData_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Order",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Order_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Order",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Order_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Pair",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Pair_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Pair",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Pair_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "ShareToAssetsPriceDaily",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "ShareToAssetsPriceDaily_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "ShareToAssetsPriceDaily",
+                "ofType": null
+              }
+            },
+            {
+              "name": "ShareToAssetsPriceDaily_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Trade",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Trade_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Trade",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Trade_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "User",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "UserGroupStat",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "UserGroupStat_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "UserGroupStat",
+                "ofType": null
+              }
+            },
+            {
+              "name": "UserGroupStat_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "UserPairStat",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "UserPairStat_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "UserPairStat",
+                "ofType": null
+              }
+            },
+            {
+              "name": "UserPairStat_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "User_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "User",
+                "ofType": null
+              }
+            },
+            {
+              "name": "User_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Vault",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "Vault_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "Vault",
+                "ofType": null
+              }
+            },
+            {
+              "name": "Vault_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "_meta",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "_meta_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "chain_metadata",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "chain_metadata_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "raw_events",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            },
+            {
+              "name": "raw_events_by_pk",
+              "type": {
+                "kind": "OBJECT",
+                "name": "raw_events",
+                "ofType": null
+              }
+            },
+            {
+              "name": "raw_events_stream",
+              "type": {
+                "kind": "NON_NULL",
+                "name": null,
+                "ofType": {
+                  "kind": "LIST",
+                  "name": null,
+                  "ofType": {
+                    "kind": "NON_NULL",
+                    "name": null
+                  }
+                }
+              }
+            }
+          ],
+          "kind": "OBJECT",
+          "name": "subscription_root"
+        },
+        {
+          "fields": null,
+          "kind": "SCALAR",
+          "name": "timestamptz"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "timestamptz_comparison_exp"
+        },
+        {
+          "fields": null,
+          "kind": "SCALAR",
+          "name": "tradetype"
+        },
+        {
+          "fields": null,
+          "kind": "INPUT_OBJECT",
+          "name": "tradetype_comparison_exp"
+        }
+      ]
+    }
+  }
+}

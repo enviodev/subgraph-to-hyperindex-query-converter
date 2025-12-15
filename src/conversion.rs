@@ -147,6 +147,96 @@ fn extract_fragments_and_main_query(query: &str) -> Result<(String, String), Con
     Ok((fragments, main_query))
 }
 
+/// Convert variable type definitions from ID/Bytes/BigInt/BigDecimal to the
+/// concrete scalar types expected by Hyperindex/Hasura.
+/// - ID, Bytes  -> String
+/// - BigInt, BigDecimal -> numeric
+fn convert_variable_types_in_header(header: &str) -> String {
+    // Replace ID/Bytes/BigInt/BigDecimal types in variable definitions
+    // Handle patterns like:
+    // - $id: ID! -> $id: String!
+    // - $id: ID -> $id: String
+    // - $bytes: Bytes! -> $bytes: String!
+    // - $bytes: Bytes -> $bytes: String
+    // - $ids: [ID!]! -> $ids: [String!]!
+    // - $ids: [Bytes!] -> $ids: [String!]
+    // - $amount: BigInt! -> $amount: numeric!
+    // - $amounts: [BigInt!]! -> $amounts: [numeric!]!
+    
+    // Normalize whitespace (replace newlines/tabs with spaces) to handle
+    // multi-line variable definitions
+    let normalized: String = header
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    
+    // Collapse multiple spaces into single spaces
+    let mut result = String::new();
+    let mut prev_was_space = false;
+    for c in normalized.chars() {
+        if c == ' ' {
+            if !prev_was_space {
+                result.push(' ');
+            }
+            prev_was_space = true;
+        } else {
+            result.push(c);
+            prev_was_space = false;
+        }
+    }
+    
+    // Replace array types first (more specific patterns)
+    result = result.replace("[ID!]", "[String!]");
+    result = result.replace("[Bytes!]", "[String!]");
+    result = result.replace("[ID]", "[String]");
+    result = result.replace("[Bytes]", "[String]");
+    result = result.replace("[BigInt!]", "[numeric!]");
+    result = result.replace("[BigInt]", "[numeric]");
+    result = result.replace("[BigDecimal!]", "[numeric!]");
+    result = result.replace("[BigDecimal]", "[numeric]");
+    
+    // Replace non-nullable types
+    result = result.replace(": ID!", ": String!");
+    result = result.replace(": Bytes!", ": String!");
+    result = result.replace(": BigInt!", ": numeric!");
+    result = result.replace(": BigDecimal!", ": numeric!");
+    
+    // Replace nullable types using simple word-boundary-ish patterns
+    // Use word boundaries by checking for space/comma/paren after the type
+    result = result.replace(": ID ", ": String ");
+    result = result.replace(": ID,", ": String,");
+    result = result.replace(": ID)", ": String)");
+    result = result.replace(": Bytes ", ": String ");
+    result = result.replace(": Bytes,", ": String,");
+    result = result.replace(": Bytes)", ": String)");
+    result = result.replace(": BigInt ", ": numeric ");
+    result = result.replace(": BigInt,", ": numeric,");
+    result = result.replace(": BigInt)", ": numeric)");
+    result = result.replace(": BigDecimal ", ": numeric ");
+    result = result.replace(": BigDecimal,", ": numeric,");
+    result = result.replace(": BigDecimal)", ": numeric)");
+    
+    // Handle end of string cases (no trailing delimiter)
+    if result.ends_with(": ID") {
+        result.truncate(result.len() - 3);
+        result.push_str(": String");
+    }
+    if result.ends_with(": Bytes") {
+        result.truncate(result.len() - 6);
+        result.push_str(": String");
+    }
+    if result.ends_with(": BigInt") {
+        result.truncate(result.len() - 7);
+        result.push_str(": numeric");
+    }
+    if result.ends_with(": BigDecimal") {
+        result.truncate(result.len() - 11);
+        result.push_str(": numeric");
+    }
+    
+    result
+}
+
 fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<String, ConversionError> {
     // Extract query header (name and variable definitions) and body separately
     let (query_header, stripped_query) = if main_query.trim().starts_with("query") {
@@ -253,10 +343,12 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<String
     }
 
     // Reconstruct the query with preserved header (including variable definitions)
+    // Convert ID and Bytes types to String in variable definitions
     let query_header_str = if let Some(header) = &query_header {
-        // If we have a header, use it (it already includes "query" keyword)
-        tracing::debug!("Using preserved query header: '{}'", header);
-        header.clone()
+        // Convert variable type definitions: ID -> String, Bytes -> String
+        let converted_header = convert_variable_types_in_header(header);
+        tracing::debug!("Using preserved query header: '{}' (converted to: '{}')", header, converted_header);
+        converted_header
     } else {
         // Otherwise, use default "query"
         tracing::debug!("No query header found, using default 'query'");
@@ -2676,6 +2768,155 @@ mod tests {
         let query = result["query"].as_str().unwrap();
         assert!(query.contains("$limit"));
         assert!(query.contains("$where"));
+    }
+
+    #[test]
+    fn test_variable_type_id_converted_to_string() {
+        // ID! should be converted to String! in the header, but variable usage and body stay intact
+        let payload = json!({
+            "query": "query getUserVolume($id: ID!) { user(id: $id) { totalVolume __typename } }",
+            "variables": {
+                "id": "0xabc"
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+
+        let query = result["query"].as_str().unwrap();
+        // Header should now declare String!
+        assert!(
+            query.contains("query getUserVolume($id: String!)"),
+            "Expected ID! to be converted to String! in header, got: {}",
+            query
+        );
+        // Body should still refer to $id
+        assert!(query.contains("User_by_pk(id: $id)"));
+        // Variables should be passed through unchanged
+        assert_eq!(result["variables"]["id"], "0xabc");
+    }
+
+    #[test]
+    fn test_variable_type_bytes_converted_to_string() {
+        // Bytes and Bytes! should be converted to String / String!
+        let payload = json!({
+            "query": "query GetSomething($data: Bytes!, $maybeData: Bytes) { user(id: \"x\") { id __typename } }",
+            "variables": {
+                "data": "0xdeadbeef",
+                "maybeData": null
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+
+        let query = result["query"].as_str().unwrap();
+        assert!(
+            query.contains("query GetSomething($data: String!, $maybeData: String)"),
+            "Expected Bytes/Bytes! to be converted to String/String! in header, got: {}",
+            query
+        );
+        // Variables still present
+        assert_eq!(result["variables"]["data"], "0xdeadbeef");
+    }
+
+    #[test]
+    fn test_variable_type_array_id_converted_to_string() {
+        // Array ID types should also be converted
+        let payload = json!({
+            "query": "query GetUsers($ids: [ID!]!) { users(first: 10, where: { id_in: $ids }) { id } }",
+            "variables": {
+                "ids": ["0x1", "0x2"]
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+
+        let query = result["query"].as_str().unwrap();
+        assert!(
+            query.contains("query GetUsers($ids: [String!]!)"),
+            "Expected [ID!]! to be converted to [String!]! in header, got: {}",
+            query
+        );
+        // Ensure the query name itself is untouched (no accidental ID -> String inside names)
+        assert!(query.contains("query GetUsers("));
+        // Variables should still be arrays
+        let vars = &result["variables"]["ids"];
+        assert!(vars.is_array());
+        assert_eq!(vars[0], "0x1");
+        assert_eq!(vars[1], "0x2");
+    }
+
+    #[test]
+    fn test_variable_type_bigint_converted_to_numeric() {
+        // BigInt! and BigInt should be converted to numeric!/numeric
+        let payload = json!({
+            "query": "query Limits($minLeverage: BigInt!, $maxLeverage: BigInt) { limits(where: { leverage_gte: $minLeverage, leverage_lte: $maxLeverage }) { id leverage } }",
+            "variables": {
+                "minLeverage": "5",
+                "maxLeverage": "10"
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+
+        let query = result["query"].as_str().unwrap();
+        assert!(
+            query.contains("query Limits($minLeverage: numeric!, $maxLeverage: numeric)"),
+            "Expected BigInt/BigInt! to be converted to numeric/numeric! in header, got: {}",
+            query
+        );
+        // Variables preserved
+        assert_eq!(result["variables"]["minLeverage"], "5");
+        assert_eq!(result["variables"]["maxLeverage"], "10");
+    }
+
+    #[test]
+    fn test_variable_type_bigdecimal_converted_to_numeric() {
+        // BigDecimal! and BigDecimal should be converted to numeric!/numeric
+        let payload = json!({
+            "query": "query Prices($price: BigDecimal!, $avgPrice: BigDecimal) { trades(where: { openPrice_gte: $price, openPrice_lte: $avgPrice }) { id openPrice } }",
+            "variables": {
+                "price": "1.23",
+                "avgPrice": "4.56"
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+
+        let query = result["query"].as_str().unwrap();
+        assert!(
+            query.contains("query Prices($price: numeric!, $avgPrice: numeric)"),
+            "Expected BigDecimal/BigDecimal! to be converted to numeric/numeric! in header, got: {}",
+            query
+        );
+        assert_eq!(result["variables"]["price"], "1.23");
+        assert_eq!(result["variables"]["avgPrice"], "4.56");
+    }
+
+    #[test]
+    fn test_variable_type_multiline_header() {
+        // Test that multi-line variable definitions work correctly
+        // This is the exact format from the user's failing query
+        let payload = json!({
+            "query": "query Limits(\n  $pair: String!\n  $isActive: Boolean!\n  $first: Int!\n  $minLeverage: BigInt\n) {\n  limits(first: $first, where: { pair: $pair, isActive: $isActive, leverage_gte: $minLeverage }) { id leverage } }",
+            "variables": {
+                "pair": "0",
+                "isActive": true,
+                "first": 100,
+                "minLeverage": "5"
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+
+        let query = result["query"].as_str().unwrap();
+        // Should convert BigInt to numeric even with newlines
+        assert!(
+            query.contains("$minLeverage: numeric"),
+            "Expected BigInt to be converted to numeric in multi-line header, got: {}",
+            query
+        );
+        // Should NOT contain BigInt anymore
+        assert!(
+            !query.contains("$minLeverage: BigInt"),
+            "Should not contain BigInt in converted query, got: {}",
+            query
+        );
+        // Variables preserved
+        assert_eq!(result["variables"]["minLeverage"], "5");
     }
 
 }
