@@ -165,8 +165,9 @@ fn extract_fragments_and_main_query(query: &str) -> Result<(String, String), Con
 /// concrete scalar types expected by Hyperindex/Hasura.
 /// - ID, Bytes  -> String
 /// - BigInt, BigDecimal -> numeric
-fn convert_variable_types_in_header(header: &str) -> String {
+fn convert_variable_types_in_header(header: &str, variable_type_overrides: &HashMap<String, String>) -> String {
     // Replace ID/Bytes/BigInt/BigDecimal types in variable definitions
+    // Also apply enum type overrides for variables used with enum fields
     // Handle patterns like:
     // - $id: ID! -> $id: String!
     // - $id: ID -> $id: String
@@ -248,6 +249,43 @@ fn convert_variable_types_in_header(header: &str) -> String {
         result.push_str(": numeric");
     }
     
+    // Apply variable type overrides for enum types
+    // For each variable that should be an enum type, replace its declared type
+    for (var_name, expected_type) in variable_type_overrides {
+        // Look for patterns like "$operation: String" and replace with "$operation: orderaction"
+        // Handle various type patterns: Type, Type!, [Type], [Type!], etc.
+        let var_prefix = format!("${}: ", var_name);
+        if let Some(var_start) = result.find(&var_prefix) {
+            let type_start = var_start + var_prefix.len();
+            // Find the end of the type (next comma, paren, or space)
+            let remaining = &result[type_start..];
+            let type_end = remaining
+                .find(|c: char| c == ',' || c == ')' || c == ' ')
+                .unwrap_or(remaining.len());
+            
+            let current_type = &remaining[..type_end];
+            
+            // Only override if current type is String (the common case for enums)
+            // Preserve nullability: String -> enum, String! -> enum!
+            if current_type == "String" || current_type == "String!" {
+                let new_type = if current_type.ends_with('!') {
+                    format!("{}!", expected_type)
+                } else {
+                    expected_type.clone()
+                };
+                
+                tracing::info!(
+                    "Converting variable ${} type from {} to {} (enum field)",
+                    var_name, current_type, new_type
+                );
+                
+                let before = &result[..type_start];
+                let after = &result[type_start + type_end..];
+                result = format!("{}{}{}", before, new_type, after);
+            }
+        }
+    }
+    
     result
 }
 
@@ -278,6 +316,8 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<(Strin
     let mut converted_entities = Vec::new();
     // Build mapping from Hyperindex field names to original query field names
     let mut field_name_map: HashMap<String, String> = HashMap::new();
+    // Collect variable type overrides from all entities
+    let mut all_variable_type_overrides: HashMap<String, String> = HashMap::new();
 
     for (entity, params, selection) in entities {
         let entity_cap = singularize_and_capitalize(&entity);
@@ -316,16 +356,21 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<(Strin
 
         // Convert filters to where clause (flattened)
         // If where is a variable, it will be handled separately
-        let where_clause = if where_is_variable {
+        let (where_clause, entity_var_overrides) = if where_is_variable {
             // If where is a variable, pass it through directly
-            if let Some(where_var) = params.get("where") {
+            let clause = if let Some(where_var) = params.get("where") {
                 format!("where: {}", where_var)
             } else {
                 String::new()
-            }
+            };
+            (clause, HashMap::new())
         } else {
-            convert_filters_to_where_clause(&converted_params, &entity_cap)?
+            let result = convert_filters_to_where_clause(&converted_params, &entity_cap)?;
+            (result.where_clause, result.variable_type_overrides)
         };
+        
+        // Merge variable type overrides
+        all_variable_type_overrides.extend(entity_var_overrides);
 
         let mut params_vec = Vec::new();
         if let Some(l) = limit.as_ref() {
@@ -366,8 +411,8 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<(Strin
     // Reconstruct the query with preserved header (including variable definitions)
     // Convert ID and Bytes types to String in variable definitions
     let query_header_str = if let Some(header) = &query_header {
-        // Convert variable type definitions: ID -> String, Bytes -> String
-        let converted_header = convert_variable_types_in_header(header);
+        // Convert variable type definitions: ID -> String, Bytes -> String, and enum types
+        let converted_header = convert_variable_types_in_header(header, &all_variable_type_overrides);
         tracing::debug!("Using preserved query header: '{}' (converted to: '{}')", header, converted_header);
         converted_header
     } else {
@@ -800,10 +845,18 @@ fn process_nested_filters_recursive(
     Ok(format!("{}: {{{}}}", parent, child_conditions.join(", ")))
 }
 
+/// Result of filter conversion, including the where clause and variable type overrides
+struct FilterConversionResult {
+    where_clause: String,
+    /// Maps variable names to their expected types (for enum fields)
+    /// e.g., "operation" -> "orderaction"
+    variable_type_overrides: HashMap<String, String>,
+}
+
 fn convert_filters_to_where_clause(
     params: &HashMap<String, String>,
     entity_name: &str,
-) -> Result<String, ConversionError> {
+) -> Result<FilterConversionResult, ConversionError> {
     // Recursively flatten the entire params map
     let mut flat_filters = flatten_where_map(params.clone());
 
@@ -863,6 +916,7 @@ fn convert_filters_to_where_clause(
     });
 
     let mut where_conditions = Vec::new();
+    let mut variable_type_overrides: HashMap<String, String> = HashMap::new();
 
     // Add basic filters
     let mut and_conditions = Vec::new();
@@ -871,13 +925,19 @@ fn convert_filters_to_where_clause(
         if conditions.len() == 1 {
             // Single condition for this field
             let (k, v) = &conditions[0];
-            let condition = convert_basic_filter_to_hasura_condition(&k, &v, entity_name)?;
+            let (condition, var_override) = convert_basic_filter_to_hasura_condition_with_type(&k, &v, entity_name)?;
             where_conditions.push(condition);
+            if let Some((var_name, var_type)) = var_override {
+                variable_type_overrides.insert(var_name, var_type);
+            }
         } else {
             // Multiple conditions for the same field - wrap in _and
             for (k, v) in conditions {
-                let condition = convert_basic_filter_to_hasura_condition(&k, &v, entity_name)?;
+                let (condition, var_override) = convert_basic_filter_to_hasura_condition_with_type(&k, &v, entity_name)?;
                 and_conditions.push(format!("{{{}}}", condition));
+                if let Some((var_name, var_type)) = var_override {
+                    variable_type_overrides.insert(var_name, var_type);
+                }
             }
         }
     }
@@ -896,10 +956,16 @@ fn convert_filters_to_where_clause(
     }
 
     if where_conditions.is_empty() {
-        return Ok(String::new());
+        return Ok(FilterConversionResult {
+            where_clause: String::new(),
+            variable_type_overrides,
+        });
     }
 
-    Ok(format!("where: {{{}}}", where_conditions.join(", ")))
+    Ok(FilterConversionResult {
+        where_clause: format!("where: {{{}}}", where_conditions.join(", ")),
+        variable_type_overrides,
+    })
 }
 
 fn parse_nested_where_clause(
@@ -1111,6 +1177,46 @@ fn convert_basic_filter_to_hasura_condition(
     // Default case: treat as equality filter (for regular fields, with or without variables)
     let result = format!("{}: {{_eq: {}}}", key, value);
     Ok(result)
+}
+
+/// Same as convert_basic_filter_to_hasura_condition but also returns variable type override info
+/// Returns: (condition_string, Option<(variable_name, expected_type)>)
+fn convert_basic_filter_to_hasura_condition_with_type(
+    key: &str,
+    value: &str,
+    entity_name: &str,
+) -> Result<(String, Option<(String, String)>), ConversionError> {
+    let condition = convert_basic_filter_to_hasura_condition(key, value, entity_name)?;
+    
+    // Check if value is a variable and if the field has a non-standard type (enum)
+    let trimmed_value = value.trim();
+    if trimmed_value.starts_with('$') {
+        // Extract variable name (remove $ prefix)
+        let var_name = trimmed_value.trim_start_matches('$').to_string();
+        
+        // Get the base field name (remove operator suffix like _gte, _contains, etc.)
+        let base_field = if let Some(underscore_idx) = key.find('_') {
+            &key[..underscore_idx]
+        } else {
+            key
+        };
+        
+        // Look up the field info in the schema
+        if let Some(field_info) = schema::get_field_info(entity_name, base_field) {
+            // Skip if this is a nested entity (object type) - those use String for ID references
+            // Only override if it's not a standard scalar AND not a nested entity
+            // This means it's likely an enum type
+            if !schema::is_standard_scalar(&field_info.field_type) && !field_info.is_nested_entity {
+                tracing::debug!(
+                    "Variable ${} used with field {}.{} expects type {} (likely enum)",
+                    var_name, entity_name, base_field, field_info.field_type
+                );
+                return Ok((condition, Some((var_name, field_info.field_type))));
+            }
+        }
+    }
+    
+    Ok((condition, None))
 }
 
 // Removed unused nested filter helper
@@ -2938,6 +3044,59 @@ mod tests {
         );
         // Variables preserved
         assert_eq!(result.query["variables"]["minLeverage"], "5");
+    }
+
+    #[test]
+    fn test_variable_type_enum_conversion() {
+        init_test_schema_if_needed();
+        // Test that String variables used with enum fields get converted to the enum type
+        // This simulates the orderAction enum scenario
+        let payload = json!({
+            "query": "query ListOperations($operation: String) { orders(where: { orderAction: $operation }) { id trader } }",
+            "variables": {
+                "operation": "Open"
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+
+        let query = result.query["query"].as_str().unwrap();
+        println!("Converted query: {}", query);
+        
+        // Should convert String to orderaction (the enum type)
+        assert!(
+            query.contains("$operation: orderaction"),
+            "Expected String to be converted to orderaction enum type, got: {}",
+            query
+        );
+        // Should NOT contain String type for operation anymore
+        assert!(
+            !query.contains("$operation: String"),
+            "Should not contain String type for operation in converted query, got: {}",
+            query
+        );
+    }
+
+    #[test]
+    fn test_variable_type_enum_conversion_non_nullable() {
+        init_test_schema_if_needed();
+        // Test that non-nullable String! variables get converted to enum! (preserving nullability)
+        let payload = json!({
+            "query": "query ListOperations($operation: String!) { orders(where: { orderAction: $operation }) { id } }",
+            "variables": {
+                "operation": "Open"
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+
+        let query = result.query["query"].as_str().unwrap();
+        println!("Converted query: {}", query);
+        
+        // Should convert String! to orderaction! (preserving non-nullable)
+        assert!(
+            query.contains("$operation: orderaction!"),
+            "Expected String! to be converted to orderaction! enum type, got: {}",
+            query
+        );
     }
 
 }

@@ -12,6 +12,7 @@ type SchemaCache = Arc<RwLock<HashMap<String, HashMap<String, FieldInfo>>>>;
 pub struct FieldInfo {
     pub is_nested_entity: bool,
     pub nested_type_name: Option<String>, // If nested, the type name (e.g., "Pair")
+    pub field_type: String, // The actual type name (e.g., "String", "Int", "orderaction")
 }
 
 // Track when the schema was last updated
@@ -145,12 +146,20 @@ pub fn parse_and_cache_schema(introspection_response: &Value) -> Result<(), Box<
             } else {
                 None
             };
+            
+            // Get the actual type name for enum/scalar detection
+            let type_name_str = actual_type
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("String")
+                .to_string();
 
             field_map.insert(
                 field_name.to_string(),
                 FieldInfo {
                     is_nested_entity,
                     nested_type_name,
+                    field_type: type_name_str,
                 },
             );
         }
@@ -205,6 +214,14 @@ pub fn is_nested_entity(entity_name: &str, field_name: &str) -> bool {
     get_field_info(entity_name, field_name)
         .map(|info| info.is_nested_entity)
         .unwrap_or(false)
+}
+
+/// Check if a type is a standard scalar (not an enum)
+pub fn is_standard_scalar(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "String" | "Int" | "Float" | "Boolean" | "ID" | "BigInt" | "BigDecimal" | "Bytes" | "numeric"
+    )
 }
 
 /// Initialize the schema by fetching and caching it
@@ -342,28 +359,34 @@ pub fn init_test_schema() {
     trade_fields.insert("id".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "String".to_string(),
     });
     trade_fields.insert("pair".to_string(), FieldInfo {
         is_nested_entity: true,
         nested_type_name: Some("Pair".to_string()),
+        field_type: "Pair".to_string(),
     });
     // Note: token can be either nested or regular depending on context
     // For Trade, we'll make it a regular field by default (can be overridden in specific tests)
     trade_fields.insert("token".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "String".to_string(),
     });
     trade_fields.insert("amount".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "numeric".to_string(),
     });
     trade_fields.insert("isOpen".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "Boolean".to_string(),
     });
     trade_fields.insert("type".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "String".to_string(),
     });
     cache.insert("Trade".to_string(), trade_fields);
 
@@ -372,22 +395,27 @@ pub fn init_test_schema() {
     pair_fields.insert("id".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "String".to_string(),
     });
     pair_fields.insert("fee".to_string(), FieldInfo {
         is_nested_entity: true,
         nested_type_name: Some("Fee".to_string()),
+        field_type: "Fee".to_string(),
     });
     pair_fields.insert("token".to_string(), FieldInfo {
         is_nested_entity: true,
         nested_type_name: Some("Token".to_string()),
+        field_type: "Token".to_string(),
     });
     pair_fields.insert("from".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "String".to_string(),
     });
     pair_fields.insert("name".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "String".to_string(),
     });
     cache.insert("Pair".to_string(), pair_fields);
 
@@ -396,14 +424,17 @@ pub fn init_test_schema() {
     token_fields.insert("id".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "String".to_string(),
     });
     token_fields.insert("amount".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "numeric".to_string(),
     });
     token_fields.insert("name".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "String".to_string(),
     });
     cache.insert("Token".to_string(), token_fields);
 
@@ -412,10 +443,12 @@ pub fn init_test_schema() {
     fee_fields.insert("id".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "String".to_string(),
     });
     fee_fields.insert("liqFeeP".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "numeric".to_string(),
     });
     cache.insert("Fee".to_string(), fee_fields);
 
@@ -424,14 +457,17 @@ pub fn init_test_schema() {
     lp_action_fields.insert("user".to_string(), FieldInfo {
         is_nested_entity: true,
         nested_type_name: Some("User".to_string()),
+        field_type: "User".to_string(),
     });
     lp_action_fields.insert("type".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "String".to_string(),
     });
     lp_action_fields.insert("withdrawUnlockEpoch".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "Int".to_string(),
     });
     cache.insert("LpAction".to_string(), lp_action_fields);
 
@@ -440,6 +476,7 @@ pub fn init_test_schema() {
     user_group_stat_fields.insert("user".to_string(), FieldInfo {
         is_nested_entity: true,
         nested_type_name: Some("User".to_string()),
+        field_type: "User".to_string(),
     });
     cache.insert("UserGroupStat".to_string(), user_group_stat_fields);
 
@@ -448,8 +485,43 @@ pub fn init_test_schema() {
     user_fields.insert("id".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
+        field_type: "String".to_string(),
     });
     cache.insert("User".to_string(), user_fields);
+
+    // Order entity (for enum type conversion test)
+    let mut order_fields = HashMap::new();
+    order_fields.insert("id".to_string(), FieldInfo {
+        is_nested_entity: false,
+        nested_type_name: None,
+        field_type: "String".to_string(),
+    });
+    order_fields.insert("trader".to_string(), FieldInfo {
+        is_nested_entity: false,
+        nested_type_name: None,
+        field_type: "String".to_string(),
+    });
+    order_fields.insert("orderAction".to_string(), FieldInfo {
+        is_nested_entity: false,
+        nested_type_name: None,
+        field_type: "orderaction".to_string(), // enum type
+    });
+    order_fields.insert("isPending".to_string(), FieldInfo {
+        is_nested_entity: false,
+        nested_type_name: None,
+        field_type: "Boolean".to_string(),
+    });
+    order_fields.insert("executedAt".to_string(), FieldInfo {
+        is_nested_entity: false,
+        nested_type_name: None,
+        field_type: "numeric".to_string(),
+    });
+    order_fields.insert("pair".to_string(), FieldInfo {
+        is_nested_entity: true,
+        nested_type_name: Some("Pair".to_string()),
+        field_type: "Pair".to_string(),
+    });
+    cache.insert("Order".to_string(), order_fields);
 
     // Update timestamp
     let timestamp = SystemTime::now()
