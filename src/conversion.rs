@@ -249,10 +249,11 @@ fn convert_variable_types_in_header(header: &str, variable_type_overrides: &Hash
         result.push_str(": numeric");
     }
     
-    // Apply variable type overrides for enum types
-    // For each variable that should be an enum type, replace its declared type
+    // Apply variable type overrides for enum and numeric types
+    // For each variable that needs type conversion, replace its declared type
     for (var_name, expected_type) in variable_type_overrides {
         // Look for patterns like "$operation: String" and replace with "$operation: orderaction"
+        // Or "$epoch: String" -> "$epoch: numeric"
         // Handle various type patterns: Type, Type!, [Type], [Type!], etc.
         let var_prefix = format!("${}: ", var_name);
         if let Some(var_start) = result.find(&var_prefix) {
@@ -265,9 +266,12 @@ fn convert_variable_types_in_header(header: &str, variable_type_overrides: &Hash
             
             let current_type = &remaining[..type_end];
             
-            // Only override if current type is String (the common case for enums)
-            // Preserve nullability: String -> enum, String! -> enum!
-            if current_type == "String" || current_type == "String!" {
+            // Override String to expected type (enum or numeric)
+            // Also handle Int -> numeric if needed
+            let should_convert = current_type == "String" || current_type == "String!" 
+                || current_type == "Int" || current_type == "Int!";
+            
+            if should_convert {
                 let new_type = if current_type.ends_with('!') {
                     format!("{}!", expected_type)
                 } else {
@@ -275,7 +279,7 @@ fn convert_variable_types_in_header(header: &str, variable_type_overrides: &Hash
                 };
                 
                 tracing::info!(
-                    "Converting variable ${} type from {} to {} (enum field)",
+                    "Converting variable ${} type from {} to {} (field type mismatch)",
                     var_name, current_type, new_type
                 );
                 
@@ -1188,7 +1192,7 @@ fn convert_basic_filter_to_hasura_condition_with_type(
 ) -> Result<(String, Option<(String, String)>), ConversionError> {
     let condition = convert_basic_filter_to_hasura_condition(key, value, entity_name)?;
     
-    // Check if value is a variable and if the field has a non-standard type (enum)
+    // Check if value is a variable and if the field type needs conversion
     let trimmed_value = value.trim();
     if trimmed_value.starts_with('$') {
         // Extract variable name (remove $ prefix)
@@ -1204,9 +1208,22 @@ fn convert_basic_filter_to_hasura_condition_with_type(
         // Look up the field info in the schema
         if let Some(field_info) = schema::get_field_info(entity_name, base_field) {
             // Skip if this is a nested entity (object type) - those use String for ID references
-            // Only override if it's not a standard scalar AND not a nested entity
-            // This means it's likely an enum type
-            if !schema::is_standard_scalar(&field_info.field_type) && !field_info.is_nested_entity {
+            if field_info.is_nested_entity {
+                return Ok((condition, None));
+            }
+            
+            // Check if field expects numeric - users often declare String but field is numeric
+            // This handles cases like withdrawUnlockEpoch where subgraph accepts String but Hyperindex needs numeric
+            if field_info.field_type == "numeric" || field_info.field_type == "Int" || field_info.field_type == "Float" {
+                tracing::debug!(
+                    "Variable ${} used with field {}.{} expects type {} (numeric field)",
+                    var_name, entity_name, base_field, field_info.field_type
+                );
+                return Ok((condition, Some((var_name, field_info.field_type.clone()))));
+            }
+            
+            // Check if it's an enum type (not a standard scalar)
+            if !schema::is_standard_scalar(&field_info.field_type) {
                 tracing::debug!(
                     "Variable ${} used with field {}.{} expects type {} (likely enum)",
                     var_name, entity_name, base_field, field_info.field_type
