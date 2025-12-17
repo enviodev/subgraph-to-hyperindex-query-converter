@@ -26,10 +26,10 @@ async fn test_actions_and_assets_query() {
     });
 
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-    println!("Converted query: {}", result["query"].as_str().unwrap());
+    println!("Converted query: {}", result.query["query"].as_str().unwrap());
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             println!("Response: {:?}", response_json);
@@ -90,10 +90,10 @@ async fn test_streams_with_order_by_query() {
     });
 
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-    println!("Converted query: {}", result["query"].as_str().unwrap());
+    println!("Converted query: {}", result.query["query"].as_str().unwrap());
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             println!("Response: {:?}", response_json);
@@ -164,12 +164,12 @@ async fn test_streams_with_filter_query() {
     });
 
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-    let converted_query = result["query"].as_str().unwrap();
+    let converted_query = result.query["query"].as_str().unwrap();
     std::fs::write("converted_query.txt", converted_query).expect("Unable to write file");
     println!("\n================ CONVERTED QUERY WRITTEN TO FILE ================\n");
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             println!("Response: {:?}", response_json);
@@ -233,10 +233,10 @@ async fn test_streams_with_order_by_and_skip_query() {
     });
 
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-    println!("Converted query: {}", result["query"].as_str().unwrap());
+    println!("Converted query: {}", result.query["query"].as_str().unwrap());
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             println!("Response: {:?}", response_json);
@@ -310,10 +310,10 @@ async fn test_streams_with_order_by_skip_and_filter_query() {
     });
 
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-    println!("Converted query: {}", result["query"].as_str().unwrap());
+    println!("Converted query: {}", result.query["query"].as_str().unwrap());
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             println!("Response: {:?}", response_json);
@@ -393,11 +393,11 @@ async fn test_complex_nested_query_with_multiple_filters() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted complex nested query: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             // Check for errors
@@ -492,11 +492,11 @@ async fn test_multiple_entities_single_query() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted multiple entities query: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             // Check for errors
@@ -573,11 +573,11 @@ async fn test_advanced_filter_combinations() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted advanced filters query: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             // Check for errors
@@ -652,11 +652,11 @@ async fn test_pagination_and_ordering_edge_cases() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted pagination edge case query: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             // Check for errors
@@ -721,11 +721,11 @@ async fn test_string_vs_numeric_filter_values() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted mixed type filters query: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             // Check for errors
@@ -802,11 +802,11 @@ async fn test_case_sensitive_vs_insensitive_filters() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted case sensitivity query: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             // Check for errors
@@ -874,7 +874,7 @@ async fn test_response_format_comparison() {
     });
 
     let converted_result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-    let converted_query = converted_result["query"].as_str().unwrap();
+    let converted_query = converted_result.query["query"].as_str().unwrap();
 
     println!("Original subgraph query: {}", subgraph_query);
     println!("Converted Hyperindex query: {}", converted_query);
@@ -888,7 +888,7 @@ async fn test_response_format_comparison() {
     println!("TheGraph response: {:?}", thegraph_response);
 
     // Make request to Hyperindex
-    let hyperindex_response = forward_to_hyperindex(&converted_result).await;
+    let hyperindex_response = forward_to_hyperindex(&converted_result.query).await;
     println!("Hyperindex response: {:?}", hyperindex_response);
 
     // Compare the responses
@@ -1023,7 +1023,7 @@ query {
     });
 
     let converted_result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-    let converted_query = converted_result["query"].as_str().unwrap();
+    let converted_query = converted_result.query["query"].as_str().unwrap();
 
     println!("Original subgraph query with fragments:");
     println!("{}", subgraph_query);
@@ -1031,7 +1031,7 @@ query {
     println!("{}", converted_query);
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&converted_result).await;
+    let response = forward_to_hyperindex(&converted_result.query).await;
     match response {
         Ok(response_json) => {
             println!("Hyperindex response: {:?}", response_json);
@@ -1136,11 +1136,11 @@ async fn test_gist_query_1_actions_and_assets() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted gist query 1: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             println!("Gist query 1 response: {:?}", response_json);
@@ -1203,11 +1203,11 @@ async fn test_gist_query_2_streams_with_order_by() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted gist query 2: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             println!("Gist query 2 response: {:?}", response_json);
@@ -1278,11 +1278,11 @@ async fn test_gist_query_3_streams_with_filter() {
     });
 
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-    let converted_query = result["query"].as_str().unwrap();
+    let converted_query = result.query["query"].as_str().unwrap();
     println!("Converted gist query 3: {}", converted_query);
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             println!("Gist query 3 response: {:?}", response_json);
@@ -1361,11 +1361,11 @@ async fn test_gist_query_4_complex_nested_query() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted gist query 4: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             // Check for errors
@@ -1457,11 +1457,11 @@ async fn test_gist_query_5_multiple_entities() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted gist query 5: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             // Check for errors
@@ -1535,11 +1535,11 @@ async fn test_gist_query_6_advanced_filters() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted gist query 6: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             // Check for errors
@@ -1611,11 +1611,11 @@ async fn test_gist_query_7_pagination_edge_cases() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted gist query 7: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             // Check for errors
@@ -1678,11 +1678,11 @@ async fn test_gist_query_8_mixed_type_filters() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted gist query 8: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             // Check for errors
@@ -1751,11 +1751,11 @@ async fn test_gist_query_9_case_sensitivity() {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted gist query 9: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             // Check for errors
@@ -1834,11 +1834,11 @@ query {
     let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
     println!(
         "Converted gist query 10: {}",
-        result["query"].as_str().unwrap()
+        result.query["query"].as_str().unwrap()
     );
 
     // Forward to Hyperindex
-    let response = forward_to_hyperindex(&result).await;
+    let response = forward_to_hyperindex(&result.query).await;
     match response {
         Ok(response_json) => {
             println!("Gist query 10 response: {:?}", response_json);

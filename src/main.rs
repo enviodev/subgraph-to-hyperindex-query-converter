@@ -71,8 +71,8 @@ async fn execute_query_with_retry(
     }
 
     // Convert the query
-    let converted_query = match conversion::convert_subgraph_to_hyperindex(payload, chain_id) {
-        Ok(query) => query,
+    let conversion_result = match conversion::convert_subgraph_to_hyperindex(payload, chain_id) {
+        Ok(result) => result,
         Err(e) => {
             tracing::error!("Conversion error: {}", e);
             let reasoning = match &e {
@@ -102,6 +102,9 @@ async fn execute_query_with_retry(
             );
         }
     };
+
+    let converted_query = conversion_result.query;
+    let field_name_map = conversion_result.field_name_map;
 
     tracing::info!("Converted query: {:?}", converted_query);
 
@@ -183,8 +186,8 @@ async fn execute_query_with_retry(
             }
 
             // Retry: convert query again with fresh schema
-            let retry_converted_query = match conversion::convert_subgraph_to_hyperindex(payload, chain_id) {
-                Ok(query) => query,
+            let retry_result = match conversion::convert_subgraph_to_hyperindex(payload, chain_id) {
+                Ok(result) => result,
                 Err(e) => {
                     tracing::error!("Conversion error on retry: {}", e);
                     // Return original error, not the retry conversion error
@@ -202,7 +205,7 @@ async fn execute_query_with_retry(
             };
 
             // Retry: forward query again
-            let retry_response = match forward_to_hyperindex(&retry_converted_query).await {
+            let retry_response = match forward_to_hyperindex(&retry_result.query).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::error!("Hyperindex request error on retry: {}", e);
@@ -239,7 +242,7 @@ async fn execute_query_with_retry(
 
             // Retry succeeded!
             tracing::info!("Query succeeded after schema refresh and retry");
-            let transformed = transform_response_to_subgraph_shape(retry_response);
+            let transformed = transform_response_to_subgraph_shape(retry_response, &field_name_map);
             return (StatusCode::OK, Json(transformed));
         }
 
@@ -269,7 +272,7 @@ async fn execute_query_with_retry(
     }
 
     // Success - no errors
-    let transformed = transform_response_to_subgraph_shape(response);
+    let transformed = transform_response_to_subgraph_shape(response, &field_name_map);
     (StatusCode::OK, Json(transformed))
 }
 
@@ -306,9 +309,9 @@ async fn handle_debug(Json(payload): Json<Value>) -> impl IntoResponse {
     }
 
     match conversion::convert_subgraph_to_hyperindex(&payload, None) {
-        Ok(converted_query) => {
-            tracing::info!("Converted debug query: {:?}", converted_query);
-            (StatusCode::OK, Json(converted_query))
+        Ok(result) => {
+            tracing::info!("Converted debug query: {:?}", result.query);
+            (StatusCode::OK, Json(result.query))
         }
         Err(e) => {
             tracing::error!("Debug conversion error: {}", e);
@@ -364,9 +367,9 @@ async fn handle_chain_debug(
     }
 
     match conversion::convert_subgraph_to_hyperindex(&payload, Some(&chain_id)) {
-        Ok(converted_query) => {
-            tracing::info!("Converted chain debug query: {:?}", converted_query);
-            (StatusCode::OK, Json(converted_query))
+        Ok(result) => {
+            tracing::info!("Converted chain debug query: {:?}", result.query);
+            (StatusCode::OK, Json(result.query))
         }
         Err(e) => {
             tracing::error!("Chain debug conversion error: {}", e);
@@ -416,7 +419,7 @@ async fn forward_to_hyperindex(
     Ok(response_json)
 }
 
-fn transform_response_to_subgraph_shape(resp: Value) -> Value {
+fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::collections::HashMap<String, String>) -> Value {
     let mut root = match resp {
         Value::Object(map) => map,
         other => return other,
@@ -425,9 +428,14 @@ fn transform_response_to_subgraph_shape(resp: Value) -> Value {
     if let Some(Value::Object(data_obj)) = root.get_mut("data") {
         let mut new_data = serde_json::Map::new();
         for (key, value) in data_obj.clone().into_iter() {
-            let new_key = if key.ends_with("_by_pk") {
+            // First, try to use the exact field name from the original query
+            let new_key = if let Some(original_name) = field_name_map.get(&key) {
+                original_name.clone()
+            } else if key.ends_with("_by_pk") {
+                // Fallback for _by_pk queries
                 key.trim_end_matches("_by_pk").to_ascii_lowercase()
             } else if is_pascal_case(&key) {
+                // Fallback: convert to lowercase plural
                 pluralize_lowercase(&key)
             } else {
                 key
@@ -640,7 +648,8 @@ mod response_shape_tests {
     }
 
     #[test]
-    fn test_transform_data_keys() {
+    fn test_transform_data_keys_fallback() {
+        // Test fallback behavior when no field map is provided
         let resp = serde_json::json!({
             "data": {
                 "Stream": [ {"id": 1} ],
@@ -648,7 +657,8 @@ mod response_shape_tests {
                 "stream_by_pk": {"id": 3}
             }
         });
-        let out = transform_response_to_subgraph_shape(resp);
+        let empty_map = std::collections::HashMap::new();
+        let out = transform_response_to_subgraph_shape(resp, &empty_map);
         let data = out.get("data").unwrap();
         assert!(data.get("streams").is_some());
         assert!(data.get("batches").is_some());
@@ -656,5 +666,33 @@ mod response_shape_tests {
         assert!(data.get("Stream").is_none());
         assert!(data.get("Batch").is_none());
         assert!(data.get("stream_by_pk").is_none());
+    }
+
+    #[test]
+    fn test_transform_uses_field_name_map() {
+        // Test that field_name_map is used to preserve original field names
+        let resp = serde_json::json!({
+            "data": {
+                "LpAction": [ {"id": 1} ],
+                "LpShare": [ {"id": 2} ],
+                "LpNFT": [ {"id": 3} ]
+            }
+        });
+        let mut field_map = std::collections::HashMap::new();
+        field_map.insert("LpAction".to_string(), "lpActions".to_string());
+        field_map.insert("LpShare".to_string(), "lpShares".to_string());
+        field_map.insert("LpNFT".to_string(), "lpNFTs".to_string());
+        
+        let out = transform_response_to_subgraph_shape(resp, &field_map);
+        let data = out.get("data").unwrap();
+        
+        // Should use exact names from the map (original query field names)
+        assert!(data.get("lpActions").is_some(), "Expected lpActions");
+        assert!(data.get("lpShares").is_some(), "Expected lpShares");
+        assert!(data.get("lpNFTs").is_some(), "Expected lpNFTs");
+        
+        // Should NOT have PascalCase or lowercase versions
+        assert!(data.get("LpAction").is_none());
+        assert!(data.get("lpactions").is_none());
     }
 }

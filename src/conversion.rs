@@ -16,10 +16,18 @@ pub enum ConversionError {
     ComplexMetaQuery,
 }
 
+/// Result of query conversion, including the converted query and field name mappings
+#[derive(Debug)]
+pub struct ConversionResult {
+    pub query: Value,
+    /// Maps Hyperindex field names (e.g., "LpAction") to original query field names (e.g., "lpActions")
+    pub field_name_map: HashMap<String, String>,
+}
+
 pub fn convert_subgraph_to_hyperindex(
     payload: &Value,
     chain_id: Option<&str>,
-) -> Result<Value, ConversionError> {
+) -> Result<ConversionResult, ConversionError> {
     // Extract the query from the payload
     let query = payload
         .get("query")
@@ -49,11 +57,14 @@ pub fn convert_subgraph_to_hyperindex(
         if let Some(variables) = payload.get("variables") {
             result["variables"] = variables.clone();
         }
-        return Ok(result);
+        return Ok(ConversionResult {
+            query: result,
+            field_name_map: HashMap::new(),
+        });
     }
 
     // Parse the GraphQL query (simplified parsing for now)
-    let converted_query = convert_query_structure(query, chain_id)?;
+    let (converted_query, field_name_map) = convert_query_structure(query, chain_id)?;
 
     // Build the result with query and optionally variables
     let mut result = serde_json::json!({
@@ -65,20 +76,23 @@ pub fn convert_subgraph_to_hyperindex(
         result["variables"] = variables.clone();
     }
 
-    Ok(result)
+    Ok(ConversionResult {
+        query: result,
+        field_name_map,
+    })
 }
 
-fn convert_query_structure(query: &str, chain_id: Option<&str>) -> Result<String, ConversionError> {
+fn convert_query_structure(query: &str, chain_id: Option<&str>) -> Result<(String, HashMap<String, String>), ConversionError> {
     // Check for _meta query first
     if query.contains("_meta") {
-        return convert_meta_query(query);
+        return Ok((convert_meta_query(query)?, HashMap::new()));
     }
 
     // Extract fragments and main query
     let (fragments, main_query) = extract_fragments_and_main_query(query)?;
 
     // Convert the main query
-    let converted_main_query = convert_main_query(&main_query, chain_id)?;
+    let (converted_main_query, field_name_map) = convert_main_query(&main_query, chain_id)?;
 
     // Combine fragments with converted main query
     let mut result = String::new();
@@ -88,7 +102,7 @@ fn convert_query_structure(query: &str, chain_id: Option<&str>) -> Result<String
     }
     result.push_str(&converted_main_query);
 
-    Ok(result)
+    Ok((result, field_name_map))
 }
 
 fn extract_fragments_and_main_query(query: &str) -> Result<(String, String), ConversionError> {
@@ -237,7 +251,7 @@ fn convert_variable_types_in_header(header: &str) -> String {
     result
 }
 
-fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<String, ConversionError> {
+fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<(String, HashMap<String, String>), ConversionError> {
     // Extract query header (name and variable definitions) and body separately
     let (query_header, stripped_query) = if main_query.trim().starts_with("query") {
         let content = main_query.trim();
@@ -262,9 +276,16 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<String
     let entities = extract_multiple_entities(&stripped_query)?;
 
     let mut converted_entities = Vec::new();
+    // Build mapping from Hyperindex field names to original query field names
+    let mut field_name_map: HashMap<String, String> = HashMap::new();
 
     for (entity, params, selection) in entities {
         let entity_cap = singularize_and_capitalize(&entity);
+        
+        // Record the mapping: Hyperindex name -> original query name
+        // e.g., "LpAction" -> "lpActions", "LpAction_by_pk" -> "lpActions"
+        field_name_map.insert(entity_cap.clone(), entity.clone());
+        field_name_map.insert(format!("{}_by_pk", entity_cap), entity.clone());
         // Extract limit/offset, preserving GraphQL variables (e.g., $first/$skip)
         let limit = params.get("first").cloned();
         let offset = params.get("skip").cloned();
@@ -357,7 +378,7 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<String
     
     let converted_query = format!("{} {{\n{}\n}}", query_header_str, converted_entities.join("\n"));
     tracing::debug!("Final converted query: {}", converted_query);
-    Ok(converted_query)
+    Ok((converted_query, field_name_map))
 }
 
 fn extract_multiple_entities(
@@ -1322,7 +1343,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(limit: 10, offset: 0, where: {chainId: {_eq: \"1\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1332,7 +1353,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream_by_pk(id: \"123\") {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1342,7 +1363,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1364,7 +1385,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_eq: \"test\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1374,7 +1395,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_neq: \"test\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1384,7 +1405,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, amount: {_gt: 100}}) {\n    id amount\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1394,7 +1415,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, amount: {_gte: 100}}) {\n    id amount\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1404,7 +1425,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, amount: {_lt: 100}}) {\n    id amount\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1414,7 +1435,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, amount: {_lte: 100}}) {\n    id amount\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1425,7 +1446,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, id: {_in: [\"1\", \"2\", \"3\"]}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1436,7 +1457,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, id: {_nin: [\"1\", \"2\", \"3\"]}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1446,7 +1467,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"%test%\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1457,7 +1478,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"%test%\"}}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1468,7 +1489,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"test%\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1479,7 +1500,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"%test\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1490,7 +1511,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"test%\"}}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1501,7 +1522,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"%test\"}}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1512,7 +1533,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"%test%\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1524,7 +1545,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"%test%\"}}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1535,7 +1556,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"test%\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1546,7 +1567,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"%test\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1558,7 +1579,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"test%\"}}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1570,7 +1591,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"%test\"}}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1609,7 +1630,7 @@ mod tests {
             "query { streams(name_contains: \"test\", amount_gt: 100, status: \"active\") { id name amount status } }"
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         // Check for all filter fragments regardless of order
         assert!(query.contains("chainId: {_eq: \"1\"}"));
         assert!(query.contains("name: {_ilike: \"%test%\"}"));
@@ -1628,7 +1649,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  User(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"%john%\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1638,7 +1659,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(limit: 5, offset: 10, where: {chainId: {_eq: \"1\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1650,7 +1671,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(order_by: {name: desc}, where: {chainId: {_eq: \"1\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1662,7 +1683,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(offset: 10, order_by: {alias: asc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%113%\"}}) {\n    alias asset { address }\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1673,7 +1694,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}}) {\n    id name amount status { id name }\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1717,7 +1738,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(limit: 10, offset: 0) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1727,7 +1748,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream_by_pk(id: \"123\") {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1737,7 +1758,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {name: {_eq: \"test\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1747,7 +1768,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  User(where: {name: {_ilike: \"%john%\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1757,7 +1778,7 @@ mod tests {
         let expected = json!({
             "query": "query {\n  Stream(where: {chainId: {_eq: \"5\"}, name: {_eq: \"test\"}}) {\n    id name\n  }\n}"
         });
-        assert_eq!(result, expected);
+        assert_eq!(result.query, expected);
     }
 
     #[test]
@@ -1766,7 +1787,7 @@ mod tests {
             "query { streams(where: {alias_contains: \"113\", chainId: \"1\"}) { id alias } }",
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
 
         // Check that both filters are included
@@ -1780,7 +1801,7 @@ mod tests {
         let payload =
             create_test_payload("query { streams(where: {alias_contains: \"113\"}) { id alias } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
 
         // Check that the filter is included
@@ -1795,7 +1816,7 @@ mod tests {
             "query GetActions { actions { ...ActionFragment } }\nfragment ContractFragment on Contract { id address category version }\nfragment ActionFragment on Action { id chainId stream { id } category hash block timestamp from addressA addressB amountA amountB contract { ...ContractFragment } }",
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         // Fragments should be preserved and appear in the final query
         assert!(query.contains("fragment ContractFragment on Contract"));
         assert!(query.contains("fragment ActionFragment on Action"));
@@ -1812,7 +1833,7 @@ mod tests {
             "query GetActions { actions { ...ActionFragment } } fragment ContractFragment on Contract { id address category version } fragment ActionFragment on Action { id chainId stream { id } category hash block timestamp from addressA addressB amountA amountB contract { ...ContractFragment } }",
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("fragment ContractFragment on Contract"));
         assert!(query.contains("fragment ActionFragment on Action"));
         assert!(query.contains("Action("));
@@ -1826,7 +1847,7 @@ mod tests {
             "query GetBatches { batches { ...BatchFragment } } fragment BatchFragment on Batch { id label size }",
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         // Should singularize to Batch and include chainId where
         assert!(query.contains("fragment BatchFragment on Batch"));
         assert!(query.contains("Batch("));
@@ -1840,7 +1861,7 @@ mod tests {
             "query GetTranches { tranches { ...TrancheFragment } } fragment TrancheFragment on Tranche { id position amount timestamp endTime startTime startAmount endAmount }",
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         // Should singularize to Tranche and include chainId where
         assert!(query.contains("fragment TrancheFragment on Tranche"));
         assert!(query.contains("Tranche("));
@@ -1856,7 +1877,7 @@ mod tests {
             "query Trades { trades(first: 10000, where: { isOpen: true }) { id trader isOpen } }",
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
         
         // Check that the boolean filter is properly converted to Hasura format
@@ -1901,7 +1922,7 @@ mod tests {
                                         }"#;
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
         
         // Check that the boolean filter is properly converted to Hasura format
@@ -1933,7 +1954,7 @@ mod tests {
 }"#;
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
         
         // Check that _neq is properly formatted (this should work since it has a suffix)
@@ -1959,7 +1980,7 @@ mod tests {
                                 }"#;
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
         
         // Check that _in is properly formatted (this should work since it has a suffix)
@@ -1977,7 +1998,7 @@ mod tests {
             "query { streams(where: { isOpen: false }) { id isOpen } }",
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
         
         // Check that the boolean filter is properly converted to Hasura format
@@ -1995,7 +2016,7 @@ mod tests {
             "query { trades(where: { isOpen: true, trader: \"0x123\" }) { id trader isOpen } }",
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
         
         // Check that both filters are properly converted
@@ -2026,7 +2047,7 @@ mod tests {
 }"#;
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
         
         // Check that both operators are properly converted
@@ -2089,7 +2110,7 @@ mod tests {
 }"#;
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
         
         // Check that the nested entity reference is converted to nested structure
@@ -2137,7 +2158,7 @@ mod tests {
 }"#;
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
         
         // Both filters should be properly converted
@@ -2174,7 +2195,7 @@ mod tests {
 }"#;
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
         
         // Nested entity reference should use nested structure
@@ -2213,7 +2234,7 @@ mod tests {
 }"#;
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
         
         // When the subgraph already uses nested structure, it should be preserved/converted correctly
@@ -2249,7 +2270,7 @@ mod tests {
 }"#;
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
         
         // Deeply nested entity reference should use nested structure
@@ -2287,7 +2308,7 @@ mod tests {
 }"#;
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
         
         // Deeply nested regular field should use nested structure without id wrapper
@@ -2332,7 +2353,7 @@ mod tests {
 }"#;
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
         
         // Should correctly convert to nested structure with name as regular field
@@ -2367,7 +2388,7 @@ mod tests {
 }"#;
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         
         // Since "token" is explicitly in the selection as a regular field, it should be treated as regular
         assert!(
@@ -2390,7 +2411,7 @@ mod tests {
         // Bug: pair(id: "0") was converting to pair_by_pk instead of Pair_by_pk
         let payload = create_test_payload("query Pair { pair(id: \"0\") { id feed } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
         
         // Should use capitalized entity name: Pair_by_pk not pair_by_pk
@@ -2413,7 +2434,7 @@ mod tests {
         // Test with stream entity
         let payload = create_test_payload("query { stream(id: \"123\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         
         // Should use capitalized entity name: Stream_by_pk not stream_by_pk
         assert!(
@@ -2435,7 +2456,7 @@ mod tests {
         // Test with user entity (ends with 'r' not 's')
         let payload = create_test_payload("query { user(id: \"0x123\") { id address } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         
         // Should use capitalized entity name: User_by_pk not user_by_pk
         assert!(
@@ -2457,7 +2478,7 @@ mod tests {
         // Test with batch entity (ends with 'ch')
         let payload = create_test_payload("query { batch(id: \"456\") { id label } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         
         // Should use capitalized entity name: Batch_by_pk not batch_by_pk
         assert!(
@@ -2479,7 +2500,7 @@ mod tests {
         // Verify that collection queries (plural) still use capitalized entity names
         let payload = create_test_payload("query { pairs(first: 10) { id feed } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         
         // Should use capitalized singular entity name for collection: Pair not pair
         assert!(
@@ -2500,7 +2521,7 @@ mod tests {
         // Because the schema expects Pair_by_pk (capitalized)
         let payload = create_test_payload("query Pair { pair(id: \"0\") { id feed } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        let converted_query = result["query"].as_str().unwrap();
+        let converted_query = result.query["query"].as_str().unwrap();
         println!("User reported bug - converted query: {}", converted_query);
         
         // Should use capitalized entity name: Pair_by_pk not pair_by_pk
@@ -2534,14 +2555,14 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         
         // Verify query is converted
-        assert!(result.get("query").is_some());
-        let query = result["query"].as_str().unwrap();
+        assert!(result.query.get("query").is_some());
+        let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("Factory"));
         assert!(query.contains("Bundle"));
         
         // Verify variables are passed through
-        assert!(result.get("variables").is_some());
-        let variables = result.get("variables").unwrap();
+        assert!(result.query.get("variables").is_some());
+        let variables = result.query.get("variables").unwrap();
         assert_eq!(variables["first"], 5);
         
         // Verify variable references in query are preserved (not converted to literals)
@@ -2557,10 +2578,10 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         
         // Should not have variables field
-        assert!(result.get("variables").is_none());
+        assert!(result.query.get("variables").is_none());
         
         // Query should still be converted
-        assert!(result.get("query").is_some());
+        assert!(result.query.get("query").is_some());
     }
 
     #[test]
@@ -2575,10 +2596,10 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         
         // Verify variables are passed through
-        assert_eq!(result["variables"]["limit"], 100);
+        assert_eq!(result.query["variables"]["limit"], 100);
         
         // Verify query includes chainId filter and preserves variable
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("chainId: {_eq: \"1\"}"));
         assert!(query.contains("$limit"), "Variable reference $limit should be preserved");
     }
@@ -2596,7 +2617,7 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
         
         // Verify variable definition is preserved in query header
@@ -2621,7 +2642,7 @@ mod tests {
         );
         
         // Verify variables are passed through
-        assert_eq!(result["variables"]["pairid"], "0");
+        assert_eq!(result.query["variables"]["pairid"], "0");
     }
 
     #[test]
@@ -2637,7 +2658,7 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
         
         // Verify variable definition is preserved in query header
@@ -2662,7 +2683,7 @@ mod tests {
         );
         
         // Verify variables are passed through
-        assert_eq!(result["variables"]["pairid"], "0");
+        assert_eq!(result.query["variables"]["pairid"], "0");
     }
 
     #[test]
@@ -2680,13 +2701,13 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         
         // Verify variables are passed through with object structure
-        assert!(result.get("variables").is_some());
-        let variables = result.get("variables").unwrap();
+        assert!(result.query.get("variables").is_some());
+        let variables = result.query.get("variables").unwrap();
         assert_eq!(variables["where"]["isOpen"], true);
         assert_eq!(variables["where"]["trader"], "0x123");
         
         // Verify variable reference is preserved in query and where clause is included
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("$where"), "Variable reference $where should be preserved");
         assert!(query.contains("where: $where"), "Where clause with variable should be included in query");
     }
@@ -2703,15 +2724,15 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         
         // Verify variables are passed through with array structure
-        assert!(result.get("variables").is_some());
-        let variables = result.get("variables").unwrap();
+        assert!(result.query.get("variables").is_some());
+        let variables = result.query.get("variables").unwrap();
         assert!(variables["ids"].is_array());
         assert_eq!(variables["ids"][0], "0");
         assert_eq!(variables["ids"][1], "1");
         assert_eq!(variables["ids"][2], "2");
         
         // Verify variable reference is preserved in query
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("$ids"), "Variable reference $ids should be preserved");
     }
 
@@ -2732,13 +2753,13 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         
         // Verify nested object variables are passed through
-        assert!(result.get("variables").is_some());
-        let variables = result.get("variables").unwrap();
+        assert!(result.query.get("variables").is_some());
+        let variables = result.query.get("variables").unwrap();
         assert_eq!(variables["filter"]["pair"]["id"], "0");
         assert_eq!(variables["filter"]["isOpen"], true);
         
         // Verify variable reference is preserved
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("$filter"), "Variable reference $filter should be preserved");
     }
 
@@ -2759,13 +2780,13 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         
         // Verify all variable types are passed through correctly
-        let variables = result.get("variables").unwrap();
+        let variables = result.query.get("variables").unwrap();
         assert_eq!(variables["limit"], 100);
         assert_eq!(variables["where"]["isOpen"], true);
         assert!(variables["ids"].is_array());
         
         // Verify all variable references are preserved
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("$limit"));
         assert!(query.contains("$where"));
     }
@@ -2781,7 +2802,7 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
 
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         // Header should now declare String!
         assert!(
             query.contains("query getUserVolume($id: String!)"),
@@ -2791,7 +2812,7 @@ mod tests {
         // Body should still refer to $id
         assert!(query.contains("User_by_pk(id: $id)"));
         // Variables should be passed through unchanged
-        assert_eq!(result["variables"]["id"], "0xabc");
+        assert_eq!(result.query["variables"]["id"], "0xabc");
     }
 
     #[test]
@@ -2806,14 +2827,14 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
 
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         assert!(
             query.contains("query GetSomething($data: String!, $maybeData: String)"),
             "Expected Bytes/Bytes! to be converted to String/String! in header, got: {}",
             query
         );
         // Variables still present
-        assert_eq!(result["variables"]["data"], "0xdeadbeef");
+        assert_eq!(result.query["variables"]["data"], "0xdeadbeef");
     }
 
     #[test]
@@ -2827,7 +2848,7 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
 
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         assert!(
             query.contains("query GetUsers($ids: [String!]!)"),
             "Expected [ID!]! to be converted to [String!]! in header, got: {}",
@@ -2836,7 +2857,7 @@ mod tests {
         // Ensure the query name itself is untouched (no accidental ID -> String inside names)
         assert!(query.contains("query GetUsers("));
         // Variables should still be arrays
-        let vars = &result["variables"]["ids"];
+        let vars = &result.query["variables"]["ids"];
         assert!(vars.is_array());
         assert_eq!(vars[0], "0x1");
         assert_eq!(vars[1], "0x2");
@@ -2854,15 +2875,15 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
 
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         assert!(
             query.contains("query Limits($minLeverage: numeric!, $maxLeverage: numeric)"),
             "Expected BigInt/BigInt! to be converted to numeric/numeric! in header, got: {}",
             query
         );
         // Variables preserved
-        assert_eq!(result["variables"]["minLeverage"], "5");
-        assert_eq!(result["variables"]["maxLeverage"], "10");
+        assert_eq!(result.query["variables"]["minLeverage"], "5");
+        assert_eq!(result.query["variables"]["maxLeverage"], "10");
     }
 
     #[test]
@@ -2877,14 +2898,14 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
 
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         assert!(
             query.contains("query Prices($price: numeric!, $avgPrice: numeric)"),
             "Expected BigDecimal/BigDecimal! to be converted to numeric/numeric! in header, got: {}",
             query
         );
-        assert_eq!(result["variables"]["price"], "1.23");
-        assert_eq!(result["variables"]["avgPrice"], "4.56");
+        assert_eq!(result.query["variables"]["price"], "1.23");
+        assert_eq!(result.query["variables"]["avgPrice"], "4.56");
     }
 
     #[test]
@@ -2902,7 +2923,7 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
 
-        let query = result["query"].as_str().unwrap();
+        let query = result.query["query"].as_str().unwrap();
         // Should convert BigInt to numeric even with newlines
         assert!(
             query.contains("$minLeverage: numeric"),
@@ -2916,7 +2937,7 @@ mod tests {
             query
         );
         // Variables preserved
-        assert_eq!(result["variables"]["minLeverage"], "5");
+        assert_eq!(result.query["variables"]["minLeverage"], "5");
     }
 
 }
