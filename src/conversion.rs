@@ -22,6 +22,8 @@ pub struct ConversionResult {
     pub query: Value,
     /// Maps Hyperindex field names (e.g., "LpAction") to original query field names (e.g., "lpActions")
     pub field_name_map: HashMap<String, String>,
+    /// Indicates if this was a _meta query (needs special response transformation)
+    pub is_meta_query: bool,
 }
 
 pub fn convert_subgraph_to_hyperindex(
@@ -60,8 +62,12 @@ pub fn convert_subgraph_to_hyperindex(
         return Ok(ConversionResult {
             query: result,
             field_name_map: HashMap::new(),
+            is_meta_query: false,
         });
     }
+
+    // Check if this is a _meta query before conversion
+    let is_meta_query = query.contains("_meta");
 
     // Parse the GraphQL query (simplified parsing for now)
     let (converted_query, field_name_map) = convert_query_structure(query, chain_id)?;
@@ -79,10 +85,14 @@ pub fn convert_subgraph_to_hyperindex(
     Ok(ConversionResult {
         query: result,
         field_name_map,
+        is_meta_query,
     })
 }
 
-fn convert_query_structure(query: &str, chain_id: Option<&str>) -> Result<(String, HashMap<String, String>), ConversionError> {
+fn convert_query_structure(
+    query: &str,
+    chain_id: Option<&str>,
+) -> Result<(String, HashMap<String, String>), ConversionError> {
     // Check for _meta query first
     if query.contains("_meta") {
         return Ok((convert_meta_query(query)?, HashMap::new()));
@@ -165,7 +175,10 @@ fn extract_fragments_and_main_query(query: &str) -> Result<(String, String), Con
 /// concrete scalar types expected by Hyperindex/Hasura.
 /// - ID, Bytes  -> String
 /// - BigInt, BigDecimal -> numeric
-fn convert_variable_types_in_header(header: &str, variable_type_overrides: &HashMap<String, String>) -> String {
+fn convert_variable_types_in_header(
+    header: &str,
+    variable_type_overrides: &HashMap<String, String>,
+) -> String {
     // Replace ID/Bytes/BigInt/BigDecimal types in variable definitions
     // Also apply enum type overrides for variables used with enum fields
     // Handle patterns like:
@@ -177,14 +190,14 @@ fn convert_variable_types_in_header(header: &str, variable_type_overrides: &Hash
     // - $ids: [Bytes!] -> $ids: [String!]
     // - $amount: BigInt! -> $amount: numeric!
     // - $amounts: [BigInt!]! -> $amounts: [numeric!]!
-    
+
     // Normalize whitespace (replace newlines/tabs with spaces) to handle
     // multi-line variable definitions
     let normalized: String = header
         .chars()
         .map(|c| if c.is_whitespace() { ' ' } else { c })
         .collect();
-    
+
     // Collapse multiple spaces into single spaces
     let mut result = String::new();
     let mut prev_was_space = false;
@@ -199,7 +212,7 @@ fn convert_variable_types_in_header(header: &str, variable_type_overrides: &Hash
             prev_was_space = false;
         }
     }
-    
+
     // Replace array types first (more specific patterns)
     result = result.replace("[ID!]", "[String!]");
     result = result.replace("[Bytes!]", "[String!]");
@@ -209,13 +222,13 @@ fn convert_variable_types_in_header(header: &str, variable_type_overrides: &Hash
     result = result.replace("[BigInt]", "[numeric]");
     result = result.replace("[BigDecimal!]", "[numeric!]");
     result = result.replace("[BigDecimal]", "[numeric]");
-    
+
     // Replace non-nullable types
     result = result.replace(": ID!", ": String!");
     result = result.replace(": Bytes!", ": String!");
     result = result.replace(": BigInt!", ": numeric!");
     result = result.replace(": BigDecimal!", ": numeric!");
-    
+
     // Replace nullable types using simple word-boundary-ish patterns
     // Use word boundaries by checking for space/comma/paren after the type
     result = result.replace(": ID ", ": String ");
@@ -230,7 +243,7 @@ fn convert_variable_types_in_header(header: &str, variable_type_overrides: &Hash
     result = result.replace(": BigDecimal ", ": numeric ");
     result = result.replace(": BigDecimal,", ": numeric,");
     result = result.replace(": BigDecimal)", ": numeric)");
-    
+
     // Handle end of string cases (no trailing delimiter)
     if result.ends_with(": ID") {
         result.truncate(result.len() - 3);
@@ -248,7 +261,7 @@ fn convert_variable_types_in_header(header: &str, variable_type_overrides: &Hash
         result.truncate(result.len() - 11);
         result.push_str(": numeric");
     }
-    
+
     // Apply variable type overrides for enum and numeric types
     // For each variable that needs type conversion, replace its declared type
     for (var_name, expected_type) in variable_type_overrides {
@@ -263,37 +276,44 @@ fn convert_variable_types_in_header(header: &str, variable_type_overrides: &Hash
             let type_end = remaining
                 .find(|c: char| c == ',' || c == ')' || c == ' ')
                 .unwrap_or(remaining.len());
-            
+
             let current_type = &remaining[..type_end];
-            
+
             // Override String to expected type (enum or numeric)
             // Also handle Int -> numeric if needed
-            let should_convert = current_type == "String" || current_type == "String!" 
-                || current_type == "Int" || current_type == "Int!";
-            
+            let should_convert = current_type == "String"
+                || current_type == "String!"
+                || current_type == "Int"
+                || current_type == "Int!";
+
             if should_convert {
                 let new_type = if current_type.ends_with('!') {
                     format!("{}!", expected_type)
                 } else {
                     expected_type.clone()
                 };
-                
+
                 tracing::info!(
                     "Converting variable ${} type from {} to {} (field type mismatch)",
-                    var_name, current_type, new_type
+                    var_name,
+                    current_type,
+                    new_type
                 );
-                
+
                 let before = &result[..type_start];
                 let after = &result[type_start + type_end..];
                 result = format!("{}{}{}", before, new_type, after);
             }
         }
     }
-    
+
     result
 }
 
-fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<(String, HashMap<String, String>), ConversionError> {
+fn convert_main_query(
+    main_query: &str,
+    chain_id: Option<&str>,
+) -> Result<(String, HashMap<String, String>), ConversionError> {
     // Extract query header (name and variable definitions) and body separately
     let (query_header, stripped_query) = if main_query.trim().starts_with("query") {
         let content = main_query.trim();
@@ -302,14 +322,24 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<(Strin
             let header = content[..start_brace].trim().to_string();
             // Extract everything inside the braces as the body
             let body = content[start_brace + 1..end_brace].to_string();
-            tracing::debug!("Extracted query header: '{}', body length: {}", header, body.len());
+            tracing::debug!(
+                "Extracted query header: '{}', body length: {}",
+                header,
+                body.len()
+            );
             (Some(header), body)
         } else {
             (None, main_query.to_string())
         }
     } else if main_query.trim().starts_with('{') {
         // Already a selection body, no header
-        (None, main_query.trim_start_matches('{').trim_end_matches('}').to_string())
+        (
+            None,
+            main_query
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .to_string(),
+        )
     } else {
         (None, main_query.to_string())
     };
@@ -325,7 +355,7 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<(Strin
 
     for (entity, params, selection) in entities {
         let entity_cap = singularize_and_capitalize(&entity);
-        
+
         // Record the mapping: Hyperindex name -> original query name
         // e.g., "LpAction" -> "lpActions", "LpAction_by_pk" -> "lpActions"
         field_name_map.insert(entity_cap.clone(), entity.clone());
@@ -354,7 +384,8 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<(Strin
         }
 
         // Check if where is a variable reference (e.g., where: $where)
-        let where_is_variable = params.get("where")
+        let where_is_variable = params
+            .get("where")
             .map(|w| w.trim_start().starts_with('$'))
             .unwrap_or(false);
 
@@ -372,7 +403,7 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<(Strin
             let result = convert_filters_to_where_clause(&converted_params, &entity_cap)?;
             (result.where_clause, result.variable_type_overrides)
         };
-        
+
         // Merge variable type overrides
         all_variable_type_overrides.extend(entity_var_overrides);
 
@@ -416,16 +447,25 @@ fn convert_main_query(main_query: &str, chain_id: Option<&str>) -> Result<(Strin
     // Convert ID and Bytes types to String in variable definitions
     let query_header_str = if let Some(header) = &query_header {
         // Convert variable type definitions: ID -> String, Bytes -> String, and enum types
-        let converted_header = convert_variable_types_in_header(header, &all_variable_type_overrides);
-        tracing::debug!("Using preserved query header: '{}' (converted to: '{}')", header, converted_header);
+        let converted_header =
+            convert_variable_types_in_header(header, &all_variable_type_overrides);
+        tracing::debug!(
+            "Using preserved query header: '{}' (converted to: '{}')",
+            header,
+            converted_header
+        );
         converted_header
     } else {
         // Otherwise, use default "query"
         tracing::debug!("No query header found, using default 'query'");
         "query".to_string()
     };
-    
-    let converted_query = format!("{} {{\n{}\n}}", query_header_str, converted_entities.join("\n"));
+
+    let converted_query = format!(
+        "{} {{\n{}\n}}",
+        query_header_str,
+        converted_entities.join("\n")
+    );
     tracing::debug!("Final converted query: {}", converted_query);
     Ok((converted_query, field_name_map))
 }
@@ -712,6 +752,10 @@ fn sanitize_fragment_arguments(fragment_text: &str) -> String {
 // Removed unused selection set helpers
 
 fn convert_meta_query(query: &str) -> Result<String, ConversionError> {
+    // Normalize whitespace: collapse all whitespace sequences into single spaces
+    // This handles multiline queries like "_meta {\n    block {\n      number\n    }\n  }"
+    let normalized: String = query.split_whitespace().collect::<Vec<_>>().join(" ");
+
     // Check if it's a simple _meta { block { number } } query
     let simple_meta_pattern = "_meta { block { number } }";
     let complex_meta_patterns = [
@@ -722,22 +766,22 @@ fn convert_meta_query(query: &str) -> Result<String, ConversionError> {
         "hasIndexingErrors",
     ];
 
-    // Check for complex patterns
+    // Check for complex patterns (using normalized query)
     for pattern in &complex_meta_patterns {
-        if query.contains(pattern) {
+        if normalized.contains(pattern) {
             return Err(ConversionError::ComplexMetaQuery);
         }
     }
 
-    // Check if it's the simple pattern
-    if query.contains(simple_meta_pattern) {
+    // Check if it's the simple pattern (using normalized query)
+    if normalized.contains(simple_meta_pattern) {
         return Ok(
             "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}".to_string(),
         );
     }
 
     // If it's a _meta query but not the simple pattern, it's complex
-    if query.contains("_meta") {
+    if normalized.contains("_meta") {
         return Err(ConversionError::ComplexMetaQuery);
     }
 
@@ -776,16 +820,17 @@ fn process_nested_filters_recursive(
         if let Some(dot_idx) = parent.find('.') {
             let first_part = &parent[..dot_idx];
             let rest = &parent[dot_idx + 1..];
-            
+
             // Get the nested entity type for first_part
             let nested_entity_type = schema::get_field_info(parent_entity_name, first_part)
                 .and_then(|info| info.nested_type_name)
                 .unwrap_or_else(|| first_part.to_string());
-            
+
             // Process "rest" with child_filters to get the nested condition for "rest"
             // This returns something like "token: {amount: {_eq: "0"}}"
-            let rest_condition = process_nested_filters_recursive(rest, child_filters, &nested_entity_type)?;
-            
+            let rest_condition =
+                process_nested_filters_recursive(rest, child_filters, &nested_entity_type)?;
+
             // Extract the inner condition part (the part after "rest: ")
             // rest_condition is "rest: {...}", we want just "{...}"
             let inner_condition = if let Some(colon_idx) = rest_condition.find(':') {
@@ -793,13 +838,13 @@ fn process_nested_filters_recursive(
             } else {
                 format!("{{{}}}", rest_condition)
             };
-            
+
             // Now wrap this under first_part: first_part: {rest: {inner_condition}}
             // The inner_condition already has the braces, so we just need to wrap it
             return Ok(format!("{}: {{{}: {}}}", first_part, rest, inner_condition));
         }
     }
-    
+
     // Base case: parent is a simple field name (e.g., "pair")
     // Get the nested entity type for this parent field
     let nested_entity_type = schema::get_field_info(parent_entity_name, parent)
@@ -836,7 +881,8 @@ fn process_nested_filters_recursive(
             // Multiple conditions for the same field - wrap in _and
             for (k, v) in conditions {
                 // Use schema to determine if child fields are nested entities
-                let condition = convert_basic_filter_to_hasura_condition(&k, &v, &nested_entity_type)?;
+                let condition =
+                    convert_basic_filter_to_hasura_condition(&k, &v, &nested_entity_type)?;
                 child_and_conditions.push(format!("{{{}}}", condition));
             }
         }
@@ -929,7 +975,8 @@ fn convert_filters_to_where_clause(
         if conditions.len() == 1 {
             // Single condition for this field
             let (k, v) = &conditions[0];
-            let (condition, var_override) = convert_basic_filter_to_hasura_condition_with_type(&k, &v, entity_name)?;
+            let (condition, var_override) =
+                convert_basic_filter_to_hasura_condition_with_type(&k, &v, entity_name)?;
             where_conditions.push(condition);
             if let Some((var_name, var_type)) = var_override {
                 variable_type_overrides.insert(var_name, var_type);
@@ -937,7 +984,8 @@ fn convert_filters_to_where_clause(
         } else {
             // Multiple conditions for the same field - wrap in _and
             for (k, v) in conditions {
-                let (condition, var_override) = convert_basic_filter_to_hasura_condition_with_type(&k, &v, entity_name)?;
+                let (condition, var_override) =
+                    convert_basic_filter_to_hasura_condition_with_type(&k, &v, entity_name)?;
                 and_conditions.push(format!("{{{}}}", condition));
                 if let Some((var_name, var_type)) = var_override {
                     variable_type_overrides.insert(var_name, var_type);
@@ -951,11 +999,8 @@ fn convert_filters_to_where_clause(
 
     // Add grouped nested filters (recursively handle arbitrary depth)
     for (parent, child_filters) in grouped_filters {
-        let nested_condition = process_nested_filters_recursive(
-            &parent,
-            child_filters,
-            entity_name,
-        )?;
+        let nested_condition =
+            process_nested_filters_recursive(&parent, child_filters, entity_name)?;
         where_conditions.push(nested_condition);
     }
 
@@ -1153,24 +1198,23 @@ fn convert_basic_filter_to_hasura_condition(
     // 2. The value is a simple scalar (string/number, not an object/array)
     // 3. The field doesn't have an operator suffix (already handled above)
     // 4. The field is not a system field like "chainId" (added programmatically)
-    
+
     // Special case: chainId is always a primitive field, never a nested entity
     if key == "chainId" {
         // chainId is always a primitive, use default equality filter
         let result = format!("{}: {{_eq: {}}}", key, value);
         return Ok(result);
     }
-    
+
     // Check if value is a simple scalar (not an object/array)
     let trimmed_value = value.trim();
     let is_variable = trimmed_value.trim_start().starts_with('$');
-    let is_simple_scalar = !trimmed_value.starts_with('{') 
-        && !trimmed_value.starts_with('[')
-        && !is_variable;
-    
+    let is_simple_scalar =
+        !trimmed_value.starts_with('{') && !trimmed_value.starts_with('[') && !is_variable;
+
     // Use schema to check if this field is a nested entity
     let is_nested_entity = schema::is_nested_entity(entity_name, key);
-    
+
     if is_nested_entity && (is_simple_scalar || is_variable) {
         // This is a nested entity reference with a scalar value (literal or variable)
         // In subgraph: pair: "0" or pair: $pairid means "where pair id equals value"
@@ -1191,48 +1235,57 @@ fn convert_basic_filter_to_hasura_condition_with_type(
     entity_name: &str,
 ) -> Result<(String, Option<(String, String)>), ConversionError> {
     let condition = convert_basic_filter_to_hasura_condition(key, value, entity_name)?;
-    
+
     // Check if value is a variable and if the field type needs conversion
     let trimmed_value = value.trim();
     if trimmed_value.starts_with('$') {
         // Extract variable name (remove $ prefix)
         let var_name = trimmed_value.trim_start_matches('$').to_string();
-        
+
         // Get the base field name (remove operator suffix like _gte, _contains, etc.)
         let base_field = if let Some(underscore_idx) = key.find('_') {
             &key[..underscore_idx]
         } else {
             key
         };
-        
+
         // Look up the field info in the schema
         if let Some(field_info) = schema::get_field_info(entity_name, base_field) {
             // Skip if this is a nested entity (object type) - those use String for ID references
             if field_info.is_nested_entity {
                 return Ok((condition, None));
             }
-            
+
             // Check if field expects numeric - users often declare String but field is numeric
             // This handles cases like withdrawUnlockEpoch where subgraph accepts String but Hyperindex needs numeric
-            if field_info.field_type == "numeric" || field_info.field_type == "Int" || field_info.field_type == "Float" {
+            if field_info.field_type == "numeric"
+                || field_info.field_type == "Int"
+                || field_info.field_type == "Float"
+            {
                 tracing::debug!(
                     "Variable ${} used with field {}.{} expects type {} (numeric field)",
-                    var_name, entity_name, base_field, field_info.field_type
+                    var_name,
+                    entity_name,
+                    base_field,
+                    field_info.field_type
                 );
                 return Ok((condition, Some((var_name, field_info.field_type.clone()))));
             }
-            
+
             // Check if it's an enum type (not a standard scalar)
             if !schema::is_standard_scalar(&field_info.field_type) {
                 tracing::debug!(
                     "Variable ${} used with field {}.{} expects type {} (likely enum)",
-                    var_name, entity_name, base_field, field_info.field_type
+                    var_name,
+                    entity_name,
+                    base_field,
+                    field_info.field_type
                 );
                 return Ok((condition, Some((var_name, field_info.field_type))));
             }
         }
     }
-    
+
     Ok((condition, None))
 }
 
@@ -1303,7 +1356,7 @@ fn parse_graphql_params(
                         let next_byte_idx = byte_idx + ch.len_utf8();
                         let remaining = &params_str[next_byte_idx..];
                         let trimmed = remaining.trim_start();
-                        
+
                         // Check if trimmed starts with identifier pattern followed by colon
                         // Pattern: [a-zA-Z_][a-zA-Z0-9_]*\s*:
                         let mut chars_iter = trimmed.chars();
@@ -1325,7 +1378,7 @@ fn parse_graphql_params(
                                         break;
                                     }
                                 }
-                                
+
                                 if is_param && found_colon {
                                     // This is a new parameter, finish current one
                                     if !current_param.trim().is_empty() {
@@ -1490,8 +1543,94 @@ mod tests {
     }
 
     #[test]
+    fn test_meta_query_simple_multiline() {
+        // Test the multiline version that was failing before
+        let payload =
+            create_test_payload("query {\n  _meta {\n    block {\n      number\n    }\n  }\n}");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        let expected = json!({
+            "query": "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
+        });
+        assert_eq!(result.query, expected);
+    }
+
+    #[test]
+    fn test_meta_query_with_tabs_and_mixed_whitespace() {
+        // Test with tabs and mixed whitespace
+        let payload =
+            create_test_payload("query {\n\t_meta {\n\t\tblock {\n\t\t\tnumber\n\t\t}\n\t}\n}");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        let expected = json!({
+            "query": "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
+        });
+        assert_eq!(result.query, expected);
+    }
+
+    #[test]
+    fn test_meta_query_with_extra_spaces() {
+        // Test with extra spaces between tokens
+        let payload = create_test_payload("query  {   _meta   {   block   {   number   }   }   }");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        let expected = json!({
+            "query": "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
+        });
+        assert_eq!(result.query, expected);
+    }
+
+    #[test]
     fn test_meta_query_complex() {
         let payload = create_test_payload("query { _meta { block { hash number } } }");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
+        assert!(result.is_err());
+        match result {
+            Err(ConversionError::ComplexMetaQuery) => {}
+            _ => panic!("Expected ComplexMetaQuery error"),
+        }
+    }
+
+    #[test]
+    fn test_meta_query_complex_multiline() {
+        // Complex meta query with multiline format should also fail
+        let payload = create_test_payload(
+            "query {\n  _meta {\n    block {\n      hash\n      number\n    }\n  }\n}",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
+        assert!(result.is_err());
+        match result {
+            Err(ConversionError::ComplexMetaQuery) => {}
+            _ => panic!("Expected ComplexMetaQuery error"),
+        }
+    }
+
+    #[test]
+    fn test_meta_query_with_deployment() {
+        // deployment field should trigger ComplexMetaQuery error
+        let payload = create_test_payload("query { _meta { deployment } }");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
+        assert!(result.is_err());
+        match result {
+            Err(ConversionError::ComplexMetaQuery) => {}
+            _ => panic!("Expected ComplexMetaQuery error"),
+        }
+    }
+
+    #[test]
+    fn test_meta_query_with_has_indexing_errors() {
+        // hasIndexingErrors field should trigger ComplexMetaQuery error
+        let payload = create_test_payload("query { _meta { hasIndexingErrors } }");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
+        assert!(result.is_err());
+        match result {
+            Err(ConversionError::ComplexMetaQuery) => {}
+            _ => panic!("Expected ComplexMetaQuery error"),
+        }
+    }
+
+    #[test]
+    fn test_meta_query_with_timestamp_multiline() {
+        // timestamp in multiline format should trigger ComplexMetaQuery error
+        let payload =
+            create_test_payload("query {\n  _meta {\n    block {\n      timestamp\n    }\n  }\n}");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
         assert!(result.is_err());
         match result {
@@ -2002,7 +2141,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
-        
+
         // Check that the boolean filter is properly converted to Hasura format
         assert!(
             query.contains("isOpen: {_eq: true}"),
@@ -2025,7 +2164,7 @@ mod tests {
         // Note: This bug specifically affects the DEFAULT case (no suffix) which should use _eq.
         // Boolean operators with explicit suffixes already work correctly:
         // - _neq (via _not suffix): isOpen_not: false → isOpen: {_neq: false} ✓ Works
-        // - _in: isOpen_in: [true, false] → isOpen: {_in: [true, false]} ✓ Works  
+        // - _in: isOpen_in: [true, false] → isOpen: {_in: [true, false]} ✓ Works
         // - _nin: isOpen_not_in: [true] → isOpen: {_nin: [true]} ✓ Works
         // - _eq (default, no suffix): isOpen: true → isOpen: {_eq: true} ✗ BUG: Affected
         //
@@ -2047,7 +2186,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
-        
+
         // Check that the boolean filter is properly converted to Hasura format
         // The incorrect format "isOpen: true" would cause Hyperindex to reject the query
         assert!(
@@ -2079,7 +2218,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
-        
+
         // Check that _neq is properly formatted (this should work since it has a suffix)
         assert!(
             converted_query.contains("isOpen: {_neq: false}"),
@@ -2105,7 +2244,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
-        
+
         // Check that _in is properly formatted (this should work since it has a suffix)
         assert!(
             converted_query.contains("isOpen: {_in: [true, false]}"),
@@ -2117,13 +2256,12 @@ mod tests {
     #[test]
     fn test_boolean_filter_false_in_where_clause() {
         // Test case for boolean false filters in where clause
-        let payload = create_test_payload(
-            "query { streams(where: { isOpen: false }) { id isOpen } }",
-        );
+        let payload =
+            create_test_payload("query { streams(where: { isOpen: false }) { id isOpen } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
-        
+
         // Check that the boolean filter is properly converted to Hasura format
         assert!(
             query.contains("isOpen: {_eq: false}"),
@@ -2141,7 +2279,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
-        
+
         // Check that both filters are properly converted
         assert!(
             query.contains("isOpen: {_eq: true}"),
@@ -2172,7 +2310,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
-        
+
         // Check that both operators are properly converted
         assert!(
             converted_query.contains("amount: {_gt: 100}"),
@@ -2192,7 +2330,7 @@ mod tests {
         // Test case for nested entity references in where clauses
         // In subgraph format, you can reference a nested entity directly: where: { pair: "0" }
         // In Envio/Hyperindex format, this must be converted to: where: { pair: {id: {_eq: "0"}} }
-        // 
+        //
         // This approach (nested structure) is better than pair_id because:
         // 1. It matches the error message: "field '_eq' not found in type: 'Pair_bool_exp'"
         //    (suggesting pair expects a Pair_bool_exp object, not a direct value)
@@ -2235,7 +2373,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
-        
+
         // Check that the nested entity reference is converted to nested structure
         // The incorrect format "pair: {_eq: \"0\"}" would cause Hyperindex error:
         // "field '_eq' not found in type: 'Pair_bool_exp'"
@@ -2248,7 +2386,7 @@ mod tests {
              Converted query: {}",
             converted_query
         );
-        
+
         // Should NOT contain the incorrect format (direct _eq on pair)
         let incorrect_pattern = "pair: {_eq:";
         assert!(
@@ -2283,7 +2421,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
-        
+
         // Both filters should be properly converted
         assert!(
             converted_query.contains("pair: {id: {_eq: \"0\"}}"),
@@ -2320,7 +2458,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
-        
+
         // Nested entity reference should use nested structure
         assert!(
             converted_query.contains("pair: {id: {_eq: \"0\"}}"),
@@ -2359,7 +2497,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
-        
+
         // When the subgraph already uses nested structure, it should be preserved/converted correctly
         // pair: {name: "ETH"} should become pair: {name: {_eq: "ETH"}}
         assert!(
@@ -2395,7 +2533,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
-        
+
         // Deeply nested entity reference should use nested structure
         assert!(
             converted_query.contains("pair: {token: {id: {_eq: \"0\"}}}"),
@@ -2433,7 +2571,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
-        
+
         // Deeply nested regular field should use nested structure without id wrapper
         assert!(
             converted_query.contains("pair: {token: {amount: {_eq: \"0\"}}}"),
@@ -2478,7 +2616,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
-        
+
         // Should correctly convert to nested structure with name as regular field
         assert!(
             converted_query.contains("pair: {token: {name: {_eq: \"ETH\"}}}"),
@@ -2492,7 +2630,6 @@ mod tests {
             converted_query
         );
     }
-
 
     #[test]
     fn test_regular_field_in_selection() {
@@ -2512,7 +2649,7 @@ mod tests {
         let payload = create_test_payload(query);
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
-        
+
         // Since "token" is explicitly in the selection as a regular field, it should be treated as regular
         assert!(
             converted_query.contains("token: {_eq: \"0\"}"),
@@ -2536,14 +2673,14 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", converted_query);
-        
+
         // Should use capitalized entity name: Pair_by_pk not pair_by_pk
         assert!(
             converted_query.contains("Pair_by_pk(id: \"0\")"),
             "Expected Pair_by_pk (capitalized) in converted query, got: {}",
             converted_query
         );
-        
+
         // Should NOT contain lowercase version
         assert!(
             !converted_query.contains("pair_by_pk"),
@@ -2558,14 +2695,14 @@ mod tests {
         let payload = create_test_payload("query { stream(id: \"123\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
-        
+
         // Should use capitalized entity name: Stream_by_pk not stream_by_pk
         assert!(
             converted_query.contains("Stream_by_pk(id: \"123\")"),
             "Expected Stream_by_pk (capitalized) in converted query, got: {}",
             converted_query
         );
-        
+
         // Should NOT contain lowercase version
         assert!(
             !converted_query.contains("stream_by_pk"),
@@ -2580,14 +2717,14 @@ mod tests {
         let payload = create_test_payload("query { user(id: \"0x123\") { id address } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
-        
+
         // Should use capitalized entity name: User_by_pk not user_by_pk
         assert!(
             converted_query.contains("User_by_pk(id: \"0x123\")"),
             "Expected User_by_pk (capitalized) in converted query, got: {}",
             converted_query
         );
-        
+
         // Should NOT contain lowercase version
         assert!(
             !converted_query.contains("user_by_pk"),
@@ -2602,14 +2739,14 @@ mod tests {
         let payload = create_test_payload("query { batch(id: \"456\") { id label } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
-        
+
         // Should use capitalized entity name: Batch_by_pk not batch_by_pk
         assert!(
             converted_query.contains("Batch_by_pk(id: \"456\")"),
             "Expected Batch_by_pk (capitalized) in converted query, got: {}",
             converted_query
         );
-        
+
         // Should NOT contain lowercase version
         assert!(
             !converted_query.contains("batch_by_pk"),
@@ -2624,7 +2761,7 @@ mod tests {
         let payload = create_test_payload("query { pairs(first: 10) { id feed } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
-        
+
         // Should use capitalized singular entity name for collection: Pair not pair
         assert!(
             converted_query.contains("Pair("),
@@ -2646,21 +2783,21 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
         println!("User reported bug - converted query: {}", converted_query);
-        
+
         // Should use capitalized entity name: Pair_by_pk not pair_by_pk
         assert!(
             converted_query.contains("Pair_by_pk(id: \"0\")"),
             "Expected Pair_by_pk (capitalized) in converted query, got: {}",
             converted_query
         );
-        
+
         // Should NOT contain the buggy lowercase version
         assert!(
             !converted_query.contains("pair_by_pk"),
             "Should NOT contain lowercase pair_by_pk in converted query, got: {}",
             converted_query
         );
-        
+
         // Verify the full structure
         assert!(converted_query.contains("id"));
         assert!(converted_query.contains("feed"));
@@ -2676,20 +2813,23 @@ mod tests {
             }
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        
+
         // Verify query is converted
         assert!(result.query.get("query").is_some());
         let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("Factory"));
         assert!(query.contains("Bundle"));
-        
+
         // Verify variables are passed through
         assert!(result.query.get("variables").is_some());
         let variables = result.query.get("variables").unwrap();
         assert_eq!(variables["first"], 5);
-        
+
         // Verify variable references in query are preserved (not converted to literals)
-        assert!(query.contains("$first"), "Variable reference $first should be preserved in converted query");
+        assert!(
+            query.contains("$first"),
+            "Variable reference $first should be preserved in converted query"
+        );
     }
 
     #[test]
@@ -2699,10 +2839,10 @@ mod tests {
             "query": "query { factories(first: 5) { id } }"
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        
+
         // Should not have variables field
         assert!(result.query.get("variables").is_none());
-        
+
         // Query should still be converted
         assert!(result.query.get("query").is_some());
     }
@@ -2717,14 +2857,17 @@ mod tests {
             }
         });
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
-        
+
         // Verify variables are passed through
         assert_eq!(result.query["variables"]["limit"], 100);
-        
+
         // Verify query includes chainId filter and preserves variable
         let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("chainId: {_eq: \"1\"}"));
-        assert!(query.contains("$limit"), "Variable reference $limit should be preserved");
+        assert!(
+            query.contains("$limit"),
+            "Variable reference $limit should be preserved"
+        );
     }
 
     #[test]
@@ -2739,31 +2882,31 @@ mod tests {
             }
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        
+
         let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
-        
+
         // Verify variable definition is preserved in query header
         assert!(
             query.contains("query Trades($pairid: String!)"),
             "Variable definition should be preserved in query header, got: {}",
             query
         );
-        
+
         // Verify nested entity variable is converted correctly
         assert!(
             query.contains("pair: {id: {_eq: $pairid}}"),
             "Expected pair: {{id: {{_eq: $pairid}}}} in converted query, got: {}",
             query
         );
-        
+
         // Should NOT contain the incorrect format
         assert!(
             !query.contains("pair: {_eq: $pairid}"),
             "Should NOT contain 'pair: {{_eq: $pairid}}' (missing id wrapper), got: {}",
             query
         );
-        
+
         // Verify variables are passed through
         assert_eq!(result.query["variables"]["pairid"], "0");
     }
@@ -2780,31 +2923,31 @@ mod tests {
             }
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        
+
         let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
-        
+
         // Verify variable definition is preserved in query header
         assert!(
             query.contains("query Trades($pairid: String!)"),
             "Variable definition should be preserved in query header, got: {}",
             query
         );
-        
+
         // Verify nested entity variable is converted correctly
         assert!(
             query.contains("pair: {id: {_eq: $pairid}}"),
             "Expected pair: {{id: {{_eq: $pairid}}}} in converted query, got: {}",
             query
         );
-        
+
         // Should NOT contain the incorrect format
         assert!(
             !query.contains("pair: {_eq: $pairid}"),
             "Should NOT contain 'pair: {{_eq: $pairid}}' (missing id wrapper), got: {}",
             query
         );
-        
+
         // Verify variables are passed through
         assert_eq!(result.query["variables"]["pairid"], "0");
     }
@@ -2822,17 +2965,23 @@ mod tests {
             }
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        
+
         // Verify variables are passed through with object structure
         assert!(result.query.get("variables").is_some());
         let variables = result.query.get("variables").unwrap();
         assert_eq!(variables["where"]["isOpen"], true);
         assert_eq!(variables["where"]["trader"], "0x123");
-        
+
         // Verify variable reference is preserved in query and where clause is included
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("$where"), "Variable reference $where should be preserved");
-        assert!(query.contains("where: $where"), "Where clause with variable should be included in query");
+        assert!(
+            query.contains("$where"),
+            "Variable reference $where should be preserved"
+        );
+        assert!(
+            query.contains("where: $where"),
+            "Where clause with variable should be included in query"
+        );
     }
 
     #[test]
@@ -2845,7 +2994,7 @@ mod tests {
             }
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        
+
         // Verify variables are passed through with array structure
         assert!(result.query.get("variables").is_some());
         let variables = result.query.get("variables").unwrap();
@@ -2853,10 +3002,13 @@ mod tests {
         assert_eq!(variables["ids"][0], "0");
         assert_eq!(variables["ids"][1], "1");
         assert_eq!(variables["ids"][2], "2");
-        
+
         // Verify variable reference is preserved in query
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("$ids"), "Variable reference $ids should be preserved");
+        assert!(
+            query.contains("$ids"),
+            "Variable reference $ids should be preserved"
+        );
     }
 
     #[test]
@@ -2874,16 +3026,19 @@ mod tests {
             }
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        
+
         // Verify nested object variables are passed through
         assert!(result.query.get("variables").is_some());
         let variables = result.query.get("variables").unwrap();
         assert_eq!(variables["filter"]["pair"]["id"], "0");
         assert_eq!(variables["filter"]["isOpen"], true);
-        
+
         // Verify variable reference is preserved
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("$filter"), "Variable reference $filter should be preserved");
+        assert!(
+            query.contains("$filter"),
+            "Variable reference $filter should be preserved"
+        );
     }
 
     #[test]
@@ -2901,13 +3056,13 @@ mod tests {
             }
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        
+
         // Verify all variable types are passed through correctly
         let variables = result.query.get("variables").unwrap();
         assert_eq!(variables["limit"], 100);
         assert_eq!(variables["where"]["isOpen"], true);
         assert!(variables["ids"].is_array());
-        
+
         // Verify all variable references are preserved
         let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("$limit"));
@@ -3078,7 +3233,7 @@ mod tests {
 
         let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
-        
+
         // Should convert String to orderaction (the enum type)
         assert!(
             query.contains("$operation: orderaction"),
@@ -3107,7 +3262,7 @@ mod tests {
 
         let query = result.query["query"].as_str().unwrap();
         println!("Converted query: {}", query);
-        
+
         // Should convert String! to orderaction! (preserving non-nullable)
         assert!(
             query.contains("$operation: orderaction!"),
@@ -3115,5 +3270,4 @@ mod tests {
             query
         );
     }
-
 }

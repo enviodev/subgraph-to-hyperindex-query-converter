@@ -109,6 +109,7 @@ async fn execute_query_with_retry(
 
     let converted_query = conversion_result.query;
     let field_name_map = conversion_result.field_name_map;
+    let is_meta_query = conversion_result.is_meta_query;
 
     tracing::info!("Converted query: {:?}", converted_query);
 
@@ -246,7 +247,7 @@ async fn execute_query_with_retry(
 
             // Retry succeeded!
             tracing::info!("Query succeeded after schema refresh and retry");
-            let transformed = transform_response_to_subgraph_shape(retry_response, &field_name_map);
+            let transformed = transform_response_to_subgraph_shape(retry_response, &field_name_map, is_meta_query);
             return (StatusCode::OK, Json(transformed));
         }
 
@@ -276,7 +277,7 @@ async fn execute_query_with_retry(
     }
 
     // Success - no errors
-    let transformed = transform_response_to_subgraph_shape(response, &field_name_map);
+    let transformed = transform_response_to_subgraph_shape(response, &field_name_map, is_meta_query);
     (StatusCode::OK, Json(transformed))
 }
 
@@ -423,13 +424,41 @@ async fn forward_to_hyperindex(
     Ok(response_json)
 }
 
-fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::collections::HashMap<String, String>) -> Value {
+fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::collections::HashMap<String, String>, is_meta_query: bool) -> Value {
     let mut root = match resp {
         Value::Object(map) => map,
         other => return other,
     };
 
     if let Some(Value::Object(data_obj)) = root.get_mut("data") {
+        // Special handling for _meta query response
+        if is_meta_query {
+            if let Some(chain_metadata) = data_obj.get("chain_metadata") {
+                // Transform chain_metadata response to _meta format
+                // From: {"data":{"chain_metadata":[{"latest_fetched_block_number":419538012}]}}
+                // To:   {"data":{"_meta":{"block":{"number":419538012}}}}
+                let block_number = chain_metadata
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|obj| obj.get("latest_fetched_block_number"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+
+                let meta_response = serde_json::json!({
+                    "_meta": {
+                        "block": {
+                            "number": block_number
+                        }
+                    }
+                });
+
+                if let Value::Object(meta_obj) = meta_response {
+                    *data_obj = meta_obj;
+                }
+                return Value::Object(root);
+            }
+        }
+
         let mut new_data = serde_json::Map::new();
         for (key, value) in data_obj.clone().into_iter() {
             // First, try to use the exact field name from the original query
@@ -662,7 +691,7 @@ mod response_shape_tests {
             }
         });
         let empty_map = std::collections::HashMap::new();
-        let out = transform_response_to_subgraph_shape(resp, &empty_map);
+        let out = transform_response_to_subgraph_shape(resp, &empty_map, false);
         let data = out.get("data").unwrap();
         assert!(data.get("streams").is_some());
         assert!(data.get("batches").is_some());
@@ -686,17 +715,42 @@ mod response_shape_tests {
         field_map.insert("LpAction".to_string(), "lpActions".to_string());
         field_map.insert("LpShare".to_string(), "lpShares".to_string());
         field_map.insert("LpNFT".to_string(), "lpNFTs".to_string());
-        
-        let out = transform_response_to_subgraph_shape(resp, &field_map);
+
+        let out = transform_response_to_subgraph_shape(resp, &field_map, false);
         let data = out.get("data").unwrap();
-        
+
         // Should use exact names from the map (original query field names)
         assert!(data.get("lpActions").is_some(), "Expected lpActions");
         assert!(data.get("lpShares").is_some(), "Expected lpShares");
         assert!(data.get("lpNFTs").is_some(), "Expected lpNFTs");
-        
+
         // Should NOT have PascalCase or lowercase versions
         assert!(data.get("LpAction").is_none());
         assert!(data.get("lpactions").is_none());
+    }
+
+    #[test]
+    fn test_transform_meta_query_response() {
+        // Test _meta query response transformation
+        let resp = serde_json::json!({
+            "data": {
+                "chain_metadata": [
+                    {"latest_fetched_block_number": 419538012}
+                ]
+            }
+        });
+        let empty_map = std::collections::HashMap::new();
+        let out = transform_response_to_subgraph_shape(resp, &empty_map, true);
+        let data = out.get("data").unwrap();
+
+        // Should have _meta structure
+        assert!(data.get("_meta").is_some(), "Expected _meta");
+        let meta = data.get("_meta").unwrap();
+        assert!(meta.get("block").is_some(), "Expected block");
+        let block = meta.get("block").unwrap();
+        assert_eq!(block.get("number").unwrap(), 419538012);
+
+        // Should NOT have chain_metadata
+        assert!(data.get("chain_metadata").is_none());
     }
 }
