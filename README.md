@@ -190,6 +190,63 @@ curl -X POST -H "Content-Type: application/json" \
   http://localhost:3000/debug
 ```
 
+## Metrics
+
+The converter exposes Prometheus metrics at `/metrics` endpoint.
+
+### Quick View (Local Development)
+
+**Option 1: Simple Script**
+```bash
+./view_metrics.sh
+# Or with custom URL:
+./view_metrics.sh http://localhost:3000/metrics
+```
+
+**Option 2: Direct curl**
+```bash
+curl http://localhost:3000/metrics
+```
+
+**Option 3: Pretty formatted (using jq if available)**
+```bash
+curl -s http://localhost:3000/metrics | grep -E "^converter_" | sort
+```
+
+### Full Monitoring Stack (Docker)
+
+For visual dashboards with Grafana:
+
+1. Start Prometheus + Grafana:
+```bash
+docker-compose -f docker-compose.metrics.yml up -d
+```
+
+2. Access:
+   - **Grafana**: http://localhost:3001 (admin/admin)
+   - **Prometheus**: http://localhost:9090
+
+3. Import Grafana dashboard:
+   - Go to Grafana → Dashboards → Import
+   - Use the Prometheus queries from `METRICS_IMPLEMENTATION_GUIDE.md`
+
+4. Stop when done:
+```bash
+docker-compose -f docker-compose.metrics.yml down
+```
+
+### Available Metrics
+
+- `converter_requests_total` - Total requests processed
+- `converter_request_duration_seconds` - Total request latency
+- `converter_query_conversion_duration_seconds` - Query conversion time
+- `converter_query_response_wait_duration_seconds` - Time waiting for Hyperindex
+- `converter_response_transform_duration_seconds` - Response transformation time
+- `converter_schema_refreshes_total` - Schema refresh count
+- `converter_schema_fetch_duration_seconds` - Schema fetch time
+- `converter_conversion_errors_total` - Conversion errors
+- `converter_query_errors_total` - Query execution errors
+
 ## Example Query Conversions
 
 ### Collection Query (Default Endpoint)
