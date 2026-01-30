@@ -15,6 +15,7 @@ use tracing;
 use tracing_subscriber;
 
 mod conversion;
+mod http_client;
 mod schema;
 #[cfg(test)]
 mod integration_tests;
@@ -50,7 +51,11 @@ async fn main() {
         tracing::warn!("Failed to initialize schema: {}. Will retry on first request.", e);
     }
 
-    let addr: SocketAddr = "0.0.0.0:3000".parse().unwrap();
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000);
+    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
     tracing::info!("listening on {}", addr);
     let listener = TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -174,20 +179,42 @@ async fn execute_query_with_retry(
                 original_debug["chainId"] = serde_json::Value::String(chain_id.to_string());
             }
 
-            // Refresh schema
-            if let Err(refresh_err) = schema::refresh_schema().await {
-                tracing::error!("Failed to refresh schema: {}", refresh_err);
-                // Return original error even if refresh fails
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "errors": original_errors,
-                        "debug": original_debug,
-                        "subgraphResponse": subgraph_debug,
-                        "schemaRefreshAttempted": true,
-                        "schemaRefreshError": refresh_err.to_string(),
-                    })),
-                );
+            // Refresh schema (with cooldown protection)
+            match schema::refresh_schema().await {
+                Ok(_) => {
+                    tracing::info!("Schema refreshed successfully, retrying query");
+                }
+                Err(refresh_err) => {
+                    let err_msg = refresh_err.to_string();
+                    // If it's a cooldown error, don't treat it as a failure - just skip refresh
+                    if err_msg.contains("cooldown") {
+                        tracing::warn!("Schema refresh skipped due to cooldown: {}", err_msg);
+                        // Return original error without attempting refresh
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "errors": original_errors,
+                                "debug": original_debug,
+                                "subgraphResponse": subgraph_debug,
+                                "schemaRefreshSkipped": true,
+                                "schemaRefreshReason": err_msg,
+                            })),
+                        );
+                    } else {
+                        tracing::error!("Failed to refresh schema: {}", err_msg);
+                        // Return original error even if refresh fails
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "errors": original_errors,
+                                "debug": original_debug,
+                                "subgraphResponse": subgraph_debug,
+                                "schemaRefreshAttempted": true,
+                                "schemaRefreshError": err_msg,
+                            })),
+                        );
+                    }
+                }
             }
 
             // Retry: convert query again with fresh schema
@@ -412,8 +439,7 @@ async fn forward_to_hyperindex(
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
     let hyperindex_url = std::env::var("HYPERINDEX_URL").expect("HYPERINDEX_URL must be set");
 
-    let client = reqwest::Client::new();
-    let response = client
+    let response = http_client::HTTP_CLIENT
         .post(&hyperindex_url)
         .header("Content-Type", "application/json")
         .json(query)
@@ -618,8 +644,7 @@ async fn maybe_fetch_subgraph_debug(payload: Value) -> Option<Value> {
         _ => return None,
     };
 
-    let client = reqwest::Client::new();
-    let mut req = client
+    let mut req = http_client::HTTP_CLIENT
         .post(url)
         .header("Content-Type", "application/json")
         .json(&payload);

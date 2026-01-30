@@ -1,12 +1,15 @@
+use crate::http_client;
+use dashmap::DashMap;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // Schema cache - stores the parsed schema structure
 // Key: entity name (e.g., "Trade"), Value: map of field name -> FieldInfo
-type SchemaCache = Arc<RwLock<HashMap<String, HashMap<String, FieldInfo>>>>;
+// Using DashMap for lock-free concurrent reads (eliminates lock contention)
+type SchemaCache = Arc<DashMap<String, HashMap<String, FieldInfo>>>;
 
 #[derive(Debug, Clone)]
 pub struct FieldInfo {
@@ -20,7 +23,11 @@ static SCHEMA_LAST_UPDATED: once_cell::sync::Lazy<Arc<RwLock<Option<u64>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
 
 static SCHEMA_CACHE: once_cell::sync::Lazy<SchemaCache> =
-    once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+    once_cell::sync::Lazy::new(|| Arc::new(DashMap::new()));
+
+// Track last schema refresh time to prevent refresh storms
+static LAST_SCHEMA_REFRESH: once_cell::sync::Lazy<Arc<RwLock<Option<Instant>>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
 
 /// Fetch the GraphQL schema via introspection query
 pub async fn fetch_schema() -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -54,12 +61,11 @@ pub async fn fetch_schema() -> Result<Value, Box<dyn std::error::Error + Send + 
                                 }
                                 "#;
 
-    let client = reqwest::Client::new();
     let payload = serde_json::json!({
         "query": introspection_query
     });
 
-    let response = client
+    let response = http_client::HTTP_CLIENT
         .post(&hyperindex_url)
         .header("Content-Type", "application/json")
         .json(&payload)
@@ -92,7 +98,7 @@ pub async fn fetch_schema() -> Result<Value, Box<dyn std::error::Error + Send + 
 
 /// Parse the introspection response and build a schema cache
 pub fn parse_and_cache_schema(introspection_response: &Value) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut cache = SCHEMA_CACHE.write().unwrap();
+    let cache = SCHEMA_CACHE.clone();
     cache.clear();
 
     let schema = introspection_response
@@ -201,12 +207,17 @@ fn is_object_type(type_info: &Value) -> bool {
 }
 
 /// Get field information for a specific entity and field
+/// Using DashMap for lock-free concurrent reads (eliminates lock contention)
 pub fn get_field_info(entity_name: &str, field_name: &str) -> Option<FieldInfo> {
-    let cache = SCHEMA_CACHE.read().unwrap();
-    cache
+    SCHEMA_CACHE
         .get(entity_name)
-        .and_then(|fields| fields.get(field_name))
-        .cloned()
+        .and_then(|fields_ref| fields_ref.value().get(field_name).cloned())
+}
+
+/// Get all field information for an entity in one operation
+/// This is more efficient when you need multiple lookups for the same entity
+pub fn get_entity_fields(entity_name: &str) -> Option<HashMap<String, FieldInfo>> {
+    SCHEMA_CACHE.get(entity_name).map(|entry| entry.value().clone())
 }
 
 /// Check if a field is a nested entity
@@ -234,7 +245,41 @@ pub async fn initialize_schema() -> Result<(), Box<dyn std::error::Error + Send 
 }
 
 /// Refresh the schema by fetching it again and updating the cache
+/// Returns Ok(()) if refresh succeeded, Err if refresh was skipped due to cooldown
 pub async fn refresh_schema() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Get cooldown period from environment (default: 30 seconds)
+    // This prevents refresh storms under load
+    let cooldown_secs = std::env::var("SCHEMA_REFRESH_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+
+    // Check if we're in cooldown period
+    {
+        let last_refresh = LAST_SCHEMA_REFRESH.read().unwrap();
+        if let Some(instant) = *last_refresh {
+            let elapsed = instant.elapsed();
+            if elapsed < Duration::from_secs(cooldown_secs) {
+                let remaining = cooldown_secs - elapsed.as_secs();
+                tracing::warn!(
+                    "Schema refresh skipped - cooldown active ({}s remaining). Last refresh was {}s ago.",
+                    remaining,
+                    elapsed.as_secs()
+                );
+                return Err(format!(
+                    "Schema refresh cooldown active ({}s remaining)",
+                    remaining
+                ).into());
+            }
+        }
+    }
+
+    // Update last refresh time before starting
+    {
+        let mut last_refresh = LAST_SCHEMA_REFRESH.write().unwrap();
+        *last_refresh = Some(Instant::now());
+    }
+
     tracing::info!("Refreshing GraphQL schema via introspection...");
     let schema_response = fetch_schema().await?;
     parse_and_cache_schema(&schema_response)?;
@@ -244,8 +289,7 @@ pub async fn refresh_schema() -> Result<(), Box<dyn std::error::Error + Send + S
 
 /// Check if the schema cache is empty (needs initialization)
 pub fn is_schema_empty() -> bool {
-    let cache = SCHEMA_CACHE.read().unwrap();
-    cache.is_empty()
+    SCHEMA_CACHE.is_empty()
 }
 
 /// Ensure schema is initialized - if empty, fetch it
@@ -259,18 +303,18 @@ pub async fn ensure_schema_initialized() -> Result<(), Box<dyn std::error::Error
 
 /// Get cache statistics
 pub fn get_cache_stats() -> (usize, Option<u64>) {
-    let cache = SCHEMA_CACHE.read().unwrap();
-    let entity_count = cache.len();
+    let entity_count = SCHEMA_CACHE.len();
     let last_updated = *SCHEMA_LAST_UPDATED.read().unwrap();
     (entity_count, last_updated)
 }
 
 /// Get a JSON snapshot of the current schema cache for debugging/inspection
 pub fn get_schema_cache_json() -> Value {
-    let cache = SCHEMA_CACHE.read().unwrap();
     let mut entities: HashMap<String, Value> = HashMap::new();
 
-    for (entity_name, fields) in cache.iter() {
+    for entry in SCHEMA_CACHE.iter() {
+        let entity_name = entry.key();
+        let fields = entry.value();
         let mut field_map: HashMap<String, Value> = HashMap::new();
         for (field_name, info) in fields.iter() {
             field_map.insert(
@@ -295,6 +339,9 @@ pub fn get_schema_cache_json() -> Value {
 
 /// Check if GraphQL errors suggest a schema mismatch that could be fixed by refreshing
 /// Returns true if the errors look like they could be caused by stale schema cache
+/// 
+/// This function is now more specific - it only triggers on actual schema-related errors,
+/// not on variable errors, syntax errors, or other validation issues.
 pub fn is_schema_stale_error(errors: &serde_json::Value) -> bool {
     // Check if errors array exists
     let errors_array = match errors.as_array() {
@@ -311,23 +358,36 @@ pub fn is_schema_stale_error(errors: &serde_json::Value) -> bool {
             .unwrap_or("")
             .to_lowercase();
 
+        // Exclude variable-related errors - these are NOT schema issues
+        if message.contains("unbound variable")
+            || message.contains("variable")
+            || message.contains("expected type")
+            || message.contains("cannot be coerced") {
+            // These are variable/type errors, not schema issues
+            continue;
+        }
+
         // Check for patterns that suggest schema mismatch:
         // 1. "field '_eq' not found in type: 'X_bool_exp'" - nested entity treated as primitive
         // 2. "field 'id' not found in type: 'X_comparison_exp'" - primitive treated as nested
         // 3. "field 'X' not found in type: 'Y'" - field doesn't exist (could be schema change)
-        // 4. "field not found" in general
+        // Note: We're more specific now - only actual field/type errors, not general "field not found"
         if message.contains("field '_eq' not found in type") 
             || message.contains("field 'id' not found in type")
-            || (message.contains("field") && message.contains("not found in type"))
-            || message.contains("field not found") {
+            || (message.contains("field") 
+                && message.contains("not found in type")
+                && !message.contains("variable")) {
+            tracing::debug!("Detected schema-related error: {}", message);
             return true;
         }
 
-        // Check extensions for validation errors that might indicate schema issues
+        // REMOVED: "validation-failed" check - too broad, causes false positives
+        // Only check for specific schema-related error codes if they exist
         if let Some(extensions) = error.get("extensions") {
             if let Some(code) = extensions.get("code").and_then(|c| c.as_str()) {
-                if code == "validation-failed" {
-                    // Validation errors could be schema-related
+                // Only trigger on specific schema-related codes, not generic validation-failed
+                if code == "schema-error" || code == "type-error" {
+                    tracing::debug!("Detected schema-related error code: {}", code);
                     return true;
                 }
             }
@@ -340,8 +400,7 @@ pub fn is_schema_stale_error(errors: &serde_json::Value) -> bool {
 #[cfg(test)]
 /// Clear the schema cache (for tests)
 pub fn clear_schema_cache() {
-    let mut cache = SCHEMA_CACHE.write().unwrap();
-    cache.clear();
+    SCHEMA_CACHE.clear();
     *SCHEMA_LAST_UPDATED.write().unwrap() = None;
 }
 
@@ -352,7 +411,7 @@ pub fn clear_schema_cache() {
 pub fn init_test_schema() {
     // Always clear first to ensure we start with a clean slate
     clear_schema_cache();
-    let mut cache = SCHEMA_CACHE.write().unwrap();
+    let cache = SCHEMA_CACHE.clone();
 
     // Trade entity with nested pair field
     let mut trade_fields = HashMap::new();

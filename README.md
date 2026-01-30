@@ -142,7 +142,20 @@ The service will start on `http://localhost:3000`
 Create a `.env` file in the project root:
 
 ```env
+# Required
 HYPERINDEX_URL=https://indexer.hyperindex.xyz/53b7e25/v1/graphql
+
+# Optional Configuration
+PORT=3000                           # Server port (default: 3000)
+HTTP_TIMEOUT_SECS=30               # Request timeout in seconds (default: 30)
+SCHEMA_REFRESH_COOLDOWN_SECS=30    # Minimum seconds between schema refreshes (default: 30)
+
+# Optional - Debug/Subgraph Comparison
+SUBGRAPH_DEBUG_URL=                # URL for subgraph comparison on errors
+SUBGRAPH_BEARER_TOKEN=             # Bearer token for subgraph auth
+SUBGRAPH_API_KEY=                  # API key for subgraph auth
+SUBGRAPH_AUTH_HEADER=              # Custom auth header name
+SUBGRAPH_AUTH_VALUE=               # Custom auth header value
 ```
 
 ## Usage
