@@ -97,6 +97,7 @@ async fn execute_query_with_retry(
         Err(e) => {
             metrics::CONVERSION_DURATION.observe(conversion_start.elapsed().as_secs_f64() * 1000.0);
             metrics::CONVERSION_ERRORS.inc();
+            metrics::TOTAL_ERRORS.inc();
             tracing::error!("Conversion error: {}", e);
             let reasoning = match &e {
                 conversion::ConversionError::InvalidQueryFormat =>
@@ -152,7 +153,8 @@ async fn execute_query_with_retry(
         },
         Err(e) => {
             metrics::QUERY_RESPONSE_WAIT_DURATION.observe(query_start.elapsed().as_secs_f64() * 1000.0);
-            metrics::QUERY_ERRORS.inc();
+            metrics::QUERY_EXECUTION_ERRORS.inc();
+            metrics::TOTAL_ERRORS.inc();
             tracing::error!("Hyperindex request error: {}", e);
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -246,6 +248,7 @@ async fn execute_query_with_retry(
             }
 
             // Retry: convert query again with fresh schema
+            let retry_conversion_start = Instant::now();
             let retry_result = match conversion::convert_subgraph_to_hyperindex(payload, chain_id) {
                 Ok(result) => result,
                 Err(e) => {
@@ -263,8 +266,10 @@ async fn execute_query_with_retry(
                     );
                 }
             };
+            let retry_conversion_duration_ms = retry_conversion_start.elapsed().as_secs_f64() * 1000.0;
 
             // Retry: forward query again
+            let retry_query_start = Instant::now();
             let retry_response = match forward_to_hyperindex(&retry_result.query).await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -282,11 +287,15 @@ async fn execute_query_with_retry(
                     );
                 }
             };
+            let retry_query_wait_duration_ms = retry_query_start.elapsed().as_secs_f64() * 1000.0;
 
             // Check if retry succeeded
             if let Some(retry_errors) = retry_response.get("errors") {
+                metrics::QUERY_EXECUTION_ERRORS.inc();
+                metrics::TOTAL_ERRORS.inc();
                 tracing::error!("Query still failed after schema refresh and retry");
                 // Return original error, not the retry error
+                metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
                 return (
                     StatusCode::BAD_GATEWAY,
                     Json(serde_json::json!({
@@ -304,12 +313,20 @@ async fn execute_query_with_retry(
             tracing::info!("Query succeeded after schema refresh and retry");
             let transform_start = Instant::now();
             let transformed = transform_response_to_subgraph_shape(retry_response, &field_name_map, is_meta_query);
-            metrics::RESPONSE_TRANSFORM_DURATION.observe(transform_start.elapsed().as_secs_f64() * 1000.0);
-            metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
+            let transform_duration_ms = transform_start.elapsed().as_secs_f64() * 1000.0;
+            metrics::RESPONSE_TRANSFORM_DURATION.observe(transform_duration_ms);
+            let total_duration_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+            metrics::REQUEST_DURATION.observe(total_duration_ms);
+            
+            // Track query statistics (use retry conversion time, response wait time, and total time)
+            metrics::track_query(original_query, retry_conversion_duration_ms, retry_query_wait_duration_ms, total_duration_ms);
+            
             return (StatusCode::OK, Json(transformed));
         }
 
         // Not a schema-related error, return it normally
+        metrics::QUERY_EXECUTION_ERRORS.inc();
+        metrics::TOTAL_ERRORS.inc();
         let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
         tracing::error!(
             original_query = original_query,
@@ -324,6 +341,7 @@ async fn execute_query_with_retry(
         if let Some(chain_id) = chain_id {
             debug["chainId"] = serde_json::Value::String(chain_id.to_string());
         }
+        metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
         return (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({
@@ -337,10 +355,17 @@ async fn execute_query_with_retry(
     // Success - no errors
     let transform_start = Instant::now();
     let transformed = transform_response_to_subgraph_shape(response, &field_name_map, is_meta_query);
-    metrics::RESPONSE_TRANSFORM_DURATION.observe(transform_start.elapsed().as_secs_f64());
+    let transform_duration_ms = transform_start.elapsed().as_secs_f64() * 1000.0;
+    metrics::RESPONSE_TRANSFORM_DURATION.observe(transform_duration_ms);
 
     // Record total request duration
-    metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64());
+    let total_duration_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+    metrics::REQUEST_DURATION.observe(total_duration_ms);
+
+    // Track query statistics (conversion time, response wait time, and total time)
+    let conversion_duration_ms = conversion_start.elapsed().as_secs_f64() * 1000.0;
+    let query_wait_duration_ms = query_start.elapsed().as_secs_f64() * 1000.0;
+    metrics::track_query(original_query, conversion_duration_ms, query_wait_duration_ms, total_duration_ms);
 
     (StatusCode::OK, Json(transformed))
 }
