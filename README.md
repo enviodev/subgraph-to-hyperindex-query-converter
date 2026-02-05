@@ -210,27 +210,11 @@ Prometheus metrics available at `/metrics`:
 - `converter_schema_fetch_duration_milliseconds` - Schema fetch time
 - `converter_schema_refresh_errors_total` - Schema refresh failures
 
-**Query-Specific Metrics (Top 10 ranked, automatically tracked):**
-- `converter_top_query_by_count{rank,query_preview}` - Most frequent queries (rank 1-10, query_preview shows full query text)
-- `converter_top_query_by_avg_time_milliseconds{rank,query_preview}` - Slowest queries by avg time
-- `converter_top_query_by_max_time_milliseconds{rank,query_preview}` - Queries with worst single execution
-
-*Note: `query_preview` is automatically extracted from queries you send (full query text) - you don't need to provide it. The complete query appears in Grafana via this label.*
-
 **Example Queries:**
 ```promql
 # Error rates
 rate(converter_errors_total[5m]) / rate(converter_requests_total[5m])
 rate(converter_conversion_errors_total[5m]) / rate(converter_requests_total[5m])
-
-# Most frequently sent queries (top 10)
-topk(10, converter_top_query_by_count)
-
-# Slowest queries by average time (top 10)
-topk(10, converter_top_query_by_avg_time_milliseconds)
-
-# Queries with worst single execution (top 10)
-topk(10, converter_top_query_by_max_time_milliseconds)
 
 # Overall average latencies
 avg(converter_request_duration_milliseconds)
@@ -346,7 +330,7 @@ query {
 
 1. **Basic Parsing**: Uses simple string parsing instead of a proper GraphQL parser
 2. **Limited Entity Support**: Currently optimized for Stream entities
-3. **Order By**: `orderBy` and `orderDirection` parameters are extracted but not used in conversion
+3. **Order By Variables**: `orderBy` and `orderDirection` parameters cannot use variables - only literal values are supported because Hasura doesn't support variables as object keys in `order_by` clauses
 4. **No Block Queries**: Time-traveling queries with `block` parameters are not supported as Hyperindex doesn't natively support historical queries
 5. **Data Limit**: Unless Hyperindex is configured via environment variables to support 5000 datapoints, the `limit` parameter should be set to a maximum of 1000
 6. **\_meta Queries**: Meta queries are limitted only to latest block number
@@ -354,10 +338,6 @@ query {
 ### Planned Improvements
 
 - [ ] Use proper GraphQL parser for robust query handling
-
-- [ ] Add support for variables and directives
-- [ ] Implement proper order_by conversion
-- [ ] Add comprehensive test coverage
 
 ## Development
 

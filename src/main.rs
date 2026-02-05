@@ -318,9 +318,6 @@ async fn execute_query_with_retry(
             let total_duration_ms = request_start.elapsed().as_secs_f64() * 1000.0;
             metrics::REQUEST_DURATION.observe(total_duration_ms);
             
-            // Track query statistics (use retry conversion time, response wait time, and total time)
-            metrics::track_query(original_query, retry_conversion_duration_ms, retry_query_wait_duration_ms, total_duration_ms);
-            
             return (StatusCode::OK, Json(transformed));
         }
 
@@ -361,11 +358,6 @@ async fn execute_query_with_retry(
     // Record total request duration
     let total_duration_ms = request_start.elapsed().as_secs_f64() * 1000.0;
     metrics::REQUEST_DURATION.observe(total_duration_ms);
-
-    // Track query statistics (conversion time, response wait time, and total time)
-    let conversion_duration_ms = conversion_start.elapsed().as_secs_f64() * 1000.0;
-    let query_wait_duration_ms = query_start.elapsed().as_secs_f64() * 1000.0;
-    metrics::track_query(original_query, conversion_duration_ms, query_wait_duration_ms, total_duration_ms);
 
     (StatusCode::OK, Json(transformed))
 }
