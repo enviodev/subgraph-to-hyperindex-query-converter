@@ -275,6 +275,11 @@ async fn execute_query_with_retry(
             // Retry succeeded!
             tracing::info!("Query succeeded after schema refresh and retry");
             let transformed = transform_response_to_subgraph_shape(retry_response, &field_name_map, is_meta_query);
+            let transform_duration_ms = transform_start.elapsed().as_secs_f64() * 1000.0;
+            metrics::RESPONSE_TRANSFORM_DURATION.observe(transform_duration_ms);
+            let total_duration_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+            metrics::REQUEST_DURATION.observe(total_duration_ms);
+            
             return (StatusCode::OK, Json(transformed));
         }
 
@@ -305,6 +310,13 @@ async fn execute_query_with_retry(
 
     // Success - no errors
     let transformed = transform_response_to_subgraph_shape(response, &field_name_map, is_meta_query);
+    let transform_duration_ms = transform_start.elapsed().as_secs_f64() * 1000.0;
+    metrics::RESPONSE_TRANSFORM_DURATION.observe(transform_duration_ms);
+
+    // Record total request duration
+    let total_duration_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+    metrics::REQUEST_DURATION.observe(total_duration_ms);
+
     (StatusCode::OK, Json(transformed))
 }
 
