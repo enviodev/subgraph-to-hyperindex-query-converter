@@ -9,6 +9,7 @@ use dotenv;
 // use reqwest; // avoid bringing reqwest::StatusCode into scope
 use serde_json::Value;
 use std::net::SocketAddr;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tracing;
@@ -16,6 +17,7 @@ use tracing_subscriber;
 
 mod conversion;
 mod http_client;
+mod metrics;
 mod schema;
 #[cfg(test)]
 mod integration_tests;
@@ -44,6 +46,7 @@ async fn main() {
         .route("/schema/test", get(test_introspection))
         .route("/schema/refresh", post(refresh_schema_endpoint))
         .route("/schema/raw", get(schema_raw_endpoint))
+        .route("/metrics", get(metrics_handler))
         .layer(cors);
 
     // Initialize schema on startup
@@ -67,9 +70,14 @@ async fn execute_query_with_retry(
     payload: &Value,
     chain_id: Option<&str>,
 ) -> (StatusCode, Json<Value>) {
+    // Track total request duration
+    let request_start = Instant::now();
+    metrics::REQUEST_COUNTER.inc();
+
     // Ensure schema is initialized (lazy initialization)
     if let Err(e) = schema::ensure_schema_initialized().await {
         tracing::error!("Failed to ensure schema is initialized: {}", e);
+        metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -80,9 +88,16 @@ async fn execute_query_with_retry(
     }
 
     // Convert the query
+    let conversion_start = Instant::now();
     let conversion_result = match conversion::convert_subgraph_to_hyperindex(payload, chain_id) {
-        Ok(result) => result,
+        Ok(result) => {
+            metrics::CONVERSION_DURATION.observe(conversion_start.elapsed().as_secs_f64() * 1000.0);
+            result
+        },
         Err(e) => {
+            metrics::CONVERSION_DURATION.observe(conversion_start.elapsed().as_secs_f64() * 1000.0);
+            metrics::CONVERSION_ERRORS.inc();
+            metrics::TOTAL_ERRORS.inc();
             tracing::error!("Conversion error: {}", e);
             let reasoning = match &e {
                 conversion::ConversionError::InvalidQueryFormat =>
@@ -130,9 +145,16 @@ async fn execute_query_with_retry(
         .unwrap_or_default();
 
     // Try forwarding the query
+    let query_start = Instant::now();
     let response = match forward_to_hyperindex(&converted_query).await {
-        Ok(resp) => resp,
+        Ok(resp) => {
+            metrics::QUERY_RESPONSE_WAIT_DURATION.observe(query_start.elapsed().as_secs_f64() * 1000.0);
+            resp
+        },
         Err(e) => {
+            metrics::QUERY_RESPONSE_WAIT_DURATION.observe(query_start.elapsed().as_secs_f64() * 1000.0);
+            metrics::QUERY_EXECUTION_ERRORS.inc();
+            metrics::TOTAL_ERRORS.inc();
             tracing::error!("Hyperindex request error: {}", e);
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -142,6 +164,7 @@ async fn execute_query_with_retry(
                 error = %details,
                 "Error forwarding converted query to Hyperindex"
             );
+            metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -180,8 +203,11 @@ async fn execute_query_with_retry(
             }
 
             // Refresh schema (with cooldown protection)
+            let refresh_start = Instant::now();
             match schema::refresh_schema().await {
                 Ok(_) => {
+                    metrics::SCHEMA_REFRESH_COUNTER.inc();
+                    metrics::SCHEMA_FETCH_DURATION.observe(refresh_start.elapsed().as_secs_f64() * 1000.0);
                     tracing::info!("Schema refreshed successfully, retrying query");
                 }
                 Err(refresh_err) => {
@@ -190,6 +216,7 @@ async fn execute_query_with_retry(
                     if err_msg.contains("cooldown") {
                         tracing::warn!("Schema refresh skipped due to cooldown: {}", err_msg);
                         // Return original error without attempting refresh
+                        metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
                         return (
                             StatusCode::BAD_GATEWAY,
                             Json(serde_json::json!({
@@ -201,8 +228,11 @@ async fn execute_query_with_retry(
                             })),
                         );
                     } else {
+                        metrics::SCHEMA_REFRESH_ERRORS.inc();
+                        metrics::SCHEMA_FETCH_DURATION.observe(refresh_start.elapsed().as_secs_f64() * 1000.0);
                         tracing::error!("Failed to refresh schema: {}", err_msg);
                         // Return original error even if refresh fails
+                        metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
                         return (
                             StatusCode::BAD_GATEWAY,
                             Json(serde_json::json!({
@@ -218,6 +248,7 @@ async fn execute_query_with_retry(
             }
 
             // Retry: convert query again with fresh schema
+            let retry_conversion_start = Instant::now();
             let retry_result = match conversion::convert_subgraph_to_hyperindex(payload, chain_id) {
                 Ok(result) => result,
                 Err(e) => {
@@ -235,8 +266,10 @@ async fn execute_query_with_retry(
                     );
                 }
             };
+            let retry_conversion_duration_ms = retry_conversion_start.elapsed().as_secs_f64() * 1000.0;
 
             // Retry: forward query again
+            let retry_query_start = Instant::now();
             let retry_response = match forward_to_hyperindex(&retry_result.query).await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -254,11 +287,15 @@ async fn execute_query_with_retry(
                     );
                 }
             };
+            let retry_query_wait_duration_ms = retry_query_start.elapsed().as_secs_f64() * 1000.0;
 
             // Check if retry succeeded
             if let Some(retry_errors) = retry_response.get("errors") {
+                metrics::QUERY_EXECUTION_ERRORS.inc();
+                metrics::TOTAL_ERRORS.inc();
                 tracing::error!("Query still failed after schema refresh and retry");
                 // Return original error, not the retry error
+                metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
                 return (
                     StatusCode::BAD_GATEWAY,
                     Json(serde_json::json!({
@@ -274,6 +311,7 @@ async fn execute_query_with_retry(
 
             // Retry succeeded!
             tracing::info!("Query succeeded after schema refresh and retry");
+            let transform_start = Instant::now();
             let transformed = transform_response_to_subgraph_shape(retry_response, &field_name_map, is_meta_query);
             let transform_duration_ms = transform_start.elapsed().as_secs_f64() * 1000.0;
             metrics::RESPONSE_TRANSFORM_DURATION.observe(transform_duration_ms);
@@ -284,6 +322,8 @@ async fn execute_query_with_retry(
         }
 
         // Not a schema-related error, return it normally
+        metrics::QUERY_EXECUTION_ERRORS.inc();
+        metrics::TOTAL_ERRORS.inc();
         let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
         tracing::error!(
             original_query = original_query,
@@ -298,6 +338,7 @@ async fn execute_query_with_retry(
         if let Some(chain_id) = chain_id {
             debug["chainId"] = serde_json::Value::String(chain_id.to_string());
         }
+        metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
         return (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({
@@ -309,6 +350,7 @@ async fn execute_query_with_retry(
     }
 
     // Success - no errors
+    let transform_start = Instant::now();
     let transformed = transform_response_to_subgraph_shape(response, &field_name_map, is_meta_query);
     let transform_duration_ms = transform_start.elapsed().as_secs_f64() * 1000.0;
     metrics::RESPONSE_TRANSFORM_DURATION.observe(transform_duration_ms);
@@ -612,9 +654,12 @@ async fn test_introspection() -> impl IntoResponse {
 
 async fn refresh_schema_endpoint() -> impl IntoResponse {
     tracing::info!("Refreshing schema via endpoint...");
+    let refresh_start = Instant::now();
     
     match schema::refresh_schema().await {
         Ok(_) => {
+            metrics::SCHEMA_REFRESH_COUNTER.inc();
+            metrics::SCHEMA_FETCH_DURATION.observe(refresh_start.elapsed().as_secs_f64() * 1000.0);
             let (entity_count, last_updated) = schema::get_cache_stats();
             
             (
@@ -628,16 +673,37 @@ async fn refresh_schema_endpoint() -> impl IntoResponse {
             )
         }
         Err(e) => {
+            let err_msg = e.to_string();
+            if !err_msg.contains("cooldown") {
+                metrics::SCHEMA_REFRESH_ERRORS.inc();
+            }
+            metrics::SCHEMA_FETCH_DURATION.observe(refresh_start.elapsed().as_secs_f64() * 1000.0);
             tracing::error!("Failed to refresh schema: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "success": false,
                     "error": "Failed to refresh schema",
-                    "details": e.to_string()
+                    "details": err_msg
                 })),
             )
         }
+    }
+}
+
+/// Metrics endpoint handler
+async fn metrics_handler() -> impl IntoResponse {
+    match metrics::gather_metrics() {
+        Ok(metrics) => (
+            StatusCode::OK,
+            [("Content-Type", "text/plain; version=0.0.4")],
+            metrics,
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [("Content-Type", "text/plain")],
+            format!("Error gathering metrics: {}", e),
+        ),
     }
 }
 

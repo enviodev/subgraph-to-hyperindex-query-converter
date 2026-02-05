@@ -2,3 +2,4 @@
 .env
 *Makefile*
 .DS_Store
+node_modules/
