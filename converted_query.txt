@@ -1,8 +1,0 @@
-query {
-  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: "1"}, alias: {_ilike: "%113%"}}) {
-    alias
-    asset {
-      address
-    }
-  }
-}

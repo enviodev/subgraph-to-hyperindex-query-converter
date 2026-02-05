@@ -190,6 +190,53 @@ curl -X POST -H "Content-Type: application/json" \
   http://localhost:3000/debug
 ```
 
+## Metrics
+
+Prometheus metrics available at `/metrics`:
+
+**Request Metrics:**
+- `converter_requests_total` - Total requests
+- `converter_request_duration_milliseconds` - Total round-trip latency (conversion + network + transform)
+- `converter_errors_total` - Total errors (conversion + query execution)
+- `converter_conversion_errors_total` - Conversion failures
+- `converter_query_execution_errors_total` - Query execution failures (HTTP or GraphQL errors)
+
+**Performance Metrics:**
+- `converter_query_conversion_duration_milliseconds` - Query conversion time
+- `converter_query_response_wait_duration_milliseconds` - Network wait time for Hyperindex response
+
+**Schema Metrics:**
+- `converter_schema_refreshes_total` - Schema refresh count
+- `converter_schema_fetch_duration_milliseconds` - Schema fetch time
+- `converter_schema_refresh_errors_total` - Schema refresh failures
+
+**Query-Specific Metrics (Top 10 ranked, automatically tracked):**
+- `converter_top_query_by_count{rank,query_preview}` - Most frequent queries (rank 1-10, query_preview shows full query text)
+- `converter_top_query_by_avg_time_milliseconds{rank,query_preview}` - Slowest queries by avg time
+- `converter_top_query_by_max_time_milliseconds{rank,query_preview}` - Queries with worst single execution
+
+*Note: `query_preview` is automatically extracted from queries you send (full query text) - you don't need to provide it. The complete query appears in Grafana via this label.*
+
+**Example Queries:**
+```promql
+# Error rates
+rate(converter_errors_total[5m]) / rate(converter_requests_total[5m])
+rate(converter_conversion_errors_total[5m]) / rate(converter_requests_total[5m])
+
+# Most frequently sent queries (top 10)
+topk(10, converter_top_query_by_count)
+
+# Slowest queries by average time (top 10)
+topk(10, converter_top_query_by_avg_time_milliseconds)
+
+# Queries with worst single execution (top 10)
+topk(10, converter_top_query_by_max_time_milliseconds)
+
+# Overall average latencies
+avg(converter_request_duration_milliseconds)
+avg(converter_query_response_wait_duration_milliseconds)
+```
+
 ## Example Query Conversions
 
 ### Collection Query (Default Endpoint)

@@ -281,7 +281,9 @@ pub async fn refresh_schema() -> Result<(), Box<dyn std::error::Error + Send + S
     }
 
     tracing::info!("Refreshing GraphQL schema via introspection...");
+    let fetch_start = std::time::Instant::now();
     let schema_response = fetch_schema().await?;
+    // Note: fetch_schema duration is tracked in main.rs where refresh_schema is called
     parse_and_cache_schema(&schema_response)?;
     tracing::info!("Schema refreshed and cached");
     Ok(())
