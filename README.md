@@ -148,7 +148,6 @@ HYPERINDEX_URL=https://indexer.hyperindex.xyz/53b7e25/v1/graphql
 # Optional Configuration
 PORT=3000                           # Server port (default: 3000)
 HTTP_TIMEOUT_SECS=30               # Request timeout in seconds (default: 30)
-SCHEMA_REFRESH_COOLDOWN_SECS=30    # Minimum seconds between schema refreshes (default: 30)
 
 # Optional - Debug/Subgraph Comparison
 SUBGRAPH_DEBUG_URL=                # URL for subgraph comparison on errors
@@ -206,9 +205,9 @@ Prometheus metrics available at `/metrics`:
 - `converter_query_response_wait_duration_milliseconds` - Network wait time for Hyperindex response
 
 **Schema Metrics:**
-- `converter_schema_refreshes_total` - Schema refresh count
-- `converter_schema_fetch_duration_milliseconds` - Schema fetch time
-- `converter_schema_refresh_errors_total` - Schema refresh failures
+- `converter_schema_refreshes_total` - Schema initialization count (once per restart)
+- `converter_schema_fetch_duration_milliseconds` - Schema fetch time during initialization
+- `converter_schema_refresh_errors_total` - Schema initialization failures
 
 **Example Queries:**
 ```promql

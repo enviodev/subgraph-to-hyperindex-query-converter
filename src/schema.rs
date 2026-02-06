@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // Schema cache - stores the parsed schema structure
 // Key: entity name (e.g., "Trade"), Value: map of field name -> FieldInfo
@@ -24,10 +24,6 @@ static SCHEMA_LAST_UPDATED: once_cell::sync::Lazy<Arc<RwLock<Option<u64>>>> =
 
 static SCHEMA_CACHE: once_cell::sync::Lazy<SchemaCache> =
     once_cell::sync::Lazy::new(|| Arc::new(DashMap::new()));
-
-// Track last schema refresh time to prevent refresh storms
-static LAST_SCHEMA_REFRESH: once_cell::sync::Lazy<Arc<RwLock<Option<Instant>>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(RwLock::new(None)));
 
 /// Fetch the GraphQL schema via introspection query
 pub async fn fetch_schema() -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -235,55 +231,34 @@ pub fn is_standard_scalar(type_name: &str) -> bool {
     )
 }
 
-/// Initialize the schema by fetching and caching it
+/// Initialize the schema by fetching and caching it (called once on startup)
 pub async fn initialize_schema() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Fetching GraphQL schema via introspection...");
+    let fetch_start = std::time::Instant::now();
     let schema_response = fetch_schema().await?;
+    let fetch_duration_ms = fetch_start.elapsed().as_secs_f64() * 1000.0;
+    
+    // Track initialization metrics
+    crate::metrics::SCHEMA_FETCH_DURATION.observe(fetch_duration_ms);
+    crate::metrics::SCHEMA_REFRESH_COUNTER.inc();
+    
     parse_and_cache_schema(&schema_response)?;
     tracing::info!("Schema initialized and cached");
     Ok(())
 }
 
 /// Refresh the schema by fetching it again and updating the cache
-/// Returns Ok(()) if refresh succeeded, Err if refresh was skipped due to cooldown
+/// This is a manual operation - the schema doesn't change automatically once deployed
 pub async fn refresh_schema() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Get cooldown period from environment (default: 30 seconds)
-    // This prevents refresh storms under load
-    let cooldown_secs = std::env::var("SCHEMA_REFRESH_COOLDOWN_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
-
-    // Check if we're in cooldown period
-    {
-        let last_refresh = LAST_SCHEMA_REFRESH.read().unwrap();
-        if let Some(instant) = *last_refresh {
-            let elapsed = instant.elapsed();
-            if elapsed < Duration::from_secs(cooldown_secs) {
-                let remaining = cooldown_secs - elapsed.as_secs();
-                tracing::warn!(
-                    "Schema refresh skipped - cooldown active ({}s remaining). Last refresh was {}s ago.",
-                    remaining,
-                    elapsed.as_secs()
-                );
-                return Err(format!(
-                    "Schema refresh cooldown active ({}s remaining)",
-                    remaining
-                ).into());
-            }
-        }
-    }
-
-    // Update last refresh time before starting
-    {
-        let mut last_refresh = LAST_SCHEMA_REFRESH.write().unwrap();
-        *last_refresh = Some(Instant::now());
-    }
-
     tracing::info!("Refreshing GraphQL schema via introspection...");
     let fetch_start = std::time::Instant::now();
     let schema_response = fetch_schema().await?;
-    // Note: fetch_schema duration is tracked in main.rs where refresh_schema is called
+    let fetch_duration_ms = fetch_start.elapsed().as_secs_f64() * 1000.0;
+    
+    // Track refresh metrics
+    crate::metrics::SCHEMA_FETCH_DURATION.observe(fetch_duration_ms);
+    crate::metrics::SCHEMA_REFRESH_COUNTER.inc();
+    
     parse_and_cache_schema(&schema_response)?;
     tracing::info!("Schema refreshed and cached");
     Ok(())
@@ -339,65 +314,6 @@ pub fn get_schema_cache_json() -> Value {
     })
 }
 
-/// Check if GraphQL errors suggest a schema mismatch that could be fixed by refreshing
-/// Returns true if the errors look like they could be caused by stale schema cache
-/// 
-/// This function is now more specific - it only triggers on actual schema-related errors,
-/// not on variable errors, syntax errors, or other validation issues.
-pub fn is_schema_stale_error(errors: &serde_json::Value) -> bool {
-    // Check if errors array exists
-    let errors_array = match errors.as_array() {
-        Some(arr) => arr,
-        None => return false,
-    };
-
-    // Look for common schema-related error patterns
-    for error in errors_array {
-        // Get the error message
-        let message = error
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        // Exclude variable-related errors - these are NOT schema issues
-        if message.contains("unbound variable")
-            || message.contains("variable")
-            || message.contains("expected type")
-            || message.contains("cannot be coerced") {
-            // These are variable/type errors, not schema issues
-            continue;
-        }
-
-        // Check for patterns that suggest schema mismatch:
-        // 1. "field '_eq' not found in type: 'X_bool_exp'" - nested entity treated as primitive
-        // 2. "field 'id' not found in type: 'X_comparison_exp'" - primitive treated as nested
-        // 3. "field 'X' not found in type: 'Y'" - field doesn't exist (could be schema change)
-        // Note: We're more specific now - only actual field/type errors, not general "field not found"
-        if message.contains("field '_eq' not found in type") 
-            || message.contains("field 'id' not found in type")
-            || (message.contains("field") 
-                && message.contains("not found in type")
-                && !message.contains("variable")) {
-            tracing::debug!("Detected schema-related error: {}", message);
-            return true;
-        }
-
-        // REMOVED: "validation-failed" check - too broad, causes false positives
-        // Only check for specific schema-related error codes if they exist
-        if let Some(extensions) = error.get("extensions") {
-            if let Some(code) = extensions.get("code").and_then(|c| c.as_str()) {
-                // Only trigger on specific schema-related codes, not generic validation-failed
-                if code == "schema-error" || code == "type-error" {
-                    tracing::debug!("Detected schema-related error code: {}", code);
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
 
 #[cfg(test)]
 /// Clear the schema cache (for tests)

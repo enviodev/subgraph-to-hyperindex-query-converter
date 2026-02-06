@@ -49,8 +49,9 @@ async fn main() {
         .route("/metrics", get(metrics_handler))
         .layer(cors);
 
-    // Initialize schema on startup
+    // Initialize schema on startup (schema doesn't change once deployed, so we only fetch once)
     if let Err(e) = schema::initialize_schema().await {
+        metrics::SCHEMA_REFRESH_ERRORS.inc();
         tracing::warn!("Failed to initialize schema: {}. Will retry on first request.", e);
     }
 
@@ -64,7 +65,7 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-/// Execute a query with automatic schema refresh retry on schema-related errors
+/// Execute a query (schema is initialized once on startup)
 /// Returns (status_code, response_json)
 async fn execute_query_with_retry(
     payload: &Value,
@@ -184,144 +185,7 @@ async fn execute_query_with_retry(
 
     // Check for GraphQL errors
     if let Some(errors) = response.get("errors") {
-        // Check if this looks like a schema-related error
-        if schema::is_schema_stale_error(errors) {
-            tracing::warn!(
-                "Detected schema-related error, refreshing schema and retrying query"
-            );
-
-            // Store original error info before retry
-            let original_errors = errors.clone();
-            let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
-            let mut original_debug = serde_json::json!({
-                "originalQuery": original_query,
-                "convertedQuery": converted_query_str,
-                "hyperindexUrl": hyperindex_url,
-            });
-            if let Some(chain_id) = chain_id {
-                original_debug["chainId"] = serde_json::Value::String(chain_id.to_string());
-            }
-
-            // Refresh schema (with cooldown protection)
-            let refresh_start = Instant::now();
-            match schema::refresh_schema().await {
-                Ok(_) => {
-                    metrics::SCHEMA_REFRESH_COUNTER.inc();
-                    metrics::SCHEMA_FETCH_DURATION.observe(refresh_start.elapsed().as_secs_f64() * 1000.0);
-                    tracing::info!("Schema refreshed successfully, retrying query");
-                }
-                Err(refresh_err) => {
-                    let err_msg = refresh_err.to_string();
-                    // If it's a cooldown error, don't treat it as a failure - just skip refresh
-                    if err_msg.contains("cooldown") {
-                        tracing::warn!("Schema refresh skipped due to cooldown: {}", err_msg);
-                        // Return original error without attempting refresh
-                        metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
-                        return (
-                            StatusCode::BAD_GATEWAY,
-                            Json(serde_json::json!({
-                                "errors": original_errors,
-                                "debug": original_debug,
-                                "subgraphResponse": subgraph_debug,
-                                "schemaRefreshSkipped": true,
-                                "schemaRefreshReason": err_msg,
-                            })),
-                        );
-                    } else {
-                        metrics::SCHEMA_REFRESH_ERRORS.inc();
-                        metrics::SCHEMA_FETCH_DURATION.observe(refresh_start.elapsed().as_secs_f64() * 1000.0);
-                        tracing::error!("Failed to refresh schema: {}", err_msg);
-                        // Return original error even if refresh fails
-                        metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
-                        return (
-                            StatusCode::BAD_GATEWAY,
-                            Json(serde_json::json!({
-                                "errors": original_errors,
-                                "debug": original_debug,
-                                "subgraphResponse": subgraph_debug,
-                                "schemaRefreshAttempted": true,
-                                "schemaRefreshError": err_msg,
-                            })),
-                        );
-                    }
-                }
-            }
-
-            // Retry: convert query again with fresh schema
-            let retry_conversion_start = Instant::now();
-            let retry_result = match conversion::convert_subgraph_to_hyperindex(payload, chain_id) {
-                Ok(result) => result,
-                Err(e) => {
-                    tracing::error!("Conversion error on retry: {}", e);
-                    // Return original error, not the retry conversion error
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "errors": original_errors,
-                            "debug": original_debug,
-                            "subgraphResponse": subgraph_debug,
-                            "schemaRefreshAttempted": true,
-                            "retryConversionError": e.to_string(),
-                        })),
-                    );
-                }
-            };
-            let retry_conversion_duration_ms = retry_conversion_start.elapsed().as_secs_f64() * 1000.0;
-
-            // Retry: forward query again
-            let retry_query_start = Instant::now();
-            let retry_response = match forward_to_hyperindex(&retry_result.query).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::error!("Hyperindex request error on retry: {}", e);
-                    // Return original error, not the retry request error
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        Json(serde_json::json!({
-                            "errors": original_errors,
-                            "debug": original_debug,
-                            "subgraphResponse": subgraph_debug,
-                            "schemaRefreshAttempted": true,
-                            "retryRequestError": e.to_string(),
-                        })),
-                    );
-                }
-            };
-            let retry_query_wait_duration_ms = retry_query_start.elapsed().as_secs_f64() * 1000.0;
-
-            // Check if retry succeeded
-            if let Some(retry_errors) = retry_response.get("errors") {
-                metrics::QUERY_EXECUTION_ERRORS.inc();
-                metrics::TOTAL_ERRORS.inc();
-                tracing::error!("Query still failed after schema refresh and retry");
-                // Return original error, not the retry error
-                metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "errors": original_errors,
-                        "debug": original_debug,
-                        "subgraphResponse": subgraph_debug,
-                        "schemaRefreshAttempted": true,
-                        "retryStillFailed": true,
-                        "retryErrors": retry_errors,
-                    })),
-                );
-            }
-
-            // Retry succeeded!
-            tracing::info!("Query succeeded after schema refresh and retry");
-            let transform_start = Instant::now();
-            let transformed = transform_response_to_subgraph_shape(retry_response, &field_name_map, is_meta_query);
-            let transform_duration_ms = transform_start.elapsed().as_secs_f64() * 1000.0;
-            metrics::RESPONSE_TRANSFORM_DURATION.observe(transform_duration_ms);
-            let total_duration_ms = request_start.elapsed().as_secs_f64() * 1000.0;
-            metrics::REQUEST_DURATION.observe(total_duration_ms);
-            
-            return (StatusCode::OK, Json(transformed));
-        }
-
-        // Not a schema-related error, return it normally
+        // Return GraphQL errors normally (no schema refresh retry)
         metrics::QUERY_EXECUTION_ERRORS.inc();
         metrics::TOTAL_ERRORS.inc();
         let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -649,17 +513,14 @@ async fn test_introspection() -> impl IntoResponse {
                         })),
                     )
                 }
-            }
         }
+    }
 
 async fn refresh_schema_endpoint() -> impl IntoResponse {
     tracing::info!("Refreshing schema via endpoint...");
-    let refresh_start = Instant::now();
     
     match schema::refresh_schema().await {
         Ok(_) => {
-            metrics::SCHEMA_REFRESH_COUNTER.inc();
-            metrics::SCHEMA_FETCH_DURATION.observe(refresh_start.elapsed().as_secs_f64() * 1000.0);
             let (entity_count, last_updated) = schema::get_cache_stats();
             
             (
@@ -674,10 +535,7 @@ async fn refresh_schema_endpoint() -> impl IntoResponse {
         }
         Err(e) => {
             let err_msg = e.to_string();
-            if !err_msg.contains("cooldown") {
-                metrics::SCHEMA_REFRESH_ERRORS.inc();
-            }
-            metrics::SCHEMA_FETCH_DURATION.observe(refresh_start.elapsed().as_secs_f64() * 1000.0);
+            metrics::SCHEMA_REFRESH_ERRORS.inc();
             tracing::error!("Failed to refresh schema: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
