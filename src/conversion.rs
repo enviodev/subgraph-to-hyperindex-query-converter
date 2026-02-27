@@ -1473,7 +1473,6 @@ fn singularize_and_capitalize(s: &str) -> String {
         || s.ends_with("zes")
         || s.ends_with("sses")
         || s.ends_with("oes")
-        || s.ends_with("ses")
     {
         // batches -> batch, boxes -> box, addresses -> address, heroes -> hero, users -> user (via 'ses')
         s[..s.len() - 2].to_string()
@@ -1991,6 +1990,8 @@ mod tests {
         assert_eq!(singularize_and_capitalize("users"), "User");
         assert_eq!(singularize_and_capitalize("stream"), "Stream");
         assert_eq!(singularize_and_capitalize("user"), "User");
+        assert_eq!(singularize_and_capitalize("purchases"), "Purchase");
+        assert_eq!(singularize_and_capitalize("addresses"), "Address");
     }
 
     #[test]
