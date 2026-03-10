@@ -26,6 +26,211 @@ pub struct ConversionResult {
     pub is_meta_query: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum QueryMode {
+    /// Treat as a Subgraph-style query that should be converted
+    Subgraph,
+    /// Treat as a Hyperindex/standard GraphQL query that should be passed through unchanged
+    Hyperindex,
+    /// Could not confidently classify – handled the same as Subgraph (convert)
+    Unknown,
+}
+
+/// Lightweight heuristic to distinguish Subgraph-style vs Hyperindex-style queries.
+/// - Looks only at the query string (no schema access).
+/// - Uses shallow signals from root-level field names and their argument names.
+fn detect_query_mode(query: &str) -> QueryMode {
+    // Quick exit for obviously empty/whitespace-only queries
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return QueryMode::Unknown;
+    }
+
+    // We only care about the first top-level selection set.
+    // Find the first '{' and start scanning from there.
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut i = 0usize;
+    let mut depth = 0i32;
+
+    // Find first '{'
+    while i < chars.len() {
+        if chars[i] == '{' {
+            depth = 1;
+            i += 1;
+            break;
+        }
+        i += 1;
+    }
+
+    if depth == 0 {
+        // No selection set – fall back to Subgraph/Unknown behavior
+        return QueryMode::Unknown;
+    }
+
+    let mut subgraph_score = 0i32;
+    let mut hyperindex_score = 0i32;
+
+    // Helper to score a root-level field name
+    fn score_field_name(
+        name: &str,
+        prev_non_ws: Option<char>,
+        subgraph_score: &mut i32,
+        hyperindex_score: &mut i32,
+    ) {
+        if name.is_empty() {
+            return;
+        }
+        // Ignore fragment spreads like ...ActionFields
+        if let Some('.') = prev_non_ws {
+            return;
+        }
+
+        let mut chars = name.chars();
+        if let Some(first) = chars.next() {
+            let is_first_upper = first.is_ascii_uppercase();
+            let is_first_lower = first.is_ascii_lowercase();
+
+            if is_first_upper {
+                // PascalCase or *_by_pk are strong Hyperindex signals
+                *hyperindex_score += 2;
+                if name.ends_with("_by_pk") {
+                    *hyperindex_score += 2;
+                }
+            } else if is_first_lower {
+                // lowerCamelCase plural (e.g., streams, lpActions) – Subgraph signal
+                if name.ends_with('s') {
+                    *subgraph_score += 2;
+                }
+            }
+        }
+    }
+
+    // Helper to score argument names inside a parameter list "( ... )"
+    fn score_params(params: &str, subgraph_score: &mut i32, hyperindex_score: &mut i32) {
+        // Very simple scan: look for identifier followed by ':'
+        let bytes: Vec<char> = params.chars().collect();
+        let mut j = 0usize;
+        while j < bytes.len() {
+            // Skip whitespace and commas
+            while j < bytes.len() && (bytes[j].is_whitespace() || bytes[j] == ',') {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                break;
+            }
+            if bytes[j].is_alphabetic() || bytes[j] == '_' {
+                let start = j;
+                j += 1;
+                while j < bytes.len()
+                    && (bytes[j].is_alphanumeric() || bytes[j] == '_' || bytes[j] == '.')
+                {
+                    j += 1;
+                }
+                let name: String = bytes[start..j].iter().collect();
+
+                // Skip whitespace between name and colon
+                while j < bytes.len() && bytes[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == ':' {
+                    // We have an argument name
+                    match name.as_str() {
+                        // Subgraph-leaning signals
+                        "first" | "skip" | "orderDirection" | "block" | "orderBy" => {
+                            *subgraph_score += 1;
+                        }
+                        // Hyperindex-leaning signals
+                        "limit" | "offset" | "order_by" | "distinct_on" => {
+                            *hyperindex_score += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                j += 1;
+            }
+        }
+    }
+
+    // Track last non-whitespace character to detect fragment spreads ("...")
+    let mut last_non_ws: Option<char> = None;
+
+    // Scan characters within the outermost selection set
+    while i < chars.len() {
+        let c = chars[i];
+
+        match c {
+            '{' => {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if depth == 1 {
+            // At root level: look for a field name
+            if c.is_alphabetic() || c == '_' {
+                let start = i;
+                i += 1;
+                while i < chars.len()
+                    && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.')
+                {
+                    i += 1;
+                }
+                let name: String = chars[start..i].iter().collect();
+                score_field_name(&name, last_non_ws, &mut subgraph_score, &mut hyperindex_score);
+
+                // Skip whitespace
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+
+                // If we have parameters, score their argument names
+                if i < chars.len() && chars[i] == '(' {
+                    let mut paren_depth = 1i32;
+                    let params_start = i + 1;
+                    i += 1;
+                    while i < chars.len() && paren_depth > 0 {
+                        match chars[i] {
+                            '(' => paren_depth += 1,
+                            ')' => paren_depth -= 1,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    if paren_depth == 0 && i > params_start + 1 {
+                        let params: String = chars[params_start..(i - 1)].iter().collect();
+                        score_params(&params, &mut subgraph_score, &mut hyperindex_score);
+                    }
+                }
+                continue;
+            }
+        }
+
+        if !c.is_whitespace() {
+            last_non_ws = Some(c);
+        }
+        i += 1;
+    }
+
+    if hyperindex_score > 0 && subgraph_score == 0 {
+        QueryMode::Hyperindex
+    } else if subgraph_score > 0 && hyperindex_score == 0 {
+        QueryMode::Subgraph
+    } else {
+        QueryMode::Unknown
+    }
+}
+
 pub fn convert_subgraph_to_hyperindex(
     payload: &Value,
     chain_id: Option<&str>,
@@ -68,6 +273,30 @@ pub fn convert_subgraph_to_hyperindex(
 
     // Check if this is a _meta query before conversion
     let is_meta_query = query.contains("_meta");
+
+    // For non-_meta queries, try to detect if this is already a Hyperindex/standard
+    // query. If so, we can skip the expensive conversion path and just pass it through.
+    if !is_meta_query {
+        match detect_query_mode(query) {
+            QueryMode::Hyperindex => {
+                tracing::info!("Detected Hyperindex-style query, passing through unchanged");
+                let mut result = serde_json::json!({
+                    "query": query
+                });
+                if let Some(variables) = payload.get("variables") {
+                    result["variables"] = variables.clone();
+                }
+                return Ok(ConversionResult {
+                    query: result,
+                    field_name_map: HashMap::new(),
+                    is_meta_query: false,
+                });
+            }
+            QueryMode::Subgraph | QueryMode::Unknown => {
+                // Fall through to the normal Subgraph conversion path
+            }
+        }
+    }
 
     // Parse the GraphQL query (simplified parsing for now)
     let (converted_query, field_name_map) = convert_query_structure(query, chain_id)?;
@@ -714,6 +943,44 @@ fn sanitize_selection_set(input: &str) -> String {
     }
 
     output
+}
+
+#[cfg(test)]
+mod detection_tests {
+    use super::*;
+
+    #[test]
+    fn detect_clearly_subgraph_query() {
+        let q = r#"{
+  streams(first: 5, skip: 0, orderBy: id, orderDirection: asc) {
+    id
+  }
+}"#;
+        let mode = detect_query_mode(q);
+        assert!(
+            mode == QueryMode::Subgraph || mode == QueryMode::Unknown,
+            "Expected Subgraph-leaning or Unknown for Subgraph-style query, got {:?}",
+            mode
+        );
+    }
+
+    #[test]
+    fn detect_clearly_hyperindex_query() {
+        let q = r#"{
+  Stream(limit: 5, offset: 0, order_by: { id: desc }) {
+    id
+  }
+}"#;
+        let mode = detect_query_mode(q);
+        assert_eq!(mode, QueryMode::Hyperindex);
+    }
+
+    #[test]
+    fn ambiguous_minimal_query_is_unknown() {
+        let q = r#"{ foo { id } }"#;
+        let mode = detect_query_mode(q);
+        assert_eq!(mode, QueryMode::Unknown);
+    }
 }
 
 fn sanitize_fragment_arguments(fragment_text: &str) -> String {
