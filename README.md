@@ -134,7 +134,7 @@ See the full filter table and known limitations in the source code.
 
 - [HyperIndex Docs](https://docs.envio.dev/docs/HyperIndex/overview)
 - [Subgraph to HyperIndex query conversion guide](https://docs.envio.dev/docs/HyperIndex/query-conversion)
-- [Migrating from a subgraph](https://docs.envio.dev/docs/HyperIndex/migrate-from-alchemy)
+- [Migrate from The Graph to Envio](https://docs.envio.dev/docs/HyperIndex/migration-guide)
 
 ## License
 
