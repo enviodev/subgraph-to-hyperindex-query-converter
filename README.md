@@ -12,6 +12,10 @@ When migrating from a subgraph to HyperIndex, existing frontends use The Graph's
 
 See the [HyperIndex query conversion guide](https://docs.envio.dev/docs/HyperIndex/query-conversion) for a manual reference on the differences.
 
+## Who is this for?
+
+Teams migrating from The Graph to HyperIndex who want to keep their existing frontend queries working during the transition, without rewriting all GraphQL calls upfront. Point your frontend at this proxy, migrate your indexer to HyperIndex, and update your queries at your own pace.
+
 ## Features
 
 - **Query conversion**: Converts subgraph GraphQL syntax to HyperIndex / Hasura format
