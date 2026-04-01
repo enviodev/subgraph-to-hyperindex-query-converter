@@ -1919,6 +1919,55 @@ query {
     }
 }
 
+#[tokio::test]
+async fn test_hyperindex_passthrough_query() {
+    // This query is already in Hyperindex/Hasura style:
+    // - PascalCase root field name `Stream`
+    // - Uses `limit` / `offset` / `order_by` arguments
+    let hyperindex_query = r#"query {
+  Stream(limit: 5, offset: 0, order_by: { id: desc }) {
+    id
+    alias
+  }
+}"#;
+
+    let payload = json!({
+        "query": hyperindex_query
+    });
+
+    // Conversion should detect Hyperindex mode and pass the query through unchanged.
+    let converted = conversion::convert_subgraph_to_hyperindex(&payload, Some("1"))
+        .expect("conversion should succeed for Hyperindex query");
+    let converted_query_str = converted.query["query"]
+        .as_str()
+        .expect("converted query should be a string");
+
+    assert_eq!(
+        converted_query_str, hyperindex_query,
+        "Hyperindex-style query should be passed through unchanged"
+    );
+
+    // Forward to Hyperindex to ensure the passthrough query is valid and returns data.
+    let response = forward_to_hyperindex(&converted.query)
+        .await
+        .expect("forwarding Hyperindex query should succeed");
+
+    if let Some(errors) = response.get("errors") {
+        if errors.is_array() && !errors.as_array().unwrap().is_empty() {
+            panic!("Hyperindex passthrough query returned errors: {:?}", errors);
+        }
+    }
+
+    if let Some(data) = response.get("data") {
+        assert!(
+            data.get("Stream").is_some(),
+            "Expected Hyperindex response to contain `Stream` root field"
+        );
+    } else {
+        panic!("No data field in Hyperindex passthrough query response");
+    }
+}
+
 async fn forward_to_hyperindex(query: &Value) -> Result<Value, Box<dyn std::error::Error>> {
     let hyperindex_url = env::var("TEST_HYPERINDEX_URL")
         .unwrap_or_else(|_| "https://indexer.hyperindex.xyz/53b7e25/v1/graphql".to_string());
