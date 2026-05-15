@@ -24,6 +24,12 @@ pub struct ConversionResult {
     pub field_name_map: HashMap<String, String>,
     /// Indicates if this was a _meta query (needs special response transformation)
     pub is_meta_query: bool,
+    /// Maps variable names (without `$`) to the Hyperindex entity name (e.g., "UniswapDayData")
+    /// for variables that were declared with a subgraph `*_filter` type and used as a
+    /// top-level `where: $var` argument. The caller is expected to translate the JSON
+    /// value of each such variable via `translate_subgraph_filter_value` before forwarding
+    /// upstream.
+    pub filter_variable_entities: HashMap<String, String>,
 }
 
 pub fn convert_subgraph_to_hyperindex(
@@ -63,6 +69,7 @@ pub fn convert_subgraph_to_hyperindex(
             query: result,
             field_name_map: HashMap::new(),
             is_meta_query: false,
+            filter_variable_entities: HashMap::new(),
         });
     }
 
@@ -70,39 +77,73 @@ pub fn convert_subgraph_to_hyperindex(
     let is_meta_query = query.contains("_meta");
 
     // Parse the GraphQL query (simplified parsing for now)
-    let (converted_query, field_name_map) = convert_query_structure(query, chain_id)?;
+    let MainConversion {
+        converted_query,
+        field_name_map,
+        filter_variable_entities,
+    } = convert_query_structure(query, chain_id)?;
 
     // Build the result with query and optionally variables
     let mut result = serde_json::json!({
         "query": converted_query
     });
 
-    // Extract and pass through variables if present
+    // Extract variables, translating any subgraph `*_filter`-typed variables that
+    // were used as `where: $var`. We rewrite the variable value in-place from
+    // subgraph filter shape (flat keys like `date_gt`) into Hasura `bool_exp` shape
+    // (`date: {_gt: ...}`). This keeps clients that still send subgraph-shaped
+    // filter JSON working transparently after the query-level rewrite.
     if let Some(variables) = payload.get("variables") {
-        result["variables"] = variables.clone();
+        let mut variables = variables.clone();
+        if !filter_variable_entities.is_empty() {
+            if let Value::Object(map) = &mut variables {
+                for (var_name, entity_name) in &filter_variable_entities {
+                    if let Some(v) = map.get(var_name).cloned() {
+                        let translated = translate_subgraph_filter_value(&v, entity_name);
+                        map.insert(var_name.clone(), translated);
+                    }
+                }
+            }
+        }
+        result["variables"] = variables;
     }
 
     Ok(ConversionResult {
         query: result,
         field_name_map,
         is_meta_query,
+        filter_variable_entities,
     })
+}
+
+/// Internal aggregate returned by `convert_query_structure` / `convert_main_query`.
+struct MainConversion {
+    converted_query: String,
+    field_name_map: HashMap<String, String>,
+    /// Variable name (without `$`) -> entity name (e.g., "UniswapDayData"). Only
+    /// populated for variables that appeared as top-level `where: $var` and were
+    /// declared with a subgraph-style `*_filter` type in the query header.
+    filter_variable_entities: HashMap<String, String>,
 }
 
 fn convert_query_structure(
     query: &str,
     chain_id: Option<&str>,
-) -> Result<(String, HashMap<String, String>), ConversionError> {
+) -> Result<MainConversion, ConversionError> {
     // Check for _meta query first
     if query.contains("_meta") {
-        return Ok((convert_meta_query(query)?, HashMap::new()));
+        return Ok(MainConversion {
+            converted_query: convert_meta_query(query)?,
+            field_name_map: HashMap::new(),
+            filter_variable_entities: HashMap::new(),
+        });
     }
 
     // Extract fragments and main query
     let (fragments, main_query) = extract_fragments_and_main_query(query)?;
 
     // Convert the main query
-    let (converted_main_query, field_name_map) = convert_main_query(&main_query, chain_id)?;
+    let main = convert_main_query(&main_query, chain_id)?;
 
     // Combine fragments with converted main query
     let mut result = String::new();
@@ -110,9 +151,13 @@ fn convert_query_structure(
         result.push_str(&fragments);
         result.push('\n');
     }
-    result.push_str(&converted_main_query);
+    result.push_str(&main.converted_query);
 
-    Ok((result, field_name_map))
+    Ok(MainConversion {
+        converted_query: result,
+        field_name_map: main.field_name_map,
+        filter_variable_entities: main.filter_variable_entities,
+    })
 }
 
 fn extract_fragments_and_main_query(query: &str) -> Result<(String, String), ConversionError> {
@@ -310,10 +355,74 @@ fn convert_variable_types_in_header(
     result
 }
 
+/// Parse `$name: Type` pairs out of a query header.
+///
+/// Best-effort lexical scan — the header here is the substring before the
+/// first `{` of the operation, e.g. `query Q($a: Foo_filter, $b: Int!)`. The
+/// returned type string is the raw text up to the next `,` or `)` (so it
+/// includes `!`, list brackets, etc.).
+fn parse_variable_declarations(header: &str) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    let bytes = header.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let name_start = i;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c.is_ascii_alphanumeric() || c == '_' {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if name_start == i {
+            continue;
+        }
+        let name = header[name_start..i].to_string();
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b':' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        let type_start = i;
+        while i < bytes.len() && bytes[i] != b',' && bytes[i] != b')' {
+            i += 1;
+        }
+        let raw_type = header[type_start..i].trim().to_string();
+        if !raw_type.is_empty() {
+            result.insert(name, raw_type);
+        }
+    }
+    result
+}
+
+/// Returns true if `declared_type` is a subgraph filter type — i.e. its
+/// non-null/list-stripped name ends in `_filter`. Used to decide whether
+/// to translate the variable's JSON value from subgraph filter shape to
+/// Hasura `bool_exp` shape.
+fn is_subgraph_filter_type(declared_type: &str) -> bool {
+    // Strip non-null markers, list brackets, and whitespace.
+    let cleaned: String = declared_type
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '!' && *c != '[' && *c != ']')
+        .collect();
+    cleaned.ends_with("_filter") && cleaned.len() > "_filter".len()
+}
+
 fn convert_main_query(
     main_query: &str,
     chain_id: Option<&str>,
-) -> Result<(String, HashMap<String, String>), ConversionError> {
+) -> Result<MainConversion, ConversionError> {
     // Extract query header (name and variable definitions) and body separately
     let (query_header, stripped_query) = if main_query.trim().starts_with("query") {
         let content = main_query.trim();
@@ -352,6 +461,17 @@ fn convert_main_query(
     let mut field_name_map: HashMap<String, String> = HashMap::new();
     // Collect variable type overrides from all entities
     let mut all_variable_type_overrides: HashMap<String, String> = HashMap::new();
+    // Track variables used as a top-level `where: $var` so their JSON value can
+    // be translated from subgraph filter shape to Hasura bool_exp shape at request time.
+    // Only variables whose declared type is a subgraph `*_filter` are recorded;
+    // variables typed as anything else (custom input types, already-migrated
+    // `*_bool_exp`, etc.) pass through verbatim.
+    let mut filter_variable_entities: HashMap<String, String> = HashMap::new();
+    // Parse variable declarations once for the whole query.
+    let header_var_types: HashMap<String, String> = query_header
+        .as_deref()
+        .map(parse_variable_declarations)
+        .unwrap_or_default();
 
     for (entity, params, selection) in entities {
         let entity_cap = singularize_and_capitalize(&entity);
@@ -394,6 +514,21 @@ fn convert_main_query(
         let (where_clause, entity_var_overrides) = if where_is_variable {
             // If where is a variable, pass it through directly
             let clause = if let Some(where_var) = params.get("where") {
+                // Only opt the variable into runtime JSON translation when it
+                // was declared with a subgraph-style `*_filter` type. Other
+                // input-object types pass through verbatim — both for
+                // backwards compatibility and because we don't know how to
+                // translate an arbitrary user-defined input type.
+                let var_name = where_var
+                    .trim()
+                    .trim_start_matches('$')
+                    .to_string();
+                if !var_name.is_empty() {
+                    let declared = header_var_types.get(&var_name);
+                    if declared.map(|t| is_subgraph_filter_type(t)).unwrap_or(false) {
+                        filter_variable_entities.insert(var_name, entity_cap.clone());
+                    }
+                }
                 format!("where: {}", where_var)
             } else {
                 String::new()
@@ -449,6 +584,11 @@ fn convert_main_query(
         // Convert variable type definitions: ID -> String, Bytes -> String, and enum types
         let converted_header =
             convert_variable_types_in_header(header, &all_variable_type_overrides);
+        // Additionally rewrite subgraph filter type names (e.g., `Foo_filter`)
+        // to their Hyperindex/Hasura equivalents (`Foo_bool_exp`). This is a
+        // syntactic rename only — see `translate_subgraph_filter_value` for
+        // the runtime JSON-value translation that goes with it.
+        let converted_header = rewrite_filter_type_names(&converted_header);
         tracing::debug!(
             "Using preserved query header: '{}' (converted to: '{}')",
             header,
@@ -467,7 +607,69 @@ fn convert_main_query(
         converted_entities.join("\n")
     );
     tracing::debug!("Final converted query: {}", converted_query);
-    Ok((converted_query, field_name_map))
+    Ok(MainConversion {
+        converted_query,
+        field_name_map,
+        filter_variable_entities,
+    })
+}
+
+/// Rewrite subgraph filter type names in a query header. Subgraph generates
+/// `EntityName_filter` for the where-clause input type; Hyperindex/Hasura
+/// generates `EntityName_bool_exp` for the equivalent argument. Anywhere a
+/// variable is declared with a `*_filter` type (including list and non-null
+/// forms), replace the suffix with `_bool_exp`.
+///
+/// Examples (input → output):
+/// - `$where: Foo_filter`           → `$where: Foo_bool_exp`
+/// - `$where: Foo_filter!`          → `$where: Foo_bool_exp!`
+/// - `$where: [Foo_filter!]!`       → `$where: [Foo_bool_exp!]!`
+fn rewrite_filter_type_names(header: &str) -> String {
+    // Walk character-by-character looking for identifier tokens that end with
+    // `_filter` and whose suffix character indicates a type position
+    // (i.e. not the middle of a longer identifier).
+    let bytes = header.as_bytes();
+    let mut out = String::with_capacity(header.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        // Identifier start: ASCII letter or underscore.
+        let is_ident_start = c.is_ascii_alphabetic() || c == '_';
+        if !is_ident_start {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        // Walk the identifier.
+        let start = i;
+        while i < bytes.len() {
+            let cc = bytes[i] as char;
+            if cc.is_ascii_alphanumeric() || cc == '_' {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        let ident = &header[start..i];
+        // Only rewrite identifiers shaped like `Something_filter` (PascalCase
+        // entity name + `_filter`). This avoids accidentally rewriting words
+        // like `query_filter_helper` or variable names that contain `_filter`.
+        if let Some(prefix) = ident.strip_suffix("_filter") {
+            let is_pascal_entity = prefix
+                .chars()
+                .next()
+                .map(|first| first.is_ascii_uppercase())
+                .unwrap_or(false)
+                && !prefix.is_empty();
+            if is_pascal_entity {
+                out.push_str(prefix);
+                out.push_str("_bool_exp");
+                continue;
+            }
+        }
+        out.push_str(ident);
+    }
+    out
 }
 
 fn extract_multiple_entities(
@@ -1227,6 +1429,251 @@ fn convert_basic_filter_to_hasura_condition(
     Ok(result)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// JSON-shaped filter translator
+//
+// Mirrors `convert_basic_filter_to_hasura_condition` for the case where a
+// caller passes the entire `where` clause as a GraphQL variable, e.g.
+//   query ($where: UniswapDayData_filter) { uniswapDayDatas(where: $where) ... }
+// In that situation the converter cannot rewrite the operator suffixes in the
+// query string itself (the value never appears literally in the query); it has
+// to rewrite the JSON value at request time, which is what these helpers do.
+//
+// Behaviour parity with the inline path is enforced by tests in
+// `tests::filter_value_translation` (every operator covered by the inline
+// tests has a matching JSON test).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Translate a subgraph-shaped filter value into the Hasura `bool_exp`-shaped
+/// value expected by Hyperindex. Non-object inputs (`null`, scalars, arrays)
+/// are returned unchanged.
+///
+/// `entity_name` is the Hyperindex entity the filter applies to (e.g. `"Trade"`).
+/// It is used to detect nested-entity references via the schema cache.
+pub fn translate_subgraph_filter_value(value: &Value, entity_name: &str) -> Value {
+    let obj = match value {
+        Value::Object(m) => m,
+        _ => return value.clone(),
+    };
+
+    let mut out = serde_json::Map::new();
+    // `_not_*` operators in the inline path each emit their own `_not: { ... }`
+    // wrapper. JSON object keys are unique, so we accumulate the inner fields
+    // and emit a single combined `_not` at the end.
+    let mut not_accum = serde_json::Map::new();
+
+    for (key, val) in obj {
+        match key.as_str() {
+            "and" | "_and" => {
+                let arr = translate_filter_array(val, entity_name);
+                out.insert("_and".to_string(), Value::Array(arr));
+            }
+            "or" | "_or" => {
+                let arr = translate_filter_array(val, entity_name);
+                out.insert("_or".to_string(), Value::Array(arr));
+            }
+            "_not" | "not" => {
+                let inner = translate_subgraph_filter_value(val, entity_name);
+                if let Value::Object(m) = inner {
+                    for (k, v) in m {
+                        not_accum.insert(k, v);
+                    }
+                }
+            }
+            _ => translate_leaf_filter(key, val, entity_name, &mut out, &mut not_accum),
+        }
+    }
+
+    if !not_accum.is_empty() {
+        out.insert("_not".to_string(), Value::Object(not_accum));
+    }
+
+    Value::Object(out)
+}
+
+fn translate_filter_array(val: &Value, entity_name: &str) -> Vec<Value> {
+    val.as_array()
+        .map(|a| {
+            a.iter()
+                .map(|v| translate_subgraph_filter_value(v, entity_name))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Translate a single non-connective filter entry, writing into `out`
+/// (or `not_accum` for `_not_*` operators).
+fn translate_leaf_filter(
+    key: &str,
+    value: &Value,
+    entity_name: &str,
+    out: &mut serde_json::Map<String, Value>,
+    not_accum: &mut serde_json::Map<String, Value>,
+) {
+    // ORDER MATTERS — longest suffixes must be checked first, mirroring the
+    // ordering in `convert_basic_filter_to_hasura_condition`. Changes here
+    // must be applied to both functions.
+
+    if let Some(field) = key.strip_suffix("_not_starts_with_nocase") {
+        not_accum.insert(field.to_string(), ilike_value(value, IlikeShape::StartsWith));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_not_ends_with_nocase") {
+        not_accum.insert(field.to_string(), ilike_value(value, IlikeShape::EndsWith));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_not_contains_nocase") {
+        not_accum.insert(field.to_string(), ilike_value(value, IlikeShape::Contains));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_starts_with_nocase") {
+        out.insert(field.to_string(), ilike_value(value, IlikeShape::StartsWith));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_ends_with_nocase") {
+        out.insert(field.to_string(), ilike_value(value, IlikeShape::EndsWith));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_contains_nocase") {
+        out.insert(field.to_string(), ilike_value(value, IlikeShape::Contains));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_not_starts_with") {
+        not_accum.insert(field.to_string(), ilike_value(value, IlikeShape::StartsWith));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_not_ends_with") {
+        not_accum.insert(field.to_string(), ilike_value(value, IlikeShape::EndsWith));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_not_contains") {
+        not_accum.insert(field.to_string(), ilike_value(value, IlikeShape::Contains));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_starts_with") {
+        out.insert(field.to_string(), ilike_value(value, IlikeShape::StartsWith));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_ends_with") {
+        out.insert(field.to_string(), ilike_value(value, IlikeShape::EndsWith));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_contains") {
+        // NOTE: inline path maps `_contains` to `_ilike` (case-insensitive)
+        // even though subgraph's `_contains` is case-sensitive on strings.
+        // Mirrored here for behaviour parity.
+        out.insert(field.to_string(), ilike_value(value, IlikeShape::Contains));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_not_in") {
+        out.insert(field.to_string(), op_wrap("_nin", value.clone()));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_gte") {
+        out.insert(field.to_string(), op_wrap("_gte", value.clone()));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_lte") {
+        out.insert(field.to_string(), op_wrap("_lte", value.clone()));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_not") {
+        out.insert(field.to_string(), op_wrap("_neq", value.clone()));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_gt") {
+        out.insert(field.to_string(), op_wrap("_gt", value.clone()));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_lt") {
+        out.insert(field.to_string(), op_wrap("_lt", value.clone()));
+        return;
+    }
+    if let Some(field) = key.strip_suffix("_in") {
+        out.insert(field.to_string(), op_wrap("_in", value.clone()));
+        return;
+    }
+
+    // Unsupported in the inline path; pass through here so Hasura surfaces a
+    // useful error instead of silently dropping the filter.
+    if key.ends_with("_containsAny") || key.ends_with("_containsAll") {
+        out.insert(key.to_string(), value.clone());
+        return;
+    }
+
+    // No operator suffix — direct equality, connective (already handled), or
+    // a nested-entity reference.
+
+    if key == "chainId" {
+        out.insert(key.to_string(), op_wrap("_eq", value.clone()));
+        return;
+    }
+
+    // Subgraph's strict nested-entity filter uses a trailing underscore
+    // (`pair_: { name: "X" }`); strip it for lookup and emission alike.
+    let (lookup_key, target_key) = match key.strip_suffix('_') {
+        Some(stripped) if !stripped.is_empty() => (stripped, stripped),
+        _ => (key, key),
+    };
+
+    let is_nested = schema::is_nested_entity(entity_name, lookup_key);
+
+    if value.is_object() {
+        if is_nested {
+            let nested_type = schema::get_field_info(entity_name, lookup_key)
+                .and_then(|info| info.nested_type_name)
+                .unwrap_or_else(|| lookup_key.to_string());
+            let translated = translate_subgraph_filter_value(value, &nested_type);
+            out.insert(target_key.to_string(), translated);
+        } else {
+            // Object value on a non-nested field — most commonly an already
+            // Hasura-shaped sub-expression (e.g. `{_eq: 1}`). Pass through.
+            out.insert(target_key.to_string(), value.clone());
+        }
+        return;
+    }
+
+    if is_nested {
+        // Scalar against a nested entity → ID equality.
+        let mut id_wrapper = serde_json::Map::new();
+        id_wrapper.insert("id".to_string(), op_wrap("_eq", value.clone()));
+        out.insert(target_key.to_string(), Value::Object(id_wrapper));
+        return;
+    }
+
+    out.insert(target_key.to_string(), op_wrap("_eq", value.clone()));
+}
+
+fn op_wrap(op: &str, value: Value) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert(op.to_string(), value);
+    Value::Object(m)
+}
+
+#[derive(Clone, Copy)]
+enum IlikeShape {
+    Contains,
+    StartsWith,
+    EndsWith,
+}
+
+fn ilike_value(value: &Value, shape: IlikeShape) -> Value {
+    let s = match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        // Object/array/null aren't valid ILIKE patterns; forward the raw value
+        // so the upstream returns a meaningful type error.
+        _ => return op_wrap("_ilike", value.clone()),
+    };
+    let pattern = match shape {
+        IlikeShape::Contains => format!("%{}%", s),
+        IlikeShape::StartsWith => format!("{}%", s),
+        IlikeShape::EndsWith => format!("%{}", s),
+    };
+    op_wrap("_ilike", Value::String(pattern))
+}
+
 /// Same as convert_basic_filter_to_hasura_condition but also returns variable type override info
 /// Returns: (condition_string, Option<(variable_name, expected_type)>)
 fn convert_basic_filter_to_hasura_condition_with_type(
@@ -1501,14 +1948,19 @@ mod tests {
         })
     }
 
-    // Initialize test schema before running tests that need schema data
-    /// Initialize test schema for unit tests
-    /// This ALWAYS resets to the hardcoded test schema to ensure tests are deterministic
-    /// and don't depend on external schema changes or test execution order
+    // Initialize test schema for unit tests.
+    //
+    // The previous "always reset" policy was racy under cargo's default parallel
+    // scheduler: `init_test_schema` does `clear()` followed by per-entity inserts,
+    // and a concurrent reader could land on a half-populated cache. Since unit
+    // tests never mutate the schema after init, we use `std::sync::Once` so that
+    // the populate runs exactly once, atomically — concurrent callers block
+    // until the first call completes.
     fn init_test_schema_if_needed() {
-        // Always reset to test schema - don't check if empty
-        // This ensures tests are deterministic and use the hardcoded test schema
-        schema::init_test_schema();
+        static INIT_TEST_SCHEMA: std::sync::Once = std::sync::Once::new();
+        INIT_TEST_SCHEMA.call_once(|| {
+            schema::init_test_schema();
+        });
     }
 
     #[test]
@@ -3270,5 +3722,695 @@ mod tests {
             "Expected String! to be converted to orderaction! enum type, got: {}",
             query
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Header rewrite: `*_filter` → `*_bool_exp`
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn rewrite_filter_type_names_basic() {
+        let h = "query Q($where: Trade_filter)";
+        assert_eq!(rewrite_filter_type_names(h), "query Q($where: Trade_bool_exp)");
+    }
+
+    #[test]
+    fn rewrite_filter_type_names_non_null() {
+        let h = "query Q($where: Trade_filter!)";
+        assert_eq!(rewrite_filter_type_names(h), "query Q($where: Trade_bool_exp!)");
+    }
+
+    #[test]
+    fn rewrite_filter_type_names_list() {
+        let h = "query Q($wheres: [Trade_filter!]!)";
+        assert_eq!(
+            rewrite_filter_type_names(h),
+            "query Q($wheres: [Trade_bool_exp!]!)"
+        );
+    }
+
+    #[test]
+    fn rewrite_filter_type_names_multiple_vars() {
+        let h = "query Q($a: Trade_filter, $b: Pair_filter!, $c: Int)";
+        assert_eq!(
+            rewrite_filter_type_names(h),
+            "query Q($a: Trade_bool_exp, $b: Pair_bool_exp!, $c: Int)"
+        );
+    }
+
+    #[test]
+    fn rewrite_filter_type_names_does_not_touch_unrelated_types() {
+        // ID/Int/Bytes types and PascalCase entity names without _filter must
+        // be untouched.
+        let h = "query Q($id: ID!, $ids: [Bytes!]!, $entity: Pair)";
+        assert_eq!(rewrite_filter_type_names(h), h);
+    }
+
+    #[test]
+    fn rewrite_filter_type_names_skips_lowercase_filter_suffix() {
+        // `query_filter_helper` is not a type name; the function must not
+        // rewrite the middle of an identifier.
+        let h = "query my_filter_query($x: Int)";
+        assert_eq!(rewrite_filter_type_names(h), h);
+    }
+
+    #[test]
+    fn rewrite_filter_type_names_skips_var_named_filter() {
+        // Variable names ending in `_filter` aren't types — only the *type*
+        // position should be rewritten. The function inspects all identifiers,
+        // but the suffix gate requires PascalCase, so lowercase identifiers
+        // (the convention for variable names) are not rewritten.
+        let h = "query Q($where_filter: Trade_filter)";
+        assert_eq!(
+            rewrite_filter_type_names(h),
+            "query Q($where_filter: Trade_bool_exp)"
+        );
+    }
+
+    #[test]
+    fn rewrite_filter_type_names_handles_multiline_header() {
+        let h = "query Q(\n  $where: Trade_filter,\n  $orderBy: String\n)";
+        assert_eq!(
+            rewrite_filter_type_names(h),
+            "query Q(\n  $where: Trade_bool_exp,\n  $orderBy: String\n)"
+        );
+    }
+
+    #[test]
+    fn rewrite_filter_type_names_camel_case_entities() {
+        // Entity names like `UniswapDayData_filter` (the original bug report).
+        let h = "query Q($where: UniswapDayData_filter)";
+        assert_eq!(
+            rewrite_filter_type_names(h),
+            "query Q($where: UniswapDayData_bool_exp)"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // JSON filter-value translation — operator parity with the inline path
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn translate_default_equality_no_suffix() {
+        init_test_schema_if_needed();
+        let v = json!({ "name": "X" });
+        let out = translate_subgraph_filter_value(&v, "Pair");
+        assert_eq!(out, json!({ "name": { "_eq": "X" } }));
+    }
+
+    #[test]
+    fn translate_not_suffix() {
+        init_test_schema_if_needed();
+        let v = json!({ "name_not": "X" });
+        let out = translate_subgraph_filter_value(&v, "Pair");
+        assert_eq!(out, json!({ "name": { "_neq": "X" } }));
+    }
+
+    #[test]
+    fn translate_gt_gte_lt_lte() {
+        init_test_schema_if_needed();
+        let v = json!({
+            "amount_gt": 1,
+            "amount_gte": 2,
+            "amount_lt": 3,
+            "amount_lte": 4,
+        });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        let expected = json!({
+            "amount": { "_gt": 1 },
+        });
+        // Note: in JSON, multiple operators on the same field collapse to a
+        // single key (last write wins) — same as Hasura object semantics. We
+        // assert membership of each key rather than full equality because
+        // HashMap iteration order is not deterministic.
+        let out_obj = out.as_object().unwrap();
+        assert_eq!(out_obj["amount"].as_object().unwrap().len(), 1);
+        assert!(["_gt", "_gte", "_lt", "_lte"].contains(
+            &out_obj["amount"].as_object().unwrap().keys().next().unwrap().as_str()
+        ));
+        // Spot-check that each op individually translates correctly.
+        for (suffix, op) in [
+            ("amount_gt", "_gt"),
+            ("amount_gte", "_gte"),
+            ("amount_lt", "_lt"),
+            ("amount_lte", "_lte"),
+        ] {
+            let single = translate_subgraph_filter_value(&json!({ suffix: 1 }), "Trade");
+            assert_eq!(single, json!({ "amount": { op: 1 } }));
+        }
+        let _ = expected; // silence warning
+    }
+
+    #[test]
+    fn translate_in_and_not_in() {
+        init_test_schema_if_needed();
+        let v = json!({ "id_in": ["a", "b"] });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(out, json!({ "id": { "_in": ["a", "b"] } }));
+
+        let v = json!({ "id_not_in": ["a", "b"] });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(out, json!({ "id": { "_nin": ["a", "b"] } }));
+    }
+
+    #[test]
+    fn translate_contains_starts_ends_with() {
+        init_test_schema_if_needed();
+        let cases = [
+            ("name_contains", "%X%"),
+            ("name_starts_with", "X%"),
+            ("name_ends_with", "%X"),
+            ("name_contains_nocase", "%X%"),
+            ("name_starts_with_nocase", "X%"),
+            ("name_ends_with_nocase", "%X"),
+        ];
+        for (suffix, pattern) in cases {
+            let v = json!({ suffix: "X" });
+            let out = translate_subgraph_filter_value(&v, "Pair");
+            assert_eq!(out, json!({ "name": { "_ilike": pattern } }), "suffix {}", suffix);
+        }
+    }
+
+    #[test]
+    fn translate_negated_string_ops_go_into_not() {
+        init_test_schema_if_needed();
+        let cases = [
+            ("name_not_contains", "%X%"),
+            ("name_not_starts_with", "X%"),
+            ("name_not_ends_with", "%X"),
+            ("name_not_contains_nocase", "%X%"),
+            ("name_not_starts_with_nocase", "X%"),
+            ("name_not_ends_with_nocase", "%X"),
+        ];
+        for (suffix, pattern) in cases {
+            let v = json!({ suffix: "X" });
+            let out = translate_subgraph_filter_value(&v, "Pair");
+            assert_eq!(
+                out,
+                json!({ "_not": { "name": { "_ilike": pattern } } }),
+                "suffix {}",
+                suffix
+            );
+        }
+    }
+
+    #[test]
+    fn translate_and_connective() {
+        init_test_schema_if_needed();
+        let v = json!({
+            "and": [
+                { "amount_gt": 1 },
+                { "amount_lt": 10 }
+            ]
+        });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(
+            out,
+            json!({
+                "_and": [
+                    { "amount": { "_gt": 1 } },
+                    { "amount": { "_lt": 10 } }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn translate_or_connective() {
+        init_test_schema_if_needed();
+        let v = json!({
+            "or": [
+                { "name": "A" },
+                { "name": "B" }
+            ]
+        });
+        let out = translate_subgraph_filter_value(&v, "Pair");
+        assert_eq!(
+            out,
+            json!({
+                "_or": [
+                    { "name": { "_eq": "A" } },
+                    { "name": { "_eq": "B" } }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn translate_hasura_shape_connective_aliases() {
+        // Already-Hasura-style `_and`/`_or` should translate inner entries
+        // but keep the connective key unchanged.
+        init_test_schema_if_needed();
+        let v = json!({
+            "_or": [
+                { "amount_gt": 1 },
+                { "amount": { "_lt": 2 } }
+            ]
+        });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(
+            out,
+            json!({
+                "_or": [
+                    { "amount": { "_gt": 1 } },
+                    { "amount": { "_lt": 2 } }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn translate_multiple_filters_in_one_object() {
+        init_test_schema_if_needed();
+        let v = json!({
+            "amount_gt": 1,
+            "isOpen": false
+        });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(
+            out,
+            json!({
+                "amount": { "_gt": 1 },
+                "isOpen": { "_eq": false }
+            })
+        );
+    }
+
+    #[test]
+    fn translate_chain_id_special_case() {
+        init_test_schema_if_needed();
+        let v = json!({ "chainId": "1" });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(out, json!({ "chainId": { "_eq": "1" } }));
+    }
+
+    #[test]
+    fn translate_nested_entity_scalar_ref() {
+        init_test_schema_if_needed();
+        // `pair` is a nested entity in the test schema (Trade.pair → Pair).
+        let v = json!({ "pair": "0xabc" });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(out, json!({ "pair": { "id": { "_eq": "0xabc" } } }));
+    }
+
+    #[test]
+    fn translate_nested_entity_object_ref() {
+        init_test_schema_if_needed();
+        let v = json!({ "pair": { "name": "ETH" } });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(out, json!({ "pair": { "name": { "_eq": "ETH" } } }));
+    }
+
+    #[test]
+    fn translate_nested_entity_trailing_underscore() {
+        // Subgraph's strict form: `pair_: { name: "ETH" }`. The trailing
+        // underscore should be stripped on the way through.
+        init_test_schema_if_needed();
+        let v = json!({ "pair_": { "name": "ETH" } });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(out, json!({ "pair": { "name": { "_eq": "ETH" } } }));
+    }
+
+    #[test]
+    fn translate_deeply_nested_with_scalar_at_depth() {
+        init_test_schema_if_needed();
+        // Trade.pair → Pair, Pair.token → Token. Scalar at depth becomes id eq.
+        let v = json!({ "pair": { "token": "0xtok" } });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(
+            out,
+            json!({ "pair": { "token": { "id": { "_eq": "0xtok" } } } })
+        );
+    }
+
+    #[test]
+    fn translate_deeply_nested_with_operator_at_depth() {
+        init_test_schema_if_needed();
+        let v = json!({ "pair": { "token": { "amount_gt": 100 } } });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(
+            out,
+            json!({ "pair": { "token": { "amount": { "_gt": 100 } } } })
+        );
+    }
+
+    #[test]
+    fn translate_already_hasura_value_passes_through() {
+        // If the caller has already shaped the value for Hasura, the leaf
+        // emits the object verbatim (no double-wrapping).
+        init_test_schema_if_needed();
+        let v = json!({ "amount": { "_gt": 1 } });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(out, json!({ "amount": { "_gt": 1 } }));
+    }
+
+    #[test]
+    fn translate_mixed_subgraph_and_hasura_in_and() {
+        init_test_schema_if_needed();
+        let v = json!({
+            "_and": [
+                { "amount_gt": 1 },
+                { "amount": { "_lt": 5 } }
+            ]
+        });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(
+            out,
+            json!({
+                "_and": [
+                    { "amount": { "_gt": 1 } },
+                    { "amount": { "_lt": 5 } }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn translate_empty_object() {
+        init_test_schema_if_needed();
+        let v = json!({});
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(out, json!({}));
+    }
+
+    #[test]
+    fn translate_non_object_passes_through() {
+        init_test_schema_if_needed();
+        assert_eq!(translate_subgraph_filter_value(&Value::Null, "Trade"), Value::Null);
+        assert_eq!(translate_subgraph_filter_value(&json!(42), "Trade"), json!(42));
+        assert_eq!(translate_subgraph_filter_value(&json!("x"), "Trade"), json!("x"));
+        assert_eq!(translate_subgraph_filter_value(&json!([1, 2]), "Trade"), json!([1, 2]));
+    }
+
+    #[test]
+    fn translate_contains_any_unsupported_pass_through() {
+        init_test_schema_if_needed();
+        let v = json!({ "tags_containsAny": ["a", "b"] });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        // Pass-through so upstream returns a meaningful error.
+        assert_eq!(out, json!({ "tags_containsAny": ["a", "b"] }));
+    }
+
+    #[test]
+    fn translate_boolean_equality() {
+        init_test_schema_if_needed();
+        let v = json!({ "isOpen": false });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(out, json!({ "isOpen": { "_eq": false } }));
+    }
+
+    #[test]
+    fn translate_numeric_equality_from_string() {
+        // Subgraph clients often send BigInt-typed fields as strings.
+        init_test_schema_if_needed();
+        let v = json!({ "amount": "100" });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(out, json!({ "amount": { "_eq": "100" } }));
+    }
+
+    #[test]
+    fn translate_explicit_not_block_recurses() {
+        // Top-level `_not` is itself a connective; its body must be translated.
+        init_test_schema_if_needed();
+        let v = json!({ "_not": { "amount_gt": 1 } });
+        let out = translate_subgraph_filter_value(&v, "Trade");
+        assert_eq!(out, json!({ "_not": { "amount": { "_gt": 1 } } }));
+    }
+
+    #[test]
+    fn translate_unsuffixed_underscore_field_does_not_split() {
+        // A bare key ending in `_` (with nothing after) should be treated as
+        // a nested-entity reference with the trailing `_` stripped, not as
+        // an operator suffix. The schema has `Pair.token`, so use that.
+        init_test_schema_if_needed();
+        let v = json!({ "token_": { "name": "ETH" } });
+        let out = translate_subgraph_filter_value(&v, "Pair");
+        assert_eq!(out, json!({ "token": { "name": { "_eq": "ETH" } } }));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // End-to-end: filter-typed variables flow through conversion
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn end_to_end_filter_variable_rewrites_type_and_value() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($first: Int, $where: Trade_filter) { trades(first: $first, where: $where) { id amount } }",
+            "variables": {
+                "first": 10,
+                "where": { "amount_gt": 100, "isOpen": false }
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+
+        // Header type rewritten.
+        assert!(
+            query.contains("$where: Trade_bool_exp"),
+            "Expected Trade_bool_exp in header, got: {}",
+            query
+        );
+        assert!(!query.contains("Trade_filter"), "Should not contain Trade_filter, got: {}", query);
+
+        // Where clause forwards the variable verbatim.
+        assert!(query.contains("where: $where"), "Expected where: $where, got: {}", query);
+
+        // Variable value translated to Hasura shape.
+        let translated_where = &result.query["variables"]["where"];
+        assert_eq!(
+            translated_where,
+            &json!({
+                "amount": { "_gt": 100 },
+                "isOpen": { "_eq": false }
+            })
+        );
+
+        // Untouched variables remain unchanged.
+        assert_eq!(result.query["variables"]["first"], 10);
+
+        // filter_variable_entities exposes the mapping for callers.
+        assert_eq!(
+            result.filter_variable_entities.get("where"),
+            Some(&"Trade".to_string())
+        );
+    }
+
+    #[test]
+    fn end_to_end_filter_variable_with_and_connective() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($where: Trade_filter) { trades(where: $where) { id } }",
+            "variables": {
+                "where": {
+                    "and": [
+                        { "amount_gte": 1 },
+                        { "amount_lte": 10 }
+                    ]
+                }
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(
+            &result.query["variables"]["where"],
+            &json!({
+                "_and": [
+                    { "amount": { "_gte": 1 } },
+                    { "amount": { "_lte": 10 } }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn end_to_end_filter_variable_missing_value_is_safe() {
+        // If the variable is declared but no value is supplied, we don't
+        // panic; we simply leave the variables payload untouched (sans key).
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($where: Trade_filter) { trades(where: $where) { id } }",
+            "variables": { "other": 1 }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(result.query["variables"]["other"], 1);
+        assert!(result.query["variables"].get("where").is_none());
+    }
+
+    #[test]
+    fn end_to_end_filter_variable_with_chain_id() {
+        // chain_id is normally injected into the where clause. When `where`
+        // is a variable, the converter currently forwards the variable as-is
+        // — chain_id isn't merged in. This test pins that behaviour so a
+        // future change doesn't silently start double-applying chain_id.
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($where: Trade_filter) { trades(where: $where) { id } }",
+            "variables": { "where": { "amount_gt": 1 } }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("where: $where"),
+            "Expected where: $where, got: {}",
+            query
+        );
+        // No literal chainId injection alongside the variable reference.
+        assert!(
+            !query.contains("chainId: {_eq: \"1\"}"),
+            "Did not expect chainId injection when where is a variable, got: {}",
+            query
+        );
+        assert_eq!(
+            &result.query["variables"]["where"],
+            &json!({ "amount": { "_gt": 1 } })
+        );
+    }
+
+    #[test]
+    fn end_to_end_already_hasura_shaped_variable_is_idempotent() {
+        // A client that has migrated to Hyperindex-native shape will declare
+        // `$where: Trade_bool_exp` (no rewrite needed) and send a Hasura
+        // value. Translation should still pass it through unchanged.
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($where: Trade_bool_exp) { trades(where: $where) { id } }",
+            "variables": { "where": { "amount": { "_gt": 1 } } }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("$where: Trade_bool_exp"));
+
+        // The variable is still classified as a filter variable (it's used as
+        // `where: $var`), so the translator runs — but on an already-Hasura
+        // value it's a no-op for the leaf field.
+        assert_eq!(
+            &result.query["variables"]["where"],
+            &json!({ "amount": { "_gt": 1 } })
+        );
+    }
+
+    #[test]
+    fn end_to_end_inline_where_still_works_after_changes() {
+        // Regression guard: the original inline-where path must not be
+        // affected by the new variable plumbing.
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query { trades(where: { amount_gt: 100 }) { id } }"
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("where: {amount: {_gt: 100}}"),
+            "Inline where regression — got: {}",
+            query
+        );
+        assert!(result.filter_variable_entities.is_empty());
+    }
+
+    #[test]
+    fn end_to_end_multiple_entities_each_with_filter_variable() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($tw: Trade_filter, $pw: Pair_filter) { trades(where: $tw) { id } pairs(where: $pw) { id } }",
+            "variables": {
+                "tw": { "amount_gt": 1 },
+                "pw": { "name_contains": "ETH" }
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("$tw: Trade_bool_exp"));
+        assert!(query.contains("$pw: Pair_bool_exp"));
+        assert_eq!(
+            &result.query["variables"]["tw"],
+            &json!({ "amount": { "_gt": 1 } })
+        );
+        assert_eq!(
+            &result.query["variables"]["pw"],
+            &json!({ "name": { "_ilike": "%ETH%" } })
+        );
+        assert_eq!(result.filter_variable_entities.len(), 2);
+    }
+
+    #[test]
+    fn end_to_end_filter_variable_with_nested_entity_scalar() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($where: Trade_filter) { trades(where: $where) { id pair { id } } }",
+            "variables": {
+                "where": { "pair": "0xabc" }
+            }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(
+            &result.query["variables"]["where"],
+            &json!({ "pair": { "id": { "_eq": "0xabc" } } })
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Backwards-compat regression: existing variable handling untouched
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn regression_non_filter_variable_passes_unchanged() {
+        // A `$first: Int` variable with no filter usage should be left alone
+        // and the entity map should not record it.
+        let payload = json!({
+            "query": "query Q($first: Int) { trades(first: $first) { id } }",
+            "variables": { "first": 5 }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(result.query["variables"]["first"], 5);
+        assert!(result.filter_variable_entities.is_empty());
+    }
+
+    #[test]
+    fn regression_bigint_to_numeric_still_applied() {
+        // The header rewrite for BigInt → numeric was the older feature; make
+        // sure the new `*_filter` rewrite layered on top doesn't disturb it.
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($a: BigInt!) { trades(where: { amount_gte: $a }) { id } }",
+            "variables": { "a": "100" }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("$a: numeric!"),
+            "BigInt → numeric regression, got: {}",
+            query
+        );
+    }
+
+    #[test]
+    fn regression_enum_string_override_still_applied() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($op: String!) { orders(where: { orderAction: $op }) { id } }",
+            "variables": { "op": "Open" }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("$op: orderaction!"),
+            "Enum override regression, got: {}",
+            query
+        );
+    }
+
+    #[test]
+    fn regression_query_with_variables_passthrough() {
+        // The pre-existing test from `test_query_with_variables`, repeated
+        // verbatim here to make any drift in the new path immediately visible.
+        let payload = json!({
+            "query": "query FactoriesAndBundles($first: Int!) { factories(first: $first) { id poolCount } bundles(first: $first) { id nativePriceUSD } }",
+            "variables": { "first": 5 }
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(result.query["variables"]["first"], 5);
+        assert!(result.filter_variable_entities.is_empty());
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("$first"));
     }
 }
