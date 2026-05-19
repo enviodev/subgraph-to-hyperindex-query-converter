@@ -705,9 +705,14 @@ fn extract_multiple_entities(
             current_pos, query_chars[current_pos]
         );
 
-        // Look for entity name (word characters) - only at top level
+        // Look for entity name (word characters) - only at top level.
+        // Identifier chars are alphanumerics plus underscore, so prefixed
+        // entity names like `V2_Factory_Swaps` are kept as a single token
+        // rather than being chopped into `V2` / `Factory` / `Swaps`.
         let entity_start = current_pos;
-        while current_pos < query_chars.len() && query_chars[current_pos].is_alphanumeric() {
+        while current_pos < query_chars.len()
+            && (query_chars[current_pos].is_alphanumeric() || query_chars[current_pos] == '_')
+        {
             current_pos += 1;
         }
 
@@ -1969,6 +1974,23 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
             "query": "query {\n  Stream(limit: 10, offset: 0, where: {chainId: {_eq: \"1\"}}) {\n    id name\n  }\n}"
+        });
+        assert_eq!(result.query, expected);
+    }
+
+    // Regression: entity names with underscored prefixes (e.g. contract-namespaced
+    // entities like `V2_Factory_Swaps`) must be preserved as a single identifier
+    // and singularized at the suffix only. Before the fix, the entity tokenizer
+    // walked only alphanumeric chars and chopped the name into `V2` / `Factory` /
+    // `Swaps`, leaving just `Swap` in the converted query.
+    #[test]
+    fn test_prefixed_entity_name_preserved() {
+        let payload = create_test_payload(
+            "query { V2_Factory_Swaps(first: 1, orderBy: timestamp, orderDirection: desc) { id timestamp amountUSD } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        let expected = json!({
+            "query": "query {\n  V2_Factory_Swap(limit: 1, order_by: {timestamp: desc}, where: {chainId: {_eq: \"1\"}}) {\n    id timestamp amountUSD\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }

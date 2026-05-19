@@ -210,12 +210,6 @@ pub fn get_field_info(entity_name: &str, field_name: &str) -> Option<FieldInfo> 
         .and_then(|fields_ref| fields_ref.value().get(field_name).cloned())
 }
 
-/// Get all field information for an entity in one operation
-/// This is more efficient when you need multiple lookups for the same entity
-pub fn get_entity_fields(entity_name: &str) -> Option<HashMap<String, FieldInfo>> {
-    SCHEMA_CACHE.get(entity_name).map(|entry| entry.value().clone())
-}
-
 /// Check if a field is a nested entity
 pub fn is_nested_entity(entity_name: &str, field_name: &str) -> bool {
     get_field_info(entity_name, field_name)
