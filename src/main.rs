@@ -132,6 +132,13 @@ async fn execute_query_with_retry(
     let field_name_map = conversion_result.field_name_map;
     let is_meta_query = conversion_result.is_meta_query;
 
+    if !conversion_result.filter_variable_entities.is_empty() {
+        tracing::info!(
+            "Translated subgraph filter variables to bool_exp shape: {:?}",
+            conversion_result.filter_variable_entities
+        );
+    }
+
     tracing::info!("Converted query: {:?}", converted_query);
 
     // Prepare debug info for potential error responses
