@@ -210,6 +210,51 @@ pub fn get_field_info(entity_name: &str, field_name: &str) -> Option<FieldInfo> 
         .and_then(|fields_ref| fields_ref.value().get(field_name).cloned())
 }
 
+/// Find the cached entity whose graph-node collection field is `field_name`.
+///
+/// graph-node's pluralization is not reversible from spelling alone —
+/// `txTransferses` could singularize to `TxTransfers` or `TxTransferse`, and
+/// guessing wrong queries a table that does not exist, which surfaces as an
+/// empty list rather than an error. The schema knows which entity is real, so
+/// ask it before falling back to word rules.
+///
+/// Returns `None` when the cache is empty or holds no match, leaving the caller
+/// on its lexical fallback.
+pub fn resolve_entity_for_collection_field(field_name: &str) -> Option<String> {
+    let cache = SCHEMA_CACHE.clone();
+    let found = cache
+        .iter()
+        .find(|entry| graph_node_plural(entry.key()) == field_name)
+        .map(|entry| entry.key().clone());
+    found
+}
+
+/// graph-node's plural collection field for an entity: lowercase the first
+/// letter, then apply English pluralization.
+fn graph_node_plural(entity: &str) -> String {
+    let mut chars = entity.chars();
+    let lower_first = match chars.next() {
+        None => return String::new(),
+        Some(f) => f.to_lowercase().collect::<String>() + chars.as_str(),
+    };
+
+    let ends_with_any = |suffixes: &[&str]| suffixes.iter().any(|s| lower_first.ends_with(s));
+
+    if lower_first.ends_with('y')
+        && !lower_first.ends_with("ay")
+        && !lower_first.ends_with("ey")
+        && !lower_first.ends_with("iy")
+        && !lower_first.ends_with("oy")
+        && !lower_first.ends_with("uy")
+    {
+        format!("{}ies", &lower_first[..lower_first.len() - 1])
+    } else if ends_with_any(&["s", "x", "z", "ch", "sh"]) {
+        format!("{}es", lower_first)
+    } else {
+        format!("{}s", lower_first)
+    }
+}
+
 /// Check if a field is a nested entity
 pub fn is_nested_entity(entity_name: &str, field_name: &str) -> bool {
     get_field_info(entity_name, field_name)
@@ -314,6 +359,17 @@ pub fn get_schema_cache_json() -> Value {
 pub fn clear_schema_cache() {
     SCHEMA_CACHE.clear();
     *SCHEMA_LAST_UPDATED.write().unwrap() = None;
+}
+
+#[cfg(test)]
+/// Initialize the test schema exactly once per test binary.
+///
+/// `init_test_schema` clears the process-global cache before repopulating it, so
+/// calling it again while other tests run in parallel can briefly blank out
+/// entities they depend on. Every test should go through this.
+pub fn init_test_schema_once() {
+    static INIT_TEST_SCHEMA: std::sync::Once = std::sync::Once::new();
+    INIT_TEST_SCHEMA.call_once(init_test_schema);
 }
 
 #[cfg(test)]
@@ -493,6 +549,71 @@ pub fn init_test_schema() {
         field_type: "Pair".to_string(),
     });
     cache.insert("Order".to_string(), order_fields);
+
+    // Argus-shaped entities, used by the tests covering their production queries.
+    // `Launch` is referenced by Swap/Holder/LaunchHourData/LaunchDayData, which is
+    // what makes `launch_in` a nested-entity filter rather than a scalar one.
+    let mut launch_fields = HashMap::new();
+    for (name, ty) in [
+        ("id", "String"),
+        ("name", "String"),
+        ("symbol", "String"),
+        ("tracker", "String"),
+        ("creator", "String"),
+        ("quoteAsset", "String"),
+        ("quoteSymbol", "String"),
+        ("createdAt", "numeric"),
+        ("dividendsPaid", "numeric"),
+    ] {
+        launch_fields.insert(name.to_string(), FieldInfo {
+            is_nested_entity: false,
+            nested_type_name: None,
+            field_type: ty.to_string(),
+        });
+    }
+    cache.insert("Launch".to_string(), launch_fields);
+
+    for entity in ["LaunchHourData", "LaunchDayData", "Swap", "Holder"] {
+        let mut fields = HashMap::new();
+        fields.insert("id".to_string(), FieldInfo {
+            is_nested_entity: false,
+            nested_type_name: None,
+            field_type: "String".to_string(),
+        });
+        fields.insert("launch".to_string(), FieldInfo {
+            is_nested_entity: true,
+            nested_type_name: Some("Launch".to_string()),
+            field_type: "Launch".to_string(),
+        });
+        for (name, ty) in [
+            ("periodStart", "numeric"),
+            ("volumeQuote", "numeric"),
+            ("timestamp", "numeric"),
+            ("ordinal", "numeric"),
+            ("balance", "numeric"),
+            ("trader", "String"),
+            ("account", "String"),
+            ("isSystem", "Boolean"),
+        ] {
+            fields.insert(name.to_string(), FieldInfo {
+                is_nested_entity: false,
+                nested_type_name: None,
+                field_type: ty.to_string(),
+            });
+        }
+        cache.insert(entity.to_string(), fields);
+    }
+
+    // Entities whose graph-node plural is not recoverable by word rules alone.
+    for entity in ["Protocol", "ProtocolDayData", "TxTransfers"] {
+        let mut fields = HashMap::new();
+        fields.insert("id".to_string(), FieldInfo {
+            is_nested_entity: false,
+            nested_type_name: None,
+            field_type: "String".to_string(),
+        });
+        cache.insert(entity.to_string(), fields);
+    }
 
     // Update timestamp
     let timestamp = SystemTime::now()

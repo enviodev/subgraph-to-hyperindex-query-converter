@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 use crate::schema;
@@ -12,8 +12,35 @@ pub enum ConversionError {
     MissingField(String),
     #[error("Unsupported filter: {0}")]
     UnsupportedFilter(String),
-    #[error("Complex _meta queries are not supported. Only _meta {{ block {{ number }} }} is currently available")]
-    ComplexMetaQuery,
+    #[error("_meta fields with no Hyperindex equivalent: {0}. Only _meta {{ block {{ number }} }} can be served, and a partial answer would look like a complete one to the caller")]
+    ComplexMetaQuery(String),
+    #[error("_meta cannot be combined with other root fields: {0}")]
+    MetaWithOtherFields(String),
+}
+
+/// Where one half of an `order_by` pair comes from: a GraphQL variable the client
+/// sends, or a literal written into the query text.
+#[derive(Debug, Clone)]
+pub enum OrderValueSource {
+    Variable(String),
+    Literal(String),
+}
+
+/// An `order_by` argument whose value has to be assembled at request time.
+///
+/// Subgraph spells dynamic ordering as two scalar variables
+/// (`orderBy: $orderBy, orderDirection: $direction`), but GraphQL has no variable
+/// object keys, so `order_by: {$orderBy: $direction}` cannot be written. Instead we
+/// retype the client's own `$orderBy` to `[Entity_order_by!]` and rebuild its JSON
+/// value as `[{field: direction}]` before forwarding.
+#[derive(Debug, Clone)]
+pub struct OrderBySpec {
+    /// Variable whose JSON value we overwrite — normally the client's own `orderBy`.
+    pub target_var: String,
+    pub field_source: OrderValueSource,
+    pub direction_source: OrderValueSource,
+    /// Hyperindex entity being ordered, for logging.
+    pub entity: String,
 }
 
 /// Result of query conversion, including the converted query and field name mappings
@@ -22,14 +49,22 @@ pub struct ConversionResult {
     pub query: Value,
     /// Maps Hyperindex field names (e.g., "LpAction") to original query field names (e.g., "lpActions")
     pub field_name_map: HashMap<String, String>,
-    /// Indicates if this was a _meta query (needs special response transformation)
-    pub is_meta_query: bool,
     /// Maps variable names (without `$`) to the Hyperindex entity name (e.g., "UniswapDayData")
     /// for variables that were declared with a subgraph `*_filter` type and used as a
     /// top-level `where: $var` argument. The caller is expected to translate the JSON
     /// value of each such variable via `translate_subgraph_filter_value` before forwarding
     /// upstream.
     pub filter_variable_entities: HashMap<String, String>,
+    /// Order-by variables whose JSON value must be rebuilt into Hasura's
+    /// `[{field: direction}]` shape before forwarding upstream.
+    /// Which `_meta` sub-fields the caller asked for, when this was a `_meta`
+    /// query. The response transform needs it to echo back exactly those fields.
+    pub meta_selection: Option<MetaSelection>,
+    pub order_by_variables: Vec<OrderBySpec>,
+    /// Variables whose declaration was removed from the operation header because
+    /// nothing references them any more. GraphQL rejects a declared-but-unused
+    /// variable, so these are stripped from the forwarded payload too.
+    pub dropped_variables: Vec<String>,
 }
 
 pub fn convert_subgraph_to_hyperindex(
@@ -68,19 +103,22 @@ pub fn convert_subgraph_to_hyperindex(
         return Ok(ConversionResult {
             query: result,
             field_name_map: HashMap::new(),
-            is_meta_query: false,
+            meta_selection: None,
             filter_variable_entities: HashMap::new(),
+            order_by_variables: Vec::new(),
+            dropped_variables: Vec::new(),
         });
     }
 
     // Check if this is a _meta query before conversion
-    let is_meta_query = query.contains("_meta");
-
     // Parse the GraphQL query (simplified parsing for now)
     let MainConversion {
         converted_query,
         field_name_map,
         filter_variable_entities,
+        order_by_variables,
+        dropped_variables,
+        meta_selection,
     } = convert_query_structure(query, chain_id)?;
 
     // Build the result with query and optionally variables
@@ -105,14 +143,66 @@ pub fn convert_subgraph_to_hyperindex(
                 }
             }
         }
+        // Rebuild `order_by` variables into Hasura's `[{field: direction}]` shape.
+        if !order_by_variables.is_empty() {
+            if let Value::Object(map) = &mut variables {
+                for spec in &order_by_variables {
+                    let field = match &spec.field_source {
+                        OrderValueSource::Literal(s) => Some(s.clone()),
+                        OrderValueSource::Variable(name) => map
+                            .get(name)
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                    };
+                    let field = match field.filter(|f| !f.trim().is_empty()) {
+                        Some(f) => f,
+                        // Nothing to order by. Leave the variable unset so Hasura
+                        // receives null and simply doesn't order, rather than
+                        // failing the request outright.
+                        None => continue,
+                    };
+                    let direction = match &spec.direction_source {
+                        OrderValueSource::Literal(s) => s.clone(),
+                        OrderValueSource::Variable(name) => map
+                            .get(name)
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "asc".to_string()),
+                    };
+                    tracing::debug!(
+                        "Rebuilding order_by variable ${} for {} as {} {}",
+                        spec.target_var,
+                        spec.entity,
+                        field,
+                        direction
+                    );
+                    map.insert(
+                        spec.target_var.clone(),
+                        Value::Array(vec![order_by_json(&field, &direction)]),
+                    );
+                }
+            }
+        }
+        // Declarations we removed from the header must not be forwarded either.
+        if !dropped_variables.is_empty() {
+            if let Value::Object(map) = &mut variables {
+                for name in &dropped_variables {
+                    if !order_by_variables.iter().any(|sp| &sp.target_var == name) {
+                        map.remove(name);
+                    }
+                }
+            }
+        }
         result["variables"] = variables;
     }
 
     Ok(ConversionResult {
         query: result,
         field_name_map,
-        is_meta_query,
+        meta_selection,
         filter_variable_entities,
+        order_by_variables,
+        dropped_variables,
     })
 }
 
@@ -124,23 +214,44 @@ struct MainConversion {
     /// populated for variables that appeared as top-level `where: $var` and were
     /// declared with a subgraph-style `*_filter` type in the query header.
     filter_variable_entities: HashMap<String, String>,
+    order_by_variables: Vec<OrderBySpec>,
+    dropped_variables: Vec<String>,
+    /// Which `_meta` sub-fields were requested, for shaping the response.
+    meta_selection: Option<MetaSelection>,
 }
 
 fn convert_query_structure(
     query: &str,
     chain_id: Option<&str>,
 ) -> Result<MainConversion, ConversionError> {
-    // Check for _meta query first
-    if query.contains("_meta") {
-        return Ok(MainConversion {
-            converted_query: convert_meta_query(query)?,
-            field_name_map: HashMap::new(),
-            filter_variable_entities: HashMap::new(),
-        });
-    }
-
     // Extract fragments and main query
     let (fragments, main_query) = extract_fragments_and_main_query(query)?;
+
+    // `_meta` is handled by a dedicated path, so it has to be recognized as an
+    // actual root field. A substring test would also fire on an entity whose
+    // name merely contains `_meta` (`token_metadata`) and hijack the whole query.
+    let root_fields = root_field_names(&main_query);
+    if root_fields.iter().any(|name| name == "_meta") {
+        // `chain_metadata` replaces the whole operation, so anything alongside
+        // `_meta` would be dropped without a word. Say so instead.
+        let others: Vec<&str> = root_fields
+            .iter()
+            .filter(|name| *name != "_meta")
+            .map(|name| name.as_str())
+            .collect();
+        if !others.is_empty() {
+            return Err(ConversionError::MetaWithOtherFields(others.join(", ")));
+        }
+        let (converted_query, meta_selection) = convert_meta_query(&main_query)?;
+        return Ok(MainConversion {
+            converted_query,
+            field_name_map: HashMap::new(),
+            filter_variable_entities: HashMap::new(),
+            order_by_variables: Vec::new(),
+            dropped_variables: Vec::new(),
+            meta_selection: Some(meta_selection),
+        });
+    }
 
     // Convert the main query
     let main = convert_main_query(&main_query, chain_id)?;
@@ -157,6 +268,9 @@ fn convert_query_structure(
         converted_query: result,
         field_name_map: main.field_name_map,
         filter_variable_entities: main.filter_variable_entities,
+        order_by_variables: main.order_by_variables,
+        dropped_variables: main.dropped_variables,
+        meta_selection: None,
     })
 }
 
@@ -467,6 +581,15 @@ fn convert_main_query(
     // variables typed as anything else (custom input types, already-migrated
     // `*_bool_exp`, etc.) pass through verbatim.
     let mut filter_variable_entities: HashMap<String, String> = HashMap::new();
+    // Unconditional header retypes for order arguments. Kept separate from
+    // `all_variable_type_overrides`, which only ever replaces a declared
+    // `String`/`Int` and so cannot touch `OrderDirection!` or `Entity_orderBy!`.
+    let mut order_by_retypes: HashMap<String, String> = HashMap::new();
+    let mut order_by_specs: Vec<OrderBySpec> = Vec::new();
+    // Declarations that may have become unused; confirmed against the built body.
+    let mut dead_candidates: Vec<String> = Vec::new();
+    let mut order_var_owner: HashMap<String, String> = HashMap::new();
+    let mut synth_counter: usize = 0;
     // Parse variable declarations once for the whole query.
     let header_var_types: HashMap<String, String> = query_header
         .as_deref()
@@ -519,13 +642,13 @@ fn convert_main_query(
                 // input-object types pass through verbatim — both for
                 // backwards compatibility and because we don't know how to
                 // translate an arbitrary user-defined input type.
-                let var_name = where_var
-                    .trim()
-                    .trim_start_matches('$')
-                    .to_string();
+                let var_name = where_var.trim().trim_start_matches('$').to_string();
                 if !var_name.is_empty() {
                     let declared = header_var_types.get(&var_name);
-                    if declared.map(|t| is_subgraph_filter_type(t)).unwrap_or(false) {
+                    if declared
+                        .map(|t| is_subgraph_filter_type(t))
+                        .unwrap_or(false)
+                    {
                         filter_variable_entities.insert(var_name, entity_cap.clone());
                     }
                 }
@@ -552,17 +675,17 @@ fn convert_main_query(
             params_vec.push(format!("offset: {}", o));
         }
         // Map orderBy/orderDirection to Hasura order_by
-        if let Some(order_field) = params.get("orderBy") {
-            let order_dir = params
-                .get("orderDirection")
-                .map(|s| s.as_str())
-                .unwrap_or("asc");
-            // Ignore order_by if the order field is a variable (e.g., $orderBy) to keep query valid
-            if !order_field.trim_start().starts_with('$')
-                && !order_dir.trim_start().starts_with('$')
-            {
-                params_vec.push(format!("order_by: {{{}: {}}}", order_field, order_dir));
-            }
+        if let Some(order_arg) = plan_order_by(
+            &params,
+            &entity_cap,
+            &header_var_types,
+            &mut order_by_retypes,
+            &mut order_by_specs,
+            &mut dead_candidates,
+            &mut order_var_owner,
+            &mut synth_counter,
+        ) {
+            params_vec.push(order_arg);
         }
         if !where_clause.is_empty() {
             // The where_clause already has the correct format, just use it directly
@@ -578,6 +701,17 @@ fn convert_main_query(
         converted_entities.push(converted_entity);
     }
 
+    // Build the body first: whether a declaration is still referenced can only be
+    // answered against the emitted arguments.
+    let body = converted_entities.join("\n");
+    let referenced = referenced_variables(&body);
+    let removals: HashSet<String> = dead_candidates
+        .into_iter()
+        .filter(|name| !referenced.contains(name))
+        .collect();
+    let mut dropped_variables: Vec<String> = removals.iter().cloned().collect();
+    dropped_variables.sort();
+
     // Reconstruct the query with preserved header (including variable definitions)
     // Convert ID and Bytes types to String in variable definitions
     let query_header_str = if let Some(header) = &query_header {
@@ -589,6 +723,10 @@ fn convert_main_query(
         // syntactic rename only — see `translate_subgraph_filter_value` for
         // the runtime JSON-value translation that goes with it.
         let converted_header = rewrite_filter_type_names(&converted_header);
+        // Order-argument retypes and removals run last, over the now
+        // whitespace-normalized single-line header.
+        let converted_header =
+            rewrite_variable_definitions(&converted_header, &order_by_retypes, &removals);
         tracing::debug!(
             "Using preserved query header: '{}' (converted to: '{}')",
             header,
@@ -601,17 +739,337 @@ fn convert_main_query(
         "query".to_string()
     };
 
-    let converted_query = format!(
-        "{} {{\n{}\n}}",
-        query_header_str,
-        converted_entities.join("\n")
-    );
+    let converted_query = format!("{} {{\n{}\n}}", query_header_str, body);
     tracing::debug!("Final converted query: {}", converted_query);
     Ok(MainConversion {
         converted_query,
         field_name_map,
         filter_variable_entities,
+        order_by_variables: order_by_specs,
+        dropped_variables,
+        meta_selection: None,
     })
+}
+
+/// Build a literal `order_by` object, expanding subgraph's `parent__child` nested
+/// ordering syntax into Hasura's nested object form
+/// (`pool__reserveUSD` -> `{pool: {reserveUSD: asc}}`).
+fn literal_order_by(field: &str, direction: &str) -> String {
+    let segments: Vec<&str> = field.split("__").filter(|s| !s.is_empty()).collect();
+    let segments = if segments.is_empty() {
+        vec![field]
+    } else {
+        segments
+    };
+    let mut out = direction.to_string();
+    for seg in segments.iter().rev() {
+        out = format!("{{{}: {}}}", seg, out);
+    }
+    out
+}
+
+/// JSON counterpart of `literal_order_by`, for values assembled at request time.
+fn order_by_json(field: &str, direction: &str) -> Value {
+    let segments: Vec<&str> = field.split("__").filter(|s| !s.is_empty()).collect();
+    let segments = if segments.is_empty() {
+        vec![field]
+    } else {
+        segments
+    };
+    let mut out = Value::String(normalize_order_direction(direction));
+    for seg in segments.iter().rev() {
+        let mut m = serde_json::Map::new();
+        m.insert((*seg).to_string(), out);
+        out = Value::Object(m);
+    }
+    out
+}
+
+/// Hasura matches its `order_by` enum exactly, while subgraph clients sometimes
+/// send `DESC`. Normalize the values we assemble ourselves; anything unrecognized
+/// falls back to `asc` rather than failing the request.
+fn normalize_order_direction(direction: &str) -> String {
+    let d = direction.trim().trim_matches('"').to_lowercase();
+    match d.as_str() {
+        "asc" | "desc" | "asc_nulls_first" | "asc_nulls_last" | "desc_nulls_first"
+        | "desc_nulls_last" => d,
+        _ => "asc".to_string(),
+    }
+}
+
+/// Decide how a root field's `orderBy`/`orderDirection` arguments become Hasura's
+/// `order_by`, recording any header retypes, now-dead declarations and runtime
+/// value rewrites the choice implies.
+///
+/// Returns the `order_by: ...` argument text, or `None` when the field has no
+/// usable ordering. Previously any variable in either position caused the whole
+/// argument to be dropped, which returned unordered rows with a 200 — silently
+/// corrupting keyset pagination.
+#[allow(clippy::too_many_arguments)]
+fn plan_order_by(
+    params: &HashMap<String, String>,
+    entity_cap: &str,
+    header_var_types: &HashMap<String, String>,
+    retypes: &mut HashMap<String, String>,
+    specs: &mut Vec<OrderBySpec>,
+    dead_candidates: &mut Vec<String>,
+    order_var_owner: &mut HashMap<String, String>,
+    synth_counter: &mut usize,
+) -> Option<String> {
+    let order_field = params.get("orderBy").map(|s| s.trim());
+    let order_dir = params.get("orderDirection").map(|s| s.trim());
+
+    let dir_var = order_dir
+        .filter(|d| d.starts_with('$'))
+        .map(|d| d.trim_start_matches('$').to_string());
+
+    let field = match order_field {
+        // `orderDirection` with no `orderBy` orders nothing. Drop its declaration
+        // too, since GraphQL rejects a variable that is declared but never used.
+        None => {
+            if let Some(dir) = dir_var {
+                dead_candidates.push(dir);
+            }
+            return None;
+        }
+        Some(f) => f,
+    };
+
+    if !field.starts_with('$') {
+        // Literal field. A variable is legal as an object *value*, so a variable
+        // direction only needs its declared type corrected.
+        let dir_text = order_dir.unwrap_or("asc");
+        if let Some(dir) = dir_var {
+            let non_null = header_var_types
+                .get(&dir)
+                .map(|t| t.trim().ends_with('!'))
+                .unwrap_or(false);
+            retypes.insert(
+                dir,
+                if non_null {
+                    "order_by!".to_string()
+                } else {
+                    "order_by".to_string()
+                },
+            );
+        }
+        return Some(format!("order_by: {}", literal_order_by(field, dir_text)));
+    }
+
+    // The field itself is a variable, so the key of the `order_by` object is not
+    // known until request time. Repurpose the client's own variable: retype it to
+    // `[Entity_order_by!]` and rebuild its value. Repurposing rather than
+    // synthesizing keeps the failure loud — if the value rewrite ever fails to
+    // fire, Hasura sees a String where an input object is expected and errors,
+    // instead of quietly returning unordered rows.
+    let var = field.trim_start_matches('$').to_string();
+
+    let target_var = match order_var_owner.get(&var) {
+        // One variable cannot be typed as two different entities' order_by.
+        Some(prev) if prev != entity_cap => {
+            let mut name;
+            loop {
+                *synth_counter += 1;
+                name = format!("order_by_{}", synth_counter);
+                if !header_var_types.contains_key(&name) && !retypes.contains_key(&name) {
+                    break;
+                }
+            }
+            name
+        }
+        _ => {
+            order_var_owner.insert(var.clone(), entity_cap.to_string());
+            var.clone()
+        }
+    };
+
+    retypes.insert(target_var.clone(), format!("[{}_order_by!]", entity_cap));
+    if let Some(dir) = dir_var.clone() {
+        dead_candidates.push(dir);
+    }
+
+    if !specs.iter().any(|sp| sp.target_var == target_var) {
+        specs.push(OrderBySpec {
+            target_var: target_var.clone(),
+            field_source: OrderValueSource::Variable(var),
+            direction_source: match (&dir_var, order_dir) {
+                (Some(d), _) => OrderValueSource::Variable(d.clone()),
+                (None, Some(lit)) => OrderValueSource::Literal(lit.to_string()),
+                (None, None) => OrderValueSource::Literal("asc".to_string()),
+            },
+            entity: entity_cap.to_string(),
+        });
+    }
+
+    Some(format!("order_by: ${}", target_var))
+}
+
+/// Rewrite an operation header's variable definitions: replace the declared type of
+/// any variable named in `retypes`, and remove any variable named in `removals`.
+///
+/// Rebuilds the definition list from kept spans rather than splicing in place, so a
+/// removal cannot leave a dangling comma and a retype discards a default value that
+/// would no longer typecheck. GraphQL treats commas as whitespace, so a declaration
+/// runs from its `$` up to the next top-level `$`.
+fn rewrite_variable_definitions(
+    header: &str,
+    retypes: &HashMap<String, String>,
+    removals: &HashSet<String>,
+) -> String {
+    if retypes.is_empty() && removals.is_empty() {
+        return header.to_string();
+    }
+
+    let chars: Vec<char> = header.chars().collect();
+    let open = chars.iter().position(|&c| c == '(');
+    let close = open.and_then(|o| match_paren(&chars, o));
+
+    let (open, close) = match (open, close) {
+        (Some(o), Some(c)) => (o, c),
+        // No definition list yet. A synthesized order_by variable still needs
+        // declaring, so build one; otherwise there is nothing to rewrite.
+        _ => {
+            let mut added: Vec<String> = retypes
+                .iter()
+                .map(|(name, ty)| format!("${}: {}", name, ty))
+                .collect();
+            if added.is_empty() {
+                return header.to_string();
+            }
+            added.sort();
+            return format!("{}({})", header.trim_end(), added.join(", "));
+        }
+    };
+
+    let inner = &chars[open + 1..close];
+
+    // Locate the start of each declaration.
+    let mut starts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut i = 0;
+    while i < inner.len() {
+        let c = inner[i];
+        if in_str {
+            if c == '\\' {
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                '$' if depth == 0 => starts.push(i),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (n, &start) in starts.iter().enumerate() {
+        let end = starts.get(n + 1).copied().unwrap_or(inner.len());
+        let span: String = inner[start..end].iter().collect();
+        let name: String = span[1..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+
+        seen.insert(name.clone());
+
+        if removals.contains(&name) {
+            continue;
+        }
+        match retypes.get(&name) {
+            Some(new_type) => kept.push(format!("${}: {}", name, new_type)),
+            None => kept.push(span.trim().trim_end_matches(',').trim().to_string()),
+        }
+    }
+
+    // A retype target the client never declared is one we synthesized (two root
+    // fields ordering by the same variable against different entities), so it
+    // needs a declaration of its own.
+    let mut added: Vec<String> = retypes
+        .iter()
+        .filter(|(name, _)| !seen.contains(*name))
+        .map(|(name, ty)| format!("${}: {}", name, ty))
+        .collect();
+    added.sort();
+    kept.extend(added);
+
+    let before: String = chars[..open].iter().collect();
+    let after: String = chars[close + 1..].iter().collect();
+
+    if kept.is_empty() {
+        // `query Q()` is a syntax error, so drop the whole list.
+        return format!("{}{}", before.trim_end(), after);
+    }
+    format!("{}({}){}", before, kept.join(", "), after)
+}
+
+/// Index of the `)` matching the `(` at `open`, skipping bracketed and quoted text.
+fn match_paren(chars: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut i = open;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_str {
+            if c == '\\' {
+                i += 2;
+                continue;
+            }
+            if c == '"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 && c == ')' {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Every `$name` token referenced in the converted operation body.
+///
+/// Selection sets have already had their argument lists stripped by
+/// `sanitize_selection_set`, so the only variable references left in the body are
+/// the root-field arguments this module emits — which makes this scan a complete
+/// answer to "is this declaration still used?".
+fn referenced_variables(body: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' {
+            let name: String = chars[i + 1..]
+                .iter()
+                .take_while(|c| c.is_alphanumeric() || **c == '_')
+                .collect();
+            i += 1 + name.chars().count();
+            if !name.is_empty() {
+                out.insert(name);
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Rewrite subgraph filter type names in a query header. Subgraph generates
@@ -958,42 +1416,206 @@ fn sanitize_fragment_arguments(fragment_text: &str) -> String {
 
 // Removed unused selection set helpers
 
-fn convert_meta_query(query: &str) -> Result<String, ConversionError> {
+/// Root-level field names of an operation, in source order.
+///
+/// Only the outermost selection set is inspected: nested fields, arguments and
+/// string literals are skipped, and an alias label is discarded in favour of the
+/// field it points at (`recent: streams` yields `streams`).
+///
+/// This exists so `_meta` can be recognized as a real root field rather than by
+/// substring, which also matches an entity like `token_metadata`.
+fn root_field_names(query: &str) -> Vec<String> {
+    let start = match query.find('{') {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let end = match query.rfind('}') {
+        Some(i) if i > start => i,
+        _ => return Vec::new(),
+    };
+    let body: Vec<char> = query[start + 1..end].chars().collect();
+
+    let mut names = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut i = 0;
+
+    while i < body.len() {
+        let c = body[i];
+
+        if in_str {
+            if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match c {
+            '"' => {
+                in_str = true;
+                i += 1;
+            }
+            '{' | '(' | '[' => {
+                depth += 1;
+                i += 1;
+            }
+            '}' | ')' | ']' => {
+                depth -= 1;
+                i += 1;
+            }
+            _ if depth == 0 && (c.is_alphabetic() || c == '_') => {
+                let name: String = body[i..]
+                    .iter()
+                    .take_while(|c| c.is_alphanumeric() || **c == '_')
+                    .collect();
+                i += name.chars().count();
+
+                // An alias label is followed by `:`; the field it names comes next.
+                let mut j = i;
+                while j < body.len() && body[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < body.len() && body[j] == ':' {
+                    i = j + 1;
+                } else {
+                    names.push(name);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    names
+}
+
+/// Which parts of a `_meta` selection the caller asked for.
+///
+/// Only `block { number }` maps onto Hyperindex (`chain_metadata`), plus the
+/// `__typename` introspection fields, which we can answer ourselves.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetaSelection {
+    pub block_number: bool,
+    pub typename: bool,
+    pub block_typename: bool,
+}
+
+/// Leaf paths a `_meta` selection may request and still be answered in full.
+const SERVABLE_META_PATHS: [&str; 3] = ["block.number", "__typename", "block.__typename"];
+
+fn convert_meta_query(query: &str) -> Result<(String, MetaSelection), ConversionError> {
     // Normalize whitespace: collapse all whitespace sequences into single spaces
     // This handles multiline queries like "_meta {\n    block {\n      number\n    }\n  }"
     let normalized: String = query.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    // Check if it's a simple _meta { block { number } } query
-    let simple_meta_pattern = "_meta { block { number } }";
-    let complex_meta_patterns = [
-        "block { hash",
-        "block { parentHash",
-        "block { timestamp",
-        "deployment",
-        "hasIndexingErrors",
-    ];
+    let selection = match extract_meta_selection(&normalized) {
+        Some(inner) => inner,
+        None => return Err(ConversionError::InvalidQueryFormat),
+    };
 
-    // Check for complex patterns (using normalized query)
-    for pattern in &complex_meta_patterns {
-        if normalized.contains(pattern) {
-            return Err(ConversionError::ComplexMetaQuery);
+    let requested = selection_leaf_paths(&selection);
+    if requested.is_empty() {
+        return Err(ConversionError::InvalidQueryFormat);
+    }
+
+    // Anything we cannot answer fails the whole query. Serving the rest would
+    // hand back an object that looks complete but silently omits fields — and a
+    // missing `hasIndexingErrors` reads as "no indexing errors".
+    let unsupported: Vec<String> = requested
+        .iter()
+        .filter(|path| !SERVABLE_META_PATHS.contains(&path.as_str()))
+        .cloned()
+        .collect();
+    if !unsupported.is_empty() {
+        return Err(ConversionError::ComplexMetaQuery(unsupported.join(", ")));
+    }
+
+    let meta = MetaSelection {
+        block_number: requested.iter().any(|p| p == "block.number"),
+        typename: requested.iter().any(|p| p == "__typename"),
+        block_typename: requested.iter().any(|p| p == "block.__typename"),
+    };
+
+    Ok((
+        "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}".to_string(),
+        meta,
+    ))
+}
+
+/// The contents of the `_meta { ... }` selection in a normalized query.
+fn extract_meta_selection(normalized: &str) -> Option<String> {
+    let meta_at = normalized.find("_meta")?;
+    let after: Vec<char> = normalized[meta_at..].chars().collect();
+    let open = after.iter().position(|&c| c == '{')?;
+
+    let mut depth = 0usize;
+    for (i, &c) in after[open..].iter().enumerate() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(after[open + 1..open + i].iter().collect());
+                }
+            }
+            _ => {}
         }
     }
+    None
+}
 
-    // Check if it's the simple pattern (using normalized query)
-    if normalized.contains(simple_meta_pattern) {
-        return Ok(
-            "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}".to_string(),
-        );
+/// Dotted leaf paths of a selection set: `block { number } deployment` yields
+/// `["block.number", "deployment"]`.
+fn selection_leaf_paths(selection: &str) -> Vec<String> {
+    let chars: Vec<char> = selection.chars().collect();
+    let mut paths = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut pending: Option<String> = None;
+
+    let join = |stack: &[String], leaf: &str| -> String {
+        if stack.is_empty() {
+            leaf.to_string()
+        } else {
+            format!("{}.{}", stack.join("."), leaf)
+        }
+    };
+
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_alphabetic() || c == '_' {
+            let name: String = chars[i..]
+                .iter()
+                .take_while(|c| c.is_alphanumeric() || **c == '_')
+                .collect();
+            i += name.chars().count();
+            // The previous identifier had no sub-selection, so it was a leaf.
+            if let Some(prev) = pending.replace(name) {
+                paths.push(join(&stack, &prev));
+            }
+            continue;
+        }
+        match c {
+            '{' => {
+                if let Some(parent) = pending.take() {
+                    stack.push(parent);
+                }
+                i += 1;
+            }
+            '}' => {
+                if let Some(prev) = pending.take() {
+                    paths.push(join(&stack, &prev));
+                }
+                stack.pop();
+                i += 1;
+            }
+            _ => i += 1,
+        }
     }
-
-    // If it's a _meta query but not the simple pattern, it's complex
-    if normalized.contains("_meta") {
-        return Err(ConversionError::ComplexMetaQuery);
+    if let Some(prev) = pending.take() {
+        paths.push(join(&stack, &prev));
     }
-
-    // This shouldn't happen, but just in case
-    Err(ConversionError::InvalidQueryFormat)
+    paths
 }
 
 fn flatten_where_map(mut map: HashMap<String, String>) -> HashMap<String, String> {
@@ -1021,11 +1643,24 @@ fn process_nested_filters_recursive(
     let mut child_conditions = Vec::new();
     let mut child_and_conditions = Vec::new();
 
+    // Subgraph's strict nested-entity filter carries a trailing underscore
+    // (`launch_: { quoteAsset: "USDC" }`). Strip it for both schema lookup and
+    // emission, matching what `translate_leaf_filter` already does on the
+    // JSON-variable path.
+    let parent = parent
+        .strip_suffix('_')
+        .filter(|p| !p.is_empty())
+        .unwrap_or(parent);
+
     // Check if parent itself is a nested path (e.g., "pair.token")
     // If so, recursively process the first part with the rest as a nested filter
     if parent.contains('.') {
         if let Some(dot_idx) = parent.find('.') {
             let first_part = &parent[..dot_idx];
+            let first_part = first_part
+                .strip_suffix('_')
+                .filter(|p| !p.is_empty())
+                .unwrap_or(first_part);
             let rest = &parent[dot_idx + 1..];
 
             // Get the nested entity type for first_part
@@ -1133,6 +1768,11 @@ fn convert_filters_to_where_clause(
             // This is a nested filter (e.g., "user.name_starts_with")
             if let Some(dot_idx) = key.rfind('.') {
                 let parent = &key[..dot_idx];
+                // `launch_: {...}` and `launch: {...}` name the same relation.
+                let parent = parent
+                    .strip_suffix('_')
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or(parent);
                 let child_key = &key[dot_idx + 1..];
 
                 grouped_filters
@@ -1200,15 +1840,27 @@ fn convert_filters_to_where_clause(
             }
         }
     }
-    if !and_conditions.is_empty() {
-        where_conditions.push(format!("_and: [{}]", and_conditions.join(", ")));
-    }
-
     // Add grouped nested filters (recursively handle arbitrary depth)
-    for (parent, child_filters) in grouped_filters {
+    //
+    // A relation can be constrained both by id (`launch_not_in: $ids`, emitted
+    // above as a basic filter) and by its own fields (`launch_: {quoteAsset: $q}`).
+    // Both render as `launch: {...}`, and a GraphQL object cannot carry the same
+    // key twice, so the nested half moves into `_and` — same meaning, valid syntax.
+    let mut sorted_parents: Vec<_> = grouped_filters.keys().cloned().collect();
+    sorted_parents.sort();
+    for parent in sorted_parents {
+        let child_filters = grouped_filters.remove(&parent).unwrap();
         let nested_condition =
             process_nested_filters_recursive(&parent, child_filters, entity_name)?;
-        where_conditions.push(nested_condition);
+        if basic_filters.contains_key(&parent) {
+            and_conditions.push(format!("{{{}}}", nested_condition));
+        } else {
+            where_conditions.push(nested_condition);
+        }
+    }
+
+    if !and_conditions.is_empty() {
+        where_conditions.push(format!("_and: [{}]", and_conditions.join(", ")));
     }
 
     if where_conditions.is_empty() {
@@ -1361,37 +2013,37 @@ fn convert_basic_filter_to_hasura_condition(
 
     if key.ends_with("_not_in") {
         let field = &key[..key.len() - 7];
-        return Ok(format!("{}: {{_nin: {}}}", field, value));
+        return Ok(nested_aware_condition(entity_name, field, "_nin", value));
     }
 
     if key.ends_with("_gte") {
         let field = &key[..key.len() - 4];
-        return Ok(format!("{}: {{_gte: {}}}", field, value));
+        return Ok(nested_aware_condition(entity_name, field, "_gte", value));
     }
 
     if key.ends_with("_lte") {
         let field = &key[..key.len() - 4];
-        return Ok(format!("{}: {{_lte: {}}}", field, value));
+        return Ok(nested_aware_condition(entity_name, field, "_lte", value));
     }
 
     if key.ends_with("_not") {
         let field = &key[..key.len() - 4];
-        return Ok(format!("{}: {{_neq: {}}}", field, value));
+        return Ok(nested_aware_condition(entity_name, field, "_neq", value));
     }
 
     if key.ends_with("_gt") {
         let field = &key[..key.len() - 3];
-        return Ok(format!("{}: {{_gt: {}}}", field, value));
+        return Ok(nested_aware_condition(entity_name, field, "_gt", value));
     }
 
     if key.ends_with("_lt") {
         let field = &key[..key.len() - 3];
-        return Ok(format!("{}: {{_lt: {}}}", field, value));
+        return Ok(nested_aware_condition(entity_name, field, "_lt", value));
     }
 
     if key.ends_with("_in") {
         let field = &key[..key.len() - 3];
-        return Ok(format!("{}: {{_in: {}}}", field, value));
+        return Ok(nested_aware_condition(entity_name, field, "_in", value));
     }
 
     // Handle unsupported filters
@@ -1520,7 +2172,10 @@ fn translate_leaf_filter(
     // must be applied to both functions.
 
     if let Some(field) = key.strip_suffix("_not_starts_with_nocase") {
-        not_accum.insert(field.to_string(), ilike_value(value, IlikeShape::StartsWith));
+        not_accum.insert(
+            field.to_string(),
+            ilike_value(value, IlikeShape::StartsWith),
+        );
         return;
     }
     if let Some(field) = key.strip_suffix("_not_ends_with_nocase") {
@@ -1532,7 +2187,10 @@ fn translate_leaf_filter(
         return;
     }
     if let Some(field) = key.strip_suffix("_starts_with_nocase") {
-        out.insert(field.to_string(), ilike_value(value, IlikeShape::StartsWith));
+        out.insert(
+            field.to_string(),
+            ilike_value(value, IlikeShape::StartsWith),
+        );
         return;
     }
     if let Some(field) = key.strip_suffix("_ends_with_nocase") {
@@ -1544,7 +2202,10 @@ fn translate_leaf_filter(
         return;
     }
     if let Some(field) = key.strip_suffix("_not_starts_with") {
-        not_accum.insert(field.to_string(), ilike_value(value, IlikeShape::StartsWith));
+        not_accum.insert(
+            field.to_string(),
+            ilike_value(value, IlikeShape::StartsWith),
+        );
         return;
     }
     if let Some(field) = key.strip_suffix("_not_ends_with") {
@@ -1556,7 +2217,10 @@ fn translate_leaf_filter(
         return;
     }
     if let Some(field) = key.strip_suffix("_starts_with") {
-        out.insert(field.to_string(), ilike_value(value, IlikeShape::StartsWith));
+        out.insert(
+            field.to_string(),
+            ilike_value(value, IlikeShape::StartsWith),
+        );
         return;
     }
     if let Some(field) = key.strip_suffix("_ends_with") {
@@ -1571,31 +2235,52 @@ fn translate_leaf_filter(
         return;
     }
     if let Some(field) = key.strip_suffix("_not_in") {
-        out.insert(field.to_string(), op_wrap("_nin", value.clone()));
+        out.insert(
+            field.to_string(),
+            nested_aware_value(entity_name, field, "_nin", value),
+        );
         return;
     }
     if let Some(field) = key.strip_suffix("_gte") {
-        out.insert(field.to_string(), op_wrap("_gte", value.clone()));
+        out.insert(
+            field.to_string(),
+            nested_aware_value(entity_name, field, "_gte", value),
+        );
         return;
     }
     if let Some(field) = key.strip_suffix("_lte") {
-        out.insert(field.to_string(), op_wrap("_lte", value.clone()));
+        out.insert(
+            field.to_string(),
+            nested_aware_value(entity_name, field, "_lte", value),
+        );
         return;
     }
     if let Some(field) = key.strip_suffix("_not") {
-        out.insert(field.to_string(), op_wrap("_neq", value.clone()));
+        out.insert(
+            field.to_string(),
+            nested_aware_value(entity_name, field, "_neq", value),
+        );
         return;
     }
     if let Some(field) = key.strip_suffix("_gt") {
-        out.insert(field.to_string(), op_wrap("_gt", value.clone()));
+        out.insert(
+            field.to_string(),
+            nested_aware_value(entity_name, field, "_gt", value),
+        );
         return;
     }
     if let Some(field) = key.strip_suffix("_lt") {
-        out.insert(field.to_string(), op_wrap("_lt", value.clone()));
+        out.insert(
+            field.to_string(),
+            nested_aware_value(entity_name, field, "_lt", value),
+        );
         return;
     }
     if let Some(field) = key.strip_suffix("_in") {
-        out.insert(field.to_string(), op_wrap("_in", value.clone()));
+        out.insert(
+            field.to_string(),
+            nested_aware_value(entity_name, field, "_in", value),
+        );
         return;
     }
 
@@ -1647,6 +2332,36 @@ fn translate_leaf_filter(
     }
 
     out.insert(target_key.to_string(), op_wrap("_eq", value.clone()));
+}
+
+/// Build an operator condition for `field`, routing through `id` when `field`
+/// is an entity reference rather than a scalar column.
+///
+/// Subgraph lets you filter an entity reference by its id directly
+/// (`launch_in: [$ids]`); Hasura requires that hop to be spelled out
+/// (`launch: {id: {_in: [$ids]}}`) and rejects a bare operator on a
+/// `*_bool_exp`. The unsuffixed form is already handled further down
+/// `convert_basic_filter_to_hasura_condition`; this keeps the suffixed
+/// operators consistent with it.
+fn nested_aware_condition(entity_name: &str, field: &str, op: &str, value: &str) -> String {
+    if schema::is_nested_entity(entity_name, field) {
+        format!("{}: {{id: {{{}: {}}}}}", field, op, value)
+    } else {
+        format!("{}: {{{}: {}}}", field, op, value)
+    }
+}
+
+/// JSON-path counterpart of `nested_aware_condition`, for filters that arrive
+/// as a variable value rather than inline in the query text.
+fn nested_aware_value(entity_name: &str, field: &str, op: &str, value: &Value) -> Value {
+    let condition = op_wrap(op, value.clone());
+    if schema::is_nested_entity(entity_name, field) {
+        let mut id_wrapper = serde_json::Map::new();
+        id_wrapper.insert("id".to_string(), condition);
+        Value::Object(id_wrapper)
+    } else {
+        condition
+    }
 }
 
 fn op_wrap(op: &str, value: Value) -> Value {
@@ -1904,6 +2619,13 @@ fn parse_single_param(
 // Removed unused brace matching helper
 
 fn singularize_and_capitalize(s: &str) -> String {
+    // Prefer an entity the schema actually declares. Word rules cannot recover
+    // `TxTransfers` from `txTransferses`, and a wrong guess queries a table that
+    // does not exist — which surfaces as an empty list, not an error.
+    if let Some(entity) = schema::resolve_entity_for_collection_field(s) {
+        return entity;
+    }
+
     // Improved singularization to cover common English plural forms used in schema entity names
     // First, handle irregulars explicitly
     let lower = s.to_lowercase();
@@ -1962,10 +2684,7 @@ mod tests {
     // the populate runs exactly once, atomically — concurrent callers block
     // until the first call completes.
     fn init_test_schema_if_needed() {
-        static INIT_TEST_SCHEMA: std::sync::Once = std::sync::Once::new();
-        INIT_TEST_SCHEMA.call_once(|| {
-            schema::init_test_schema();
-        });
+        schema::init_test_schema_once();
     }
 
     #[test]
@@ -2050,28 +2769,119 @@ mod tests {
         assert_eq!(result.query, expected);
     }
 
+    /// A `_meta` selection is answered in full or not at all.
+    ///
+    /// Serving `block { number }` and quietly omitting `hash` would hand back an
+    /// object the caller cannot tell from a complete one.
     #[test]
-    fn test_meta_query_complex() {
-        let payload = create_test_payload("query { _meta { block { hash number } } }");
-        let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
-        assert!(result.is_err());
-        match result {
-            Err(ConversionError::ComplexMetaQuery) => {}
-            _ => panic!("Expected ComplexMetaQuery error"),
+    fn test_meta_query_rejects_any_unservable_field() {
+        for (query, expected) in [
+            ("query { _meta { block { hash number } } }", "block.hash"),
+            (
+                "query {\n  _meta {\n    block {\n      hash\n      number\n    }\n  }\n}",
+                "block.hash",
+            ),
+            (
+                "query { _meta { block { number timestamp } } }",
+                "block.timestamp",
+            ),
+            (
+                "query { _meta { block { number } deployment } }",
+                "deployment",
+            ),
+        ] {
+            let payload = create_test_payload(query);
+            match convert_subgraph_to_hyperindex(&payload, Some("1")) {
+                Err(ConversionError::ComplexMetaQuery(fields)) => assert_eq!(
+                    fields, expected,
+                    "the error should name the unservable field(s) for {}",
+                    query
+                ),
+                other => panic!(
+                    "expected ComplexMetaQuery for {}, got {:?}",
+                    query,
+                    other.map(|r| r.query)
+                ),
+            }
         }
     }
 
+    /// Argus `Meta`, verbatim. It asks for two fields Hyperindex cannot answer,
+    /// so it is rejected rather than answered partially.
     #[test]
-    fn test_meta_query_complex_multiline() {
-        // Complex meta query with multiline format should also fail
+    fn test_meta_query_argus_verbatim_is_rejected() {
         let payload = create_test_payload(
-            "query {\n  _meta {\n    block {\n      hash\n      number\n    }\n  }\n}",
+            "query Meta { _meta { block { number timestamp } hasIndexingErrors } }",
         );
+        match convert_subgraph_to_hyperindex(&payload, Some("5042")) {
+            Err(ConversionError::ComplexMetaQuery(fields)) => {
+                assert_eq!(fields, "block.timestamp, hasIndexingErrors")
+            }
+            other => panic!("expected ComplexMetaQuery, got {:?}", other.map(|r| r.query)),
+        }
+    }
+
+    /// Reducing that query to what Hyperindex can serve makes it work.
+    #[test]
+    fn test_meta_query_argus_reduced_to_block_number_succeeds() {
+        let payload = create_test_payload("query Meta { _meta { block { number } } }");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("5042")).unwrap();
+        assert_eq!(
+            result.query["query"].as_str().unwrap(),
+            "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
+        );
+        assert!(result.meta_selection.is_some());
+        assert_eq!(
+            result.meta_selection,
+            Some(MetaSelection {
+                block_number: true,
+                typename: false,
+                block_typename: false,
+            })
+        );
+    }
+
+    /// `__typename` is answered locally, so it does not make a query unservable.
+    /// Clients that inject it automatically keep working.
+    #[test]
+    fn test_meta_query_allows_typename() {
+        let payload =
+            create_test_payload("query { _meta { __typename block { number __typename } } }");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        assert_eq!(
+            result.meta_selection,
+            Some(MetaSelection {
+                block_number: true,
+                typename: true,
+                block_typename: true,
+            })
+        );
+    }
+
+    #[test]
+    fn selection_leaf_paths_walks_nested_selections() {
+        assert_eq!(
+            selection_leaf_paths("block { number timestamp } hasIndexingErrors"),
+            vec![
+                "block.number".to_string(),
+                "block.timestamp".to_string(),
+                "hasIndexingErrors".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_meta_query_block_number_token_is_not_matched_by_prefix() {
+        // `blockNumber` must not be mistaken for `block { number }`; nothing here
+        // is servable, so this still fails loudly.
+        let payload = create_test_payload("query { _meta { block { blockNumber } } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
-        assert!(result.is_err());
         match result {
-            Err(ConversionError::ComplexMetaQuery) => {}
-            _ => panic!("Expected ComplexMetaQuery error"),
+            Err(ConversionError::ComplexMetaQuery(_)) => {}
+            other => panic!(
+                "Expected ComplexMetaQuery error, got {:?}",
+                other.map(|r| r.query)
+            ),
         }
     }
 
@@ -2082,7 +2892,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
         assert!(result.is_err());
         match result {
-            Err(ConversionError::ComplexMetaQuery) => {}
+            Err(ConversionError::ComplexMetaQuery(_)) => {}
             _ => panic!("Expected ComplexMetaQuery error"),
         }
     }
@@ -2094,7 +2904,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
         assert!(result.is_err());
         match result {
-            Err(ConversionError::ComplexMetaQuery) => {}
+            Err(ConversionError::ComplexMetaQuery(_)) => {}
             _ => panic!("Expected ComplexMetaQuery error"),
         }
     }
@@ -2107,7 +2917,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
         assert!(result.is_err());
         match result {
-            Err(ConversionError::ComplexMetaQuery) => {}
+            Err(ConversionError::ComplexMetaQuery(_)) => {}
             _ => panic!("Expected ComplexMetaQuery error"),
         }
     }
@@ -3753,13 +4563,19 @@ mod tests {
     #[test]
     fn rewrite_filter_type_names_basic() {
         let h = "query Q($where: Trade_filter)";
-        assert_eq!(rewrite_filter_type_names(h), "query Q($where: Trade_bool_exp)");
+        assert_eq!(
+            rewrite_filter_type_names(h),
+            "query Q($where: Trade_bool_exp)"
+        );
     }
 
     #[test]
     fn rewrite_filter_type_names_non_null() {
         let h = "query Q($where: Trade_filter!)";
-        assert_eq!(rewrite_filter_type_names(h), "query Q($where: Trade_bool_exp!)");
+        assert_eq!(
+            rewrite_filter_type_names(h),
+            "query Q($where: Trade_bool_exp!)"
+        );
     }
 
     #[test]
@@ -3868,7 +4684,13 @@ mod tests {
         let out_obj = out.as_object().unwrap();
         assert_eq!(out_obj["amount"].as_object().unwrap().len(), 1);
         assert!(["_gt", "_gte", "_lt", "_lte"].contains(
-            &out_obj["amount"].as_object().unwrap().keys().next().unwrap().as_str()
+            &out_obj["amount"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next()
+                .unwrap()
+                .as_str()
         ));
         // Spot-check that each op individually translates correctly.
         for (suffix, op) in [
@@ -3909,7 +4731,12 @@ mod tests {
         for (suffix, pattern) in cases {
             let v = json!({ suffix: "X" });
             let out = translate_subgraph_filter_value(&v, "Pair");
-            assert_eq!(out, json!({ "name": { "_ilike": pattern } }), "suffix {}", suffix);
+            assert_eq!(
+                out,
+                json!({ "name": { "_ilike": pattern } }),
+                "suffix {}",
+                suffix
+            );
         }
     }
 
@@ -4118,10 +4945,22 @@ mod tests {
     #[test]
     fn translate_non_object_passes_through() {
         init_test_schema_if_needed();
-        assert_eq!(translate_subgraph_filter_value(&Value::Null, "Trade"), Value::Null);
-        assert_eq!(translate_subgraph_filter_value(&json!(42), "Trade"), json!(42));
-        assert_eq!(translate_subgraph_filter_value(&json!("x"), "Trade"), json!("x"));
-        assert_eq!(translate_subgraph_filter_value(&json!([1, 2]), "Trade"), json!([1, 2]));
+        assert_eq!(
+            translate_subgraph_filter_value(&Value::Null, "Trade"),
+            Value::Null
+        );
+        assert_eq!(
+            translate_subgraph_filter_value(&json!(42), "Trade"),
+            json!(42)
+        );
+        assert_eq!(
+            translate_subgraph_filter_value(&json!("x"), "Trade"),
+            json!("x")
+        );
+        assert_eq!(
+            translate_subgraph_filter_value(&json!([1, 2]), "Trade"),
+            json!([1, 2])
+        );
     }
 
     #[test]
@@ -4193,10 +5032,18 @@ mod tests {
             "Expected Trade_bool_exp in header, got: {}",
             query
         );
-        assert!(!query.contains("Trade_filter"), "Should not contain Trade_filter, got: {}", query);
+        assert!(
+            !query.contains("Trade_filter"),
+            "Should not contain Trade_filter, got: {}",
+            query
+        );
 
         // Where clause forwards the variable verbatim.
-        assert!(query.contains("where: $where"), "Expected where: $where, got: {}", query);
+        assert!(
+            query.contains("where: $where"),
+            "Expected where: $where, got: {}",
+            query
+        );
 
         // Variable value translated to Hasura shape.
         let translated_where = &result.query["variables"]["where"];
@@ -4434,5 +5281,543 @@ mod tests {
         assert!(result.filter_variable_entities.is_empty());
         let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("$first"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Argus production queries (see `test-queries.md`).
+    //
+    // Three converter bugs surfaced by their 31-query client. Each is pinned here
+    // with the query text exactly as they send it.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn argus_payload(query: &str, variables: Value) -> Value {
+        json!({ "query": query, "variables": variables })
+    }
+
+    // ---- Cause A: order arguments passed as variables ----
+
+    /// Argus `SwapsOf`: literal `orderBy`, variable `orderDirection`.
+    ///
+    /// Previously the whole `order_by` argument was dropped, so this returned
+    /// arbitrarily-ordered rows with a 200.
+    #[test]
+    fn argus_swaps_of_order_direction_variable() {
+        init_test_schema_if_needed();
+        let payload = argus_payload(
+            "query SwapsOf($launch: Bytes!, $from: BigInt!, $first: Int!, $skip: Int!, $direction: OrderDirection!) { swaps(first: $first, skip: $skip, where: { launch: $launch, timestamp_gte: $from }, orderBy: ordinal, orderDirection: $direction) { id ordinal } }",
+            json!({"launch": "0xabc", "from": "100", "first": 50, "skip": 0, "direction": "desc"}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, Some("5042")).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+
+        assert!(
+            query.contains("order_by: {ordinal: $direction}"),
+            "ordering must survive a variable direction: {}",
+            query
+        );
+        assert!(
+            query.contains("$direction: order_by!"),
+            "OrderDirection has no Hasura equivalent: {}",
+            query
+        );
+        assert!(!query.contains("OrderDirection"), "{}", query);
+        // The client's own value is already a valid `order_by` enum value.
+        assert_eq!(result.query["variables"]["direction"], json!("desc"));
+    }
+
+    #[test]
+    fn order_direction_variable_preserves_nullability() {
+        let payload = argus_payload(
+            "query Q($direction: OrderDirection) { swaps(orderBy: ordinal, orderDirection: $direction) { id } }",
+            json!({}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("$direction: order_by)"), "{}", query);
+        assert!(!query.contains("order_by!"), "{}", query);
+    }
+
+    /// Argus `LaunchKeyPage`: the order field itself is a variable.
+    ///
+    /// GraphQL has no variable object keys, so the client's `$orderBy` is retyped
+    /// to `[Launch_order_by!]` and its value rebuilt as `[{field: direction}]`.
+    #[test]
+    fn argus_launch_key_page_order_by_variable() {
+        init_test_schema_if_needed();
+        let payload = argus_payload(
+            "query LaunchKeyPage($where: Launch_filter!, $orderBy: Launch_orderBy!, $direction: OrderDirection!, $first: Int!) { launches(first: $first, where: $where, orderBy: $orderBy, orderDirection: $direction) { id key: createdAt } }",
+            json!({"where": {"dividendsPaid_gt": "0"}, "orderBy": "createdAt", "direction": "desc", "first": 25}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+
+        assert!(query.contains("order_by: $orderBy"), "{}", query);
+        assert!(query.contains("$orderBy: [Launch_order_by!]"), "{}", query);
+        assert!(!query.contains("Launch_orderBy"), "{}", query);
+        // `$direction` is folded into the rebuilt value, so its declaration would
+        // be unused — and GraphQL rejects an unused variable definition.
+        assert!(!query.contains("$direction"), "{}", query);
+        assert!(query.contains("$where: Launch_bool_exp!"), "{}", query);
+
+        let vars = &result.query["variables"];
+        assert_eq!(vars["orderBy"], json!([{"createdAt": "desc"}]));
+        assert_eq!(vars["where"], json!({"dividendsPaid": {"_gt": "0"}}));
+        assert!(vars.get("direction").is_none(), "vars: {}", vars);
+
+        assert_eq!(result.dropped_variables, vec!["direction".to_string()]);
+        assert_eq!(result.order_by_variables.len(), 1);
+        assert_eq!(result.order_by_variables[0].target_var, "orderBy");
+        assert_eq!(result.order_by_variables[0].entity, "Launch");
+    }
+
+    #[test]
+    fn order_by_variable_defaults_direction_to_asc() {
+        let payload = argus_payload(
+            "query Q($ob: Launch_orderBy!) { launches(orderBy: $ob) { id } }",
+            json!({"ob": "createdAt"}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(
+            result.query["variables"]["ob"],
+            json!([{"createdAt": "asc"}])
+        );
+    }
+
+    #[test]
+    fn order_by_variable_with_literal_direction() {
+        let payload = argus_payload(
+            "query Q($ob: Launch_orderBy!) { launches(orderBy: $ob, orderDirection: desc) { id } }",
+            json!({"ob": "createdAt"}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(
+            result.query["variables"]["ob"],
+            json!([{"createdAt": "desc"}])
+        );
+    }
+
+    #[test]
+    fn order_by_variable_missing_value_is_safe() {
+        // No `ob` key in the payload: leave the variable unset so Hasura simply
+        // doesn't order, rather than failing the request.
+        let payload = argus_payload(
+            "query Q($ob: Launch_orderBy!) { launches(orderBy: $ob) { id } }",
+            json!({}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert!(result.query["variables"].get("ob").is_none());
+    }
+
+    #[test]
+    fn order_by_variable_normalizes_uppercase_direction() {
+        // Hasura matches its enum exactly; subgraph clients sometimes send `DESC`.
+        let payload = argus_payload(
+            "query Q($ob: Launch_orderBy!, $dir: OrderDirection!) { launches(orderBy: $ob, orderDirection: $dir) { id } }",
+            json!({"ob": "createdAt", "dir": "DESC"}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(
+            result.query["variables"]["ob"],
+            json!([{"createdAt": "desc"}])
+        );
+    }
+
+    #[test]
+    fn order_by_variable_expands_nested_field_syntax() {
+        // Subgraph spells nested ordering `parent__child`.
+        let payload = argus_payload(
+            "query Q($ob: Swap_orderBy!) { swaps(orderBy: $ob, orderDirection: desc) { id } }",
+            json!({"ob": "launch__createdAt"}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(
+            result.query["variables"]["ob"],
+            json!([{"launch": {"createdAt": "desc"}}])
+        );
+    }
+
+    #[test]
+    fn literal_nested_order_by_expands_too() {
+        let payload = create_test_payload(
+            "query { swaps(orderBy: launch__createdAt, orderDirection: desc) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("order_by: {launch: {createdAt: desc}}"),
+            "{}",
+            query
+        );
+    }
+
+    #[test]
+    fn order_direction_variable_without_order_by_drops_declaration() {
+        // Nothing to order by, so the variable is unused — and an unused
+        // declaration is a GraphQL validation error.
+        let payload = argus_payload(
+            "query Q($direction: OrderDirection!) { swaps(orderDirection: $direction) { id } }",
+            json!({"direction": "desc"}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(!query.contains("order_by"), "{}", query);
+        assert!(!query.contains("$direction"), "{}", query);
+        // The whole definition list is gone, so the parens must go with it.
+        assert!(query.starts_with("query Q {"), "{}", query);
+        assert!(result.query["variables"].get("direction").is_none());
+    }
+
+    #[test]
+    fn same_order_by_variable_across_two_entities_synthesizes_second() {
+        // One variable cannot be typed as both `[Launch_order_by!]` and
+        // `[Swap_order_by!]`.
+        let payload = argus_payload(
+            "query Q($ob: String!) { launches(orderBy: $ob) { id } swaps(orderBy: $ob) { id } }",
+            json!({"ob": "createdAt"}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("$ob: [Launch_order_by!]"), "{}", query);
+        assert!(query.contains("$order_by_1: [Swap_order_by!]"), "{}", query);
+        assert!(query.contains("order_by: $order_by_1"), "{}", query);
+        assert_eq!(result.order_by_variables.len(), 2);
+    }
+
+    #[test]
+    fn order_by_variable_shared_by_same_entity_is_not_duplicated() {
+        let payload = argus_payload(
+            "query Q($ob: String!) { launches(orderBy: $ob) { id } launches(orderBy: $ob) { name } }",
+            json!({"ob": "createdAt"}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(!query.contains("order_by_1"), "{}", query);
+        assert_eq!(result.order_by_variables.len(), 1);
+    }
+
+    // ---- Cause B: operator suffixes on entity-reference fields ----
+
+    /// Argus `HoursOfLaunches`: `launch_in` filters a relation by id.
+    ///
+    /// Previously emitted `launch: {_in: $ids}`, which Hasura rejects because
+    /// `_in` is not a field of `Launch_bool_exp`.
+    #[test]
+    fn argus_hours_of_launches_nested_in_filter() {
+        init_test_schema_if_needed();
+        let payload = argus_payload(
+            "query HoursOfLaunches($ids: [Bytes!]!, $since: BigInt!, $cursor: Bytes!, $first: Int!) { launchHourDatas(first: $first, where: { launch_in: $ids, periodStart_gte: $since, id_gt: $cursor }, orderBy: id) { id periodStart } }",
+            json!({"ids": ["0xa"], "since": "1", "cursor": "", "first": 10}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, Some("5042")).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+
+        assert!(query.contains("launch: {id: {_in: $ids}}"), "{}", query);
+        // A scalar `id_gt` must be untouched by the same change.
+        assert!(query.contains("id: {_gt: $cursor}"), "{}", query);
+        assert!(query.contains("periodStart: {_gte: $since}"), "{}", query);
+        assert!(query.contains("order_by: {id: asc}"), "{}", query);
+    }
+
+    #[test]
+    fn argus_days_of_launches_nested_in_filter() {
+        init_test_schema_if_needed();
+        let payload = argus_payload(
+            "query DaysOfLaunches($ids: [Bytes!]!, $since: BigInt!, $cursor: Bytes!, $first: Int!) { launchDayDatas(first: $first, where: { launch_in: $ids, periodStart_gte: $since, id_gt: $cursor }, orderBy: id) { id } }",
+            json!({"ids": ["0xa"], "since": "1", "cursor": "", "first": 10}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, Some("5042")).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("launch: {id: {_in: $ids}}"), "{}", query);
+    }
+
+    #[test]
+    fn nested_not_in_filter_routes_through_id() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swaps(where: { launch_not_in: [\"0xa\", \"0xb\"] }) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("launch: {id: {_nin: [\"0xa\", \"0xb\"]}}"),
+            "{}",
+            query
+        );
+    }
+
+    #[test]
+    fn scalar_in_filter_is_unaffected_by_nested_routing() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { launches(where: { id_in: [\"0xa\"] }) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("id: {_in: [\"0xa\"]}"), "{}", query);
+        assert!(!query.contains("{id: {id:"), "{}", query);
+    }
+
+    /// The same bug existed on the JSON path, which is what a whole-`where`
+    /// variable travels through.
+    #[test]
+    fn nested_in_filter_translates_on_json_variable_path() {
+        init_test_schema_if_needed();
+        let translated = translate_subgraph_filter_value(
+            &json!({"launch_in": ["0xa"], "periodStart_gte": "1"}),
+            "LaunchHourData",
+        );
+        assert_eq!(
+            translated,
+            json!({"launch": {"id": {"_in": ["0xa"]}}, "periodStart": {"_gte": "1"}})
+        );
+    }
+
+    #[test]
+    fn nested_not_in_filter_translates_on_json_variable_path() {
+        init_test_schema_if_needed();
+        let translated =
+            translate_subgraph_filter_value(&json!({"launch_not_in": ["0xa"]}), "Swap");
+        assert_eq!(translated, json!({"launch": {"id": {"_nin": ["0xa"]}}}));
+    }
+
+    /// Argus `FallenBack` constrains the same relation twice: by id
+    /// (`launch_not_in`) and by one of its own fields (`launch_: {...}`). Both
+    /// render as `launch: {...}`, and a GraphQL object cannot repeat a key.
+    #[test]
+    fn relation_filtered_by_id_and_by_field_does_not_duplicate_key() {
+        init_test_schema_if_needed();
+        let payload = argus_payload(
+            "query FallenBack($exclude: [String!]!, $quote: String!, $first: Int!) { swaps(first: $first, where: { launch_not_in: $exclude, launch_: { quoteAsset: $quote } }, orderBy: ordinal, orderDirection: desc) { ordinal } }",
+            json!({"exclude": ["0xa"], "quote": "USDC", "first": 5}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, Some("5042")).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+
+        assert!(
+            query.contains("launch: {id: {_nin: $exclude}}"),
+            "{}",
+            query
+        );
+        assert!(
+            query.contains("_and: [{launch: {quoteAsset: {_eq: $quote}}}]"),
+            "{}",
+            query
+        );
+        // The strict-nested spelling must not leak through.
+        assert!(!query.contains("launch_:"), "{}", query);
+        let where_start = query.find("where: {").unwrap();
+        assert_eq!(
+            query[where_start..].matches("launch: {").count(),
+            2,
+            "one at top level, one inside _and: {}",
+            query
+        );
+    }
+
+    #[test]
+    fn strict_nested_relation_syntax_is_stripped_inline() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swaps(where: { launch_: { quoteAsset: \"USDC\" } }) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("launch: {quoteAsset: {_eq: \"USDC\"}}"),
+            "{}",
+            query
+        );
+        assert!(!query.contains("launch_"), "{}", query);
+    }
+
+    // ---- `rewrite_variable_definitions` ----
+
+    fn retype(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn remove(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn rewrite_vardefs_retypes_preserving_position() {
+        let out = rewrite_variable_definitions(
+            "query Q($a: Int!, $d: OrderDirection!, $b: String)",
+            &retype(&[("d", "order_by!")]),
+            &HashSet::new(),
+        );
+        assert_eq!(out, "query Q($a: Int!, $d: order_by!, $b: String)");
+    }
+
+    #[test]
+    fn rewrite_vardefs_removes_middle_declaration_cleanly() {
+        let out = rewrite_variable_definitions(
+            "query Q($a: Int!, $d: OrderDirection!, $b: String)",
+            &HashMap::new(),
+            &remove(&["d"]),
+        );
+        assert_eq!(out, "query Q($a: Int!, $b: String)");
+    }
+
+    #[test]
+    fn rewrite_vardefs_removing_last_declaration_drops_parens() {
+        let out = rewrite_variable_definitions(
+            "query Q($d: OrderDirection!)",
+            &HashMap::new(),
+            &remove(&["d"]),
+        );
+        assert_eq!(out, "query Q");
+    }
+
+    #[test]
+    fn rewrite_vardefs_handles_comma_less_list() {
+        // GraphQL treats commas as whitespace, so they are optional.
+        let out = rewrite_variable_definitions(
+            "query Q($a: Int $d: OrderDirection!)",
+            &retype(&[("d", "order_by!")]),
+            &HashSet::new(),
+        );
+        assert_eq!(out, "query Q($a: Int, $d: order_by!)");
+    }
+
+    #[test]
+    fn rewrite_vardefs_retype_drops_incompatible_default() {
+        // `= createdAt` would not typecheck against `[Launch_order_by!]`.
+        let out = rewrite_variable_definitions(
+            "query Q($ob: Launch_orderBy! = createdAt)",
+            &retype(&[("ob", "[Launch_order_by!]")]),
+            &HashSet::new(),
+        );
+        assert_eq!(out, "query Q($ob: [Launch_order_by!])");
+    }
+
+    #[test]
+    fn rewrite_vardefs_preserves_default_on_untouched_declaration() {
+        let out = rewrite_variable_definitions(
+            "query Q($a: Int = 5, $d: OrderDirection!)",
+            &retype(&[("d", "order_by!")]),
+            &HashSet::new(),
+        );
+        assert_eq!(out, "query Q($a: Int = 5, $d: order_by!)");
+    }
+
+    #[test]
+    fn rewrite_vardefs_adds_a_declaration_it_has_not_seen() {
+        // A synthesized order_by variable has no declaration to rewrite.
+        let out = rewrite_variable_definitions(
+            "query Q($a: Int!)",
+            &retype(&[("order_by_1", "[Swap_order_by!]")]),
+            &HashSet::new(),
+        );
+        assert_eq!(out, "query Q($a: Int!, $order_by_1: [Swap_order_by!])");
+    }
+
+    #[test]
+    fn rewrite_vardefs_creates_a_list_when_the_header_has_none() {
+        let out = rewrite_variable_definitions(
+            "query Q",
+            &retype(&[("order_by_1", "[Swap_order_by!]")]),
+            &HashSet::new(),
+        );
+        assert_eq!(out, "query Q($order_by_1: [Swap_order_by!])");
+    }
+
+    #[test]
+    fn rewrite_vardefs_is_a_noop_without_work() {
+        let header = "query Q($a: Int!)";
+        assert_eq!(
+            rewrite_variable_definitions(header, &HashMap::new(), &HashSet::new()),
+            header
+        );
+    }
+
+    #[test]
+    fn referenced_variables_matches_whole_tokens() {
+        let found = referenced_variables("  Launch(limit: $first, order_by: $orderBy) {\n  id\n}");
+        assert!(found.contains("first"));
+        assert!(found.contains("orderBy"));
+        // `$order` must not be found merely because `$orderBy` is present.
+        assert!(!found.contains("order"));
+    }
+
+    /// A variable still referenced elsewhere must never be removed.
+    #[test]
+    fn direction_variable_still_used_elsewhere_is_kept() {
+        let payload = argus_payload(
+            "query Q($dir: OrderDirection!) { launches(orderBy: $dir) { id } swaps(orderBy: ordinal, orderDirection: $dir) { id } }",
+            json!({"dir": "desc"}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        // First field repurposes `$dir` as the Launch order_by, second still
+        // references it as a direction — so it must stay declared.
+        assert!(query.contains("$dir"), "{}", query);
+    }
+
+    // ---- Regressions the Argus write-up asks to be pinned ----
+    //
+    // These pass today. They are pinned because breaking them returns an empty
+    // list rather than an error, which their UI cannot distinguish from "no rows".
+
+    #[test]
+    fn argus_root_field_plurals_singularize_exactly() {
+        for (field, entity) in [
+            ("launches", "Launch"),
+            ("swaps", "Swap"),
+            ("holders", "Holder"),
+            ("launchHourDatas", "LaunchHourData"),
+            ("launchDayDatas", "LaunchDayData"),
+            ("protocolDayDatas", "ProtocolDayData"),
+            ("txTransferses", "TxTransfers"),
+        ] {
+            let payload = create_test_payload(&format!("query {{ {}(first: 1) {{ id }} }}", field));
+            let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+            let query = result.query["query"].as_str().unwrap();
+            assert!(
+                query.contains(&format!("{}(limit: 1)", entity)),
+                "{} should convert to {}: {}",
+                field,
+                entity,
+                query
+            );
+            assert_eq!(result.field_name_map.get(entity), Some(&field.to_string()));
+        }
+    }
+
+    /// Their paging is `id_gt` over `orderBy: id`. If id encoding or ordering
+    /// changed, paging would silently skip or repeat rows.
+    #[test]
+    fn argus_keyset_pagination_round_trips_unchanged() {
+        let payload = argus_payload(
+            "query Launches($cursor: Bytes!, $first: Int!) { launches(first: $first, where: { id_gt: $cursor }, orderBy: id) { id name } }",
+            json!({"cursor": "0xaa", "first": 500}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, Some("5042")).unwrap();
+        assert_eq!(
+            result.query["query"].as_str().unwrap(),
+            "query Launches($cursor: String!, $first: Int!) {\n  Launch(limit: $first, order_by: {id: asc}, where: {chainId: {_eq: \"5042\"}, id: {_gt: $cursor}}) {\n    id name\n  }\n}"
+        );
+        // The cursor value must be forwarded byte-for-byte and stay lowercase.
+        assert_eq!(result.query["variables"]["cursor"], json!("0xaa"));
+    }
+
+    #[test]
+    fn regression_literal_order_by_output_is_unchanged() {
+        let payload = create_test_payload(
+            "query { streams(first: 10, orderBy: name, orderDirection: desc) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("order_by: {name: desc}"), "{}", query);
+    }
+
+    #[test]
+    fn regression_literal_order_by_defaults_to_asc() {
+        let payload = create_test_payload("query { streams(orderBy: name) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("order_by: {name: asc}"), "{}", query);
     }
 }

@@ -480,3 +480,104 @@ query {
     let expected = "fragment ActionFields on Action {id\n  block\n  category\n  chainId}\nfragment AssetFields on Asset {id\n  address\n  chainId\n  decimals}\nquery {\n  Action(limit: 5, where: {chainId: {_eq: \"1\"}}) {\n    ...ActionFields\n  }\n  Asset(limit: 5, where: {chainId: {_eq: \"1\"}}) {\n    ...AssetFields\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Argus production queries (test-queries.md).
+//
+// Byte-exact goldens for the queries that exercise the three converter bugs
+// their 31-query client hit. Unit-level coverage lives in `conversion::tests`;
+// these pin the complete output string so formatting drift is caught too.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Like `assert_converts_to`, but also asserts the forwarded variables. The
+/// order-argument and whole-`where` rewrites both happen in the variable
+/// payload, so they cannot be pinned without it.
+fn assert_converts_with_variables(
+    subgraph_query: &str,
+    variables: Value,
+    expected_query: &str,
+    expected_variables: Value,
+) {
+    crate::schema::init_test_schema_once();
+    let payload = json!({ "query": subgraph_query, "variables": variables });
+    let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("5042"))
+        .expect("conversion should succeed");
+    assert_eq!(
+        result.query["query"].as_str().expect("query is a string"),
+        expected_query
+    );
+    assert_eq!(result.query["variables"], expected_variables);
+}
+
+#[test]
+fn argus_launch_key_page_end_to_end() {
+    assert_converts_with_variables(
+        "query LaunchKeyPage($where: Launch_filter!, $orderBy: Launch_orderBy!, $direction: OrderDirection!, $first: Int!) { launches(first: $first, where: $where, orderBy: $orderBy, orderDirection: $direction) { id key: createdAt } }",
+        json!({"where": {"dividendsPaid_gt": "0"}, "orderBy": "createdAt", "direction": "desc", "first": 25}),
+        "query LaunchKeyPage($where: Launch_bool_exp!, $orderBy: [Launch_order_by!], $first: Int!) {\n  Launch(limit: $first, order_by: $orderBy, where: $where) {\n    id key: createdAt\n  }\n}",
+        json!({"where": {"dividendsPaid": {"_gt": "0"}}, "orderBy": [{"createdAt": "desc"}], "first": 25}),
+    );
+}
+
+#[test]
+fn argus_swaps_of_end_to_end() {
+    assert_converts_with_variables(
+        "query SwapsOf($launch: Bytes!, $from: BigInt!, $first: Int!, $skip: Int!, $direction: OrderDirection!) { swaps(first: $first, skip: $skip, where: { launch: $launch, timestamp_gte: $from }, orderBy: ordinal, orderDirection: $direction) { id ordinal } }",
+        json!({"launch": "0xabc", "from": "100", "first": 50, "skip": 0, "direction": "desc"}),
+        "query SwapsOf($launch: String!, $from: numeric!, $first: Int!, $skip: Int!, $direction: order_by!) {\n  Swap(limit: $first, offset: $skip, order_by: {ordinal: $direction}, where: {chainId: {_eq: \"5042\"}, launch: {id: {_eq: $launch}}, timestamp: {_gte: $from}}) {\n    id ordinal\n  }\n}",
+        json!({"launch": "0xabc", "from": "100", "first": 50, "skip": 0, "direction": "desc"}),
+    );
+}
+
+#[test]
+fn argus_hours_of_launches_end_to_end() {
+    assert_converts_with_variables(
+        "query HoursOfLaunches($ids: [Bytes!]!, $since: BigInt!, $cursor: Bytes!, $first: Int!) { launchHourDatas(first: $first, where: { launch_in: $ids, periodStart_gte: $since, id_gt: $cursor }, orderBy: id) { id periodStart } }",
+        json!({"ids": ["0xa", "0xb"], "since": "1700000000", "cursor": "0x", "first": 500}),
+        "query HoursOfLaunches($ids: [String!]!, $since: numeric!, $cursor: String!, $first: Int!) {\n  LaunchHourData(limit: $first, order_by: {id: asc}, where: {chainId: {_eq: \"5042\"}, id: {_gt: $cursor}, launch: {id: {_in: $ids}}, periodStart: {_gte: $since}}) {\n    id periodStart\n  }\n}",
+        json!({"ids": ["0xa", "0xb"], "since": "1700000000", "cursor": "0x", "first": 500}),
+    );
+}
+
+/// Argus `Meta` asks for `block { timestamp }` and `hasIndexingErrors`, neither of
+/// which Hyperindex can answer. The query is rejected rather than served partially:
+/// a response missing `hasIndexingErrors` would read as "no indexing errors".
+#[test]
+fn argus_meta_end_to_end_is_rejected() {
+    crate::schema::init_test_schema_once();
+    let payload =
+        json!({ "query": "query Meta { _meta { block { number timestamp } hasIndexingErrors } }" });
+    match conversion::convert_subgraph_to_hyperindex(&payload, Some("5042")) {
+        Err(conversion::ConversionError::ComplexMetaQuery(fields)) => {
+            assert_eq!(fields, "block.timestamp, hasIndexingErrors")
+        }
+        other => panic!("expected ComplexMetaQuery, got {:?}", other.map(|r| r.query)),
+    }
+}
+
+/// The same query reduced to what Hyperindex can serve.
+#[test]
+fn argus_meta_reduced_end_to_end() {
+    crate::schema::init_test_schema_once();
+    let payload = json!({ "query": "query Meta { _meta { block { number } } }" });
+    let result = conversion::convert_subgraph_to_hyperindex(&payload, Some("5042"))
+        .expect("block { number } is servable");
+    assert_eq!(
+        result.query["query"].as_str().unwrap(),
+        "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
+    );
+    assert!(result.meta_selection.is_some());
+}
+
+/// Their keyset pager walks `id_gt` over `orderBy: id`. Breaking either the
+/// entity name or the ordering returns an empty list rather than an error, so
+/// this pins the whole string.
+#[test]
+fn argus_keyset_pagination_end_to_end() {
+    assert_converts_with_variables(
+        "query Launches($cursor: Bytes!, $first: Int!) { launches(first: $first, where: { id_gt: $cursor }, orderBy: id) { id name } }",
+        json!({"cursor": "0xaa", "first": 1000}),
+        "query Launches($cursor: String!, $first: Int!) {\n  Launch(limit: $first, order_by: {id: asc}, where: {chainId: {_eq: \"5042\"}, id: {_gt: $cursor}}) {\n    id name\n  }\n}",
+        json!({"cursor": "0xaa", "first": 1000}),
+    );
+}
