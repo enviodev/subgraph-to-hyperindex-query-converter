@@ -50,6 +50,9 @@ const ALIAS_PREFIX: &str = "_on_";
 pub struct ShapePlan {
     children: BTreeMap<String, ShapePlan>,
     hoist: bool,
+    /// For a hoisted link: the implementing type, which becomes the row's
+    /// `__typename` (the subgraph reports the concrete type, not the interface).
+    typename: Option<String>,
 }
 
 impl ShapePlan {
@@ -62,8 +65,11 @@ impl ShapePlan {
         self.children.keys().cloned().collect()
     }
 
-    fn merge(&mut self, other: ShapePlan) {
+    pub(crate) fn merge(&mut self, other: ShapePlan) {
         self.hoist |= other.hoist;
+        if other.typename.is_some() {
+            self.typename = other.typename;
+        }
         for (key, plan) in other.children {
             self.children.entry(key).or_default().merge(plan);
         }
@@ -96,7 +102,12 @@ impl ShapePlan {
                         continue;
                     }
                     match obj.remove(key) {
-                        Some(Value::Object(link)) => merge_into(obj, link),
+                        Some(Value::Object(link)) => {
+                            if let (Some(t), true) = (&plan.typename, obj.contains_key("__typename")) {
+                                obj.insert("__typename".to_string(), Value::String(t.clone()));
+                            }
+                            merge_into(obj, link)
+                        }
                         // `null`: this row is some other implementing type.
                         _ => {}
                     }
@@ -117,6 +128,19 @@ fn merge_into(dst: &mut Map<String, Value>, src: Map<String, Value>) {
             Some(Value::Object(existing)) => {
                 if let Value::Object(incoming) = incoming {
                     merge_into(existing, incoming);
+                }
+            }
+            Some(Value::Array(existing)) => {
+                // Same field selected twice with different sub-fields: merge the
+                // rows pairwise, as GraphQL field merging would.
+                if let Value::Array(incoming) = incoming {
+                    if existing.len() == incoming.len() {
+                        for (e, i) in existing.iter_mut().zip(incoming) {
+                            if let (Value::Object(e), Value::Object(i)) = (e, i) {
+                                merge_into(e, i);
+                            }
+                        }
+                    }
                 }
             }
             Some(existing) if existing.is_null() => *existing = incoming,
@@ -261,7 +285,13 @@ impl<'a> Rewriter<'a> {
         if !selection.contains("...") {
             return None;
         }
-        let doc = parse_query::<String>(selection).ok()?;
+        let doc = match parse_query::<String>(selection) {
+            Ok(doc) => doc,
+            Err(e) => {
+                tracing::warn!("Could not parse selection for fragment rewrite: {}", e);
+                return None;
+            }
+        };
         let mut definitions = doc.definitions.into_iter();
         let (Some(Definition::Operation(OperationDefinition::SelectionSet(mut set))), None) =
             (definitions.next(), definitions.next())
@@ -320,6 +350,7 @@ impl<'a> Rewriter<'a> {
                             LinkLookup::One(link) => {
                                 let mut inner = self.rewrite_set(&mut inline.selection_set, Some(t));
                                 inner.hoist = true;
+                                inner.typename = Some(t.to_string());
                                 let key = format!("{ALIAS_PREFIX}{t}");
                                 plan.add_child(key.clone(), inner);
                                 out.push(Selection::Field(Field {
@@ -370,6 +401,7 @@ impl<'a> Rewriter<'a> {
                                 LinkLookup::One(link) => {
                                     let mut inner = fragment_plan;
                                     inner.hoist = true;
+                                    inner.typename = Some(def_type.clone());
                                     let key = format!("{ALIAS_PREFIX}{def_type}");
                                     plan.add_child(key.clone(), inner);
                                     let position = spread.position;
@@ -487,6 +519,9 @@ mod tests {
         assert_eq!(squash(&r.selection), "{ id txHash }");
     }
 
+    // Note: this exercises the rewrite alone. End to end, `sanitize_selection_set`
+    // strips every `(...)` from a selection first, so `@include(if: $x)` loses its
+    // argument before it gets here (pre-existing; see README, Known Limitations).
     #[test]
     fn directives_on_the_fragment_move_to_the_link() {
         let r = root("UserTransaction", "{ id ... on Supply @include(if: $withSupply) { amount } }");
@@ -684,6 +719,37 @@ mod tests {
         let mut data = json!([{"id": "1", "_on_Supply": {"id": "other", "amount": "5"}}]);
         p.apply(&mut data);
         assert_eq!(data, json!([{"id": "1", "amount": "5"}]));
+    }
+
+    #[test]
+    fn typename_reports_the_implementing_type() {
+        let p = plan("UserTransaction", "{ id __typename ... on Supply { amount __typename } }");
+        let mut data = json!([
+            {"id": "1", "__typename": "UserTransaction", "_on_Supply": {"amount": "5", "__typename": "Supply"}},
+            {"id": "2", "__typename": "UserTransaction", "_on_Supply": null},
+        ]);
+        p.apply(&mut data);
+        assert_eq!(data[0]["__typename"], "Supply");
+        // A row matching no requested fragment keeps the stand-in's name.
+        assert_eq!(data[1]["__typename"], "UserTransaction");
+    }
+
+    #[test]
+    fn typename_is_not_invented_when_not_requested() {
+        let p = plan("UserTransaction", "{ id ... on Supply { amount } }");
+        let mut data = json!([{"id": "1", "_on_Supply": {"amount": "5"}}]);
+        p.apply(&mut data);
+        assert!(data[0].get("__typename").is_none());
+    }
+
+    #[test]
+    fn same_list_selected_twice_merges_its_rows() {
+        // Hand-built: a hoisted object whose list overlaps the row's own list.
+        let mut row = json!({"items": [{"id": 1}], "_on_X": {"items": [{"amount": 2}]}});
+        let mut plan = ShapePlan::default();
+        plan.children.insert("_on_X".into(), ShapePlan { hoist: true, ..Default::default() });
+        plan.apply(&mut row);
+        assert_eq!(row, json!({"items": [{"id": 1, "amount": 2}]}));
     }
 
     #[test]

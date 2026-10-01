@@ -139,7 +139,7 @@ The converter now handles this itself, with no per-interface configuration:
 - A fragment whose type condition is the surrounding type, or has none, is flattened into it.
 - In the response, each non-null `_on_*` object is merged into its row and the key removed, so rows look exactly like the subgraph's: fragment fields present for the matching type and absent for the others.
 
-A fragment is left untouched, as before, when the surrounding type is unknown, no field links to the fragment's type, or several do. A warning is logged. `__typename` is not translated: it still reports the concrete HyperIndex entity, not the implementing type. Fragments on an interface a type *implements* (`supplies { ... on UserTransaction { id } }`) are not resolved, because the schema carries no interface information.
+A fragment is left untouched, as before, when the surrounding type is unknown, no field links to the fragment's type, or several do. A warning is logged. When a row matches a fragment and `__typename` is selected, it reports the implementing type (`Supply`), as the subgraph does; a row that matches no requested fragment keeps the entity's own name. Fragments on an interface a type *implements* (`supplies { ... on UserTransaction { id } }`) are not resolved, because the schema carries no interface information.
 
 ## Ordering
 
@@ -154,7 +154,7 @@ Two things this does not do:
 
 ## Known Limitations
 
-- Uses string parsing rather than a full GraphQL parser
+- Uses string parsing rather than a full GraphQL parser. Selection sets have their `(...)` argument lists stripped, so a directive on a fragment loses its arguments (`@include(if: $x)` becomes `@include`)
 - `orderBy` and `orderDirection` with variables are not supported (Hasura limitation)
 - Block/time-travel queries are not supported
 - `_meta` queries only return latest block number

@@ -634,8 +634,15 @@ fn convert_main_query(
         let entity_cap = singularize_and_capitalize(&entity);
         let selection = match root_rewrites.next().flatten() {
             Some(rewrite) => {
-                shape_plans.insert(entity_cap.clone(), rewrite.plan.clone());
-                shape_plans.insert(format!("{}_by_pk", entity_cap), rewrite.plan);
+                // Key by the root field actually emitted below, and merge: the same
+                // entity can be selected twice in one operation (GraphQL merges them).
+                let is_pk = !entity.ends_with('s') && params.len() == 1 && params.contains_key("id");
+                let key = if is_pk {
+                    format!("{}_by_pk", entity_cap)
+                } else {
+                    entity_cap.clone()
+                };
+                shape_plans.entry(key).or_default().merge(rewrite.plan);
                 rewrite.selection
             }
             None => selection,
@@ -5938,8 +5945,10 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         assert!(result.shape_plans.is_empty());
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("supply { amount }"), "{query}");
-        assert!(!query.contains("_on_"), "{query}");
+        assert_eq!(
+            query,
+            "query {\n  UserTransaction(limit: 5) {\n    id supply { amount }\n  }\n}"
+        );
     }
 
     #[test]
@@ -5969,6 +5978,18 @@ mod tests {
         assert!(flat.contains("...Tx"), "{flat}");
         assert!(!flat.contains("... on"), "{flat}");
         assert!(result.shape_plans["UserTransaction"].children_for_test().contains(&"_on_Supply".to_string()));
+    }
+
+    #[test]
+    fn two_roots_of_the_same_entity_merge_their_plans() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { userTransactions(first: 1) { id ... on Supply { amount } } userTransactions(first: 1) { id ... on Borrow { borrowRateMode } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let mut keys = result.shape_plans["UserTransaction"].children_for_test();
+        keys.sort();
+        assert_eq!(keys, vec!["_on_Borrow".to_string(), "_on_Supply".to_string()]);
     }
 
     #[test]
