@@ -2,6 +2,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
+use crate::fragments::{self, ShapePlan};
 use crate::schema;
 
 #[derive(Error, Debug)]
@@ -65,6 +66,9 @@ pub struct ConversionResult {
     /// nothing references them any more. GraphQL rejects a declared-but-unused
     /// variable, so these are stripped from the forwarded payload too.
     pub dropped_variables: Vec<String>,
+    /// Per root response key (the Hyperindex field name), how to merge rewritten
+    /// interface-link fields back into subgraph-shaped rows. See `crate::fragments`.
+    pub shape_plans: HashMap<String, ShapePlan>,
 }
 
 pub fn convert_subgraph_to_hyperindex(
@@ -107,6 +111,7 @@ pub fn convert_subgraph_to_hyperindex(
             filter_variable_entities: HashMap::new(),
             order_by_variables: Vec::new(),
             dropped_variables: Vec::new(),
+            shape_plans: HashMap::new(),
         });
     }
 
@@ -119,6 +124,8 @@ pub fn convert_subgraph_to_hyperindex(
         order_by_variables,
         dropped_variables,
         meta_selection,
+        shape_plans,
+        fragments_override: _,
     } = convert_query_structure(query, chain_id)?;
 
     // Build the result with query and optionally variables
@@ -178,7 +185,7 @@ pub fn convert_subgraph_to_hyperindex(
                     );
                     map.insert(
                         spec.target_var.clone(),
-                        Value::Array(vec![order_by_json(&field, &direction)]),
+                        order_by_json_with_tiebreak(&field, &direction, id_tiebreak_enabled()),
                     );
                 }
             }
@@ -203,6 +210,7 @@ pub fn convert_subgraph_to_hyperindex(
         filter_variable_entities,
         order_by_variables,
         dropped_variables,
+        shape_plans,
     })
 }
 
@@ -218,6 +226,10 @@ struct MainConversion {
     dropped_variables: Vec<String>,
     /// Which `_meta` sub-fields were requested, for shaping the response.
     meta_selection: Option<MetaSelection>,
+    /// Response reshaping for rewritten interface fragments, by root response key.
+    shape_plans: HashMap<String, ShapePlan>,
+    /// Replacement named-fragment definitions, when rewriting changed any of them.
+    fragments_override: Option<String>,
 }
 
 fn convert_query_structure(
@@ -250,13 +262,16 @@ fn convert_query_structure(
             order_by_variables: Vec::new(),
             dropped_variables: Vec::new(),
             meta_selection: Some(meta_selection),
+            shape_plans: HashMap::new(),
+            fragments_override: None,
         });
     }
 
     // Convert the main query
-    let main = convert_main_query(&main_query, chain_id)?;
+    let main = convert_main_query(&main_query, chain_id, &fragments)?;
 
     // Combine fragments with converted main query
+    let fragments = main.fragments_override.clone().unwrap_or(fragments);
     let mut result = String::new();
     if !fragments.is_empty() {
         result.push_str(&fragments);
@@ -271,6 +286,8 @@ fn convert_query_structure(
         order_by_variables: main.order_by_variables,
         dropped_variables: main.dropped_variables,
         meta_selection: None,
+        shape_plans: main.shape_plans,
+        fragments_override: None,
     })
 }
 
@@ -536,6 +553,7 @@ fn is_subgraph_filter_type(declared_type: &str) -> bool {
 fn convert_main_query(
     main_query: &str,
     chain_id: Option<&str>,
+    fragments_text: &str,
 ) -> Result<MainConversion, ConversionError> {
     // Extract query header (name and variable definitions) and body separately
     let (query_header, stripped_query) = if main_query.trim().starts_with("query") {
@@ -596,8 +614,32 @@ fn convert_main_query(
         .map(parse_variable_declarations)
         .unwrap_or_default();
 
+    // Type-conditioned fragments (`... on Supply { }`) on an interface stand-in are
+    // rewritten to its link fields before anything below sees the selection.
+    let root_types: Vec<String> = entities
+        .iter()
+        .map(|(entity, _, _)| singularize_and_capitalize(entity))
+        .collect();
+    let root_pairs: Vec<(&str, &str)> = entities
+        .iter()
+        .zip(&root_types)
+        .map(|((_, _, selection), ty)| (ty.as_str(), selection.as_str()))
+        .collect();
+    let rewrites = fragments::rewrite_all(fragments_text, &root_pairs);
+    let fragments_override = rewrites.fragments;
+    let mut root_rewrites = rewrites.roots.into_iter();
+    let mut shape_plans: HashMap<String, ShapePlan> = HashMap::new();
+
     for (entity, params, selection) in entities {
         let entity_cap = singularize_and_capitalize(&entity);
+        let selection = match root_rewrites.next().flatten() {
+            Some(rewrite) => {
+                shape_plans.insert(entity_cap.clone(), rewrite.plan.clone());
+                shape_plans.insert(format!("{}_by_pk", entity_cap), rewrite.plan);
+                rewrite.selection
+            }
+            None => selection,
+        };
 
         // Record the mapping: Hyperindex name -> original query name
         // e.g., "LpAction" -> "lpActions", "LpAction_by_pk" -> "lpActions"
@@ -748,6 +790,8 @@ fn convert_main_query(
         order_by_variables: order_by_specs,
         dropped_variables,
         meta_selection: None,
+        shape_plans,
+        fragments_override,
     })
 }
 
@@ -783,6 +827,44 @@ fn order_by_json(field: &str, direction: &str) -> Value {
         out = Value::Object(m);
     }
     out
+}
+
+/// graph-node orders rows that tie on the sort key by `id`, in the same direction as
+/// the sort (`ORDER BY timestamp DESC, id DESC`). Hasura leaves ties in whatever order
+/// Postgres produces them, so with `first`/`skip` a page boundary inside a run of equal
+/// keys can repeat or skip rows, and the rows differ from what the subgraph returned.
+/// Appending `id` makes the order total and identical.
+///
+/// Set `CONVERTER_ORDER_ID_TIEBREAK=off` to emit the sort key alone, e.g. if the extra
+/// sort column proves slow on a very large table.
+fn id_tiebreak_enabled() -> bool {
+    !matches!(
+        std::env::var("CONVERTER_ORDER_ID_TIEBREAK")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    )
+}
+
+/// The `order_by` value for a literal sort: the sort key, then `id` when `tiebreak`.
+/// Sorting by `id` already is a total order, so nothing is added.
+fn literal_order_by_with_tiebreak(field: &str, direction: &str, tiebreak: bool) -> String {
+    let primary = literal_order_by(field, direction);
+    if tiebreak && field != "id" {
+        format!("[{}, {}]", primary, literal_order_by("id", direction))
+    } else {
+        primary
+    }
+}
+
+/// JSON counterpart, for sorts assembled at request time. Always an array, which
+/// is the shape the retyped `[Entity_order_by!]` variable expects.
+fn order_by_json_with_tiebreak(field: &str, direction: &str, tiebreak: bool) -> Value {
+    let mut items = vec![order_by_json(field, direction)];
+    if tiebreak && field != "id" {
+        items.push(order_by_json("id", direction));
+    }
+    Value::Array(items)
 }
 
 /// Hasura matches its `order_by` enum exactly, while subgraph clients sometimes
@@ -853,7 +935,10 @@ fn plan_order_by(
                 },
             );
         }
-        return Some(format!("order_by: {}", literal_order_by(field, dir_text)));
+        return Some(format!(
+            "order_by: {}",
+            literal_order_by_with_tiebreak(field, dir_text, id_tiebreak_enabled())
+        ));
     }
 
     // The field itself is a variable, so the key of the `order_by` object is not
@@ -2709,7 +2794,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  V2_Factory_Swap(limit: 1, order_by: {timestamp: desc}, where: {chainId: {_eq: \"1\"}}) {\n    id timestamp amountUSD\n  }\n}"
+            "query": "query {\n  V2_Factory_Swap(limit: 1, order_by: [{timestamp: desc}, {id: desc}], where: {chainId: {_eq: \"1\"}}) {\n    id timestamp amountUSD\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3214,7 +3299,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(order_by: {name: desc}, where: {chainId: {_eq: \"1\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(order_by: [{name: desc}, {id: desc}], where: {chainId: {_eq: \"1\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3226,7 +3311,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(offset: 10, order_by: {alias: asc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%113%\"}}) {\n    alias asset { address }\n  }\n}"
+            "query": "query {\n  Stream(offset: 10, order_by: [{alias: asc}, {id: asc}], where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%113%\"}}) {\n    alias asset { address }\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -5311,7 +5396,7 @@ mod tests {
         let query = result.query["query"].as_str().unwrap();
 
         assert!(
-            query.contains("order_by: {ordinal: $direction}"),
+            query.contains("order_by: [{ordinal: $direction}, {id: $direction}]"),
             "ordering must survive a variable direction: {}",
             query
         );
@@ -5360,7 +5445,7 @@ mod tests {
         assert!(query.contains("$where: Launch_bool_exp!"), "{}", query);
 
         let vars = &result.query["variables"];
-        assert_eq!(vars["orderBy"], json!([{"createdAt": "desc"}]));
+        assert_eq!(vars["orderBy"], json!([{"createdAt": "desc"}, {"id": "desc"}]));
         assert_eq!(vars["where"], json!({"dividendsPaid": {"_gt": "0"}}));
         assert!(vars.get("direction").is_none(), "vars: {}", vars);
 
@@ -5379,7 +5464,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         assert_eq!(
             result.query["variables"]["ob"],
-            json!([{"createdAt": "asc"}])
+            json!([{"createdAt": "asc"}, {"id": "asc"}])
         );
     }
 
@@ -5392,7 +5477,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         assert_eq!(
             result.query["variables"]["ob"],
-            json!([{"createdAt": "desc"}])
+            json!([{"createdAt": "desc"}, {"id": "desc"}])
         );
     }
 
@@ -5418,7 +5503,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         assert_eq!(
             result.query["variables"]["ob"],
-            json!([{"createdAt": "desc"}])
+            json!([{"createdAt": "desc"}, {"id": "desc"}])
         );
     }
 
@@ -5432,7 +5517,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         assert_eq!(
             result.query["variables"]["ob"],
-            json!([{"launch": {"createdAt": "desc"}}])
+            json!([{"launch": {"createdAt": "desc"}}, {"id": "desc"}])
         );
     }
 
@@ -5444,7 +5529,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
         assert!(
-            query.contains("order_by: {launch: {createdAt: desc}}"),
+            query.contains("order_by: [{launch: {createdAt: desc}}, {id: desc}]"),
             "{}",
             query
         );
@@ -5804,20 +5889,135 @@ mod tests {
     }
 
     #[test]
-    fn regression_literal_order_by_output_is_unchanged() {
+    fn regression_literal_order_by_gains_id_tiebreak() {
         let payload = create_test_payload(
             "query { streams(first: 10, orderBy: name, orderDirection: desc) { id } }",
         );
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("order_by: {name: desc}"), "{}", query);
+        assert!(query.contains("order_by: [{name: desc}, {id: desc}]"), "{}", query);
     }
 
     #[test]
-    fn regression_literal_order_by_defaults_to_asc() {
+    fn regression_literal_order_by_defaults_to_asc_with_id_tiebreak() {
         let payload = create_test_payload("query { streams(orderBy: name) { id } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("order_by: {name: asc}"), "{}", query);
+        assert!(query.contains("order_by: [{name: asc}, {id: asc}]"), "{}", query);
+    }
+
+    // ---- interface fragments + id tie-break (UserTransaction stand-in) ----
+
+    const CLIENT_QUERY: &str = "query UserTransactions($userAddress: String!, $first: Int!, $skip: Int!) { userTransactions(where: { user: $userAddress }, orderBy: timestamp, orderDirection: desc, first: $first, skip: $skip) { id timestamp txHash action ... on Supply { amount reserve { symbol decimals } assetPriceUSD } ... on Borrow { amount borrowRateMode reserve { symbol } } } }";
+
+    #[test]
+    fn interface_fragments_query_is_rewritten_end_to_end() {
+        init_test_schema_if_needed();
+        let payload = argus_payload(
+            CLIENT_QUERY,
+            json!({"userAddress": "0xabc", "first": 10, "skip": 0}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        let flat = query.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(!flat.contains("... on"), "fragments must be gone: {flat}");
+        assert!(flat.contains("_on_Supply: supply { amount reserve { symbol decimals } assetPriceUSD }"), "{flat}");
+        assert!(flat.contains("_on_Borrow: borrow { amount borrowRateMode reserve { symbol } }"), "{flat}");
+        // The other two fixes must still apply to the same field.
+        assert!(flat.contains("order_by: [{timestamp: desc}, {id: desc}]"), "{flat}");
+        assert!(flat.contains("user: {id: {_eq: $userAddress}}"), "{flat}");
+        assert!(result.shape_plans.contains_key("UserTransaction"));
+        assert_eq!(result.query["variables"]["userAddress"], json!("0xabc"));
+    }
+
+    #[test]
+    fn query_without_fragments_has_no_shape_plan_and_is_unchanged() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { userTransactions(first: 5) { id supply { amount } } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert!(result.shape_plans.is_empty());
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("supply { amount }"), "{query}");
+        assert!(!query.contains("_on_"), "{query}");
+    }
+
+    #[test]
+    fn by_pk_root_with_a_fragment_gets_a_plan() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { userTransaction(id: \"1:2:0xab\") { id ... on Supply { amount } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("UserTransaction_by_pk"), "{query}");
+        assert!(query.contains("_on_Supply: supply"), "{query}");
+        assert!(result.shape_plans.contains_key("UserTransaction_by_pk"));
+    }
+
+    #[test]
+    fn named_fragment_definition_is_rewritten_in_the_output() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "fragment Tx on UserTransaction { id ... on Supply { amount } }\nquery { userTransactions(first: 5) { ...Tx } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        let flat = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("fragment Tx on UserTransaction"), "{flat}");
+        assert!(flat.contains("_on_Supply: supply { amount }"), "{flat}");
+        assert!(flat.contains("...Tx"), "{flat}");
+        assert!(!flat.contains("... on"), "{flat}");
+        assert!(result.shape_plans["UserTransaction"].children_for_test().contains(&"_on_Supply".to_string()));
+    }
+
+    #[test]
+    fn order_by_id_gets_no_duplicate_tiebreak() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { streams(orderBy: id, orderDirection: desc) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("order_by: {id: desc}"), "{query}");
+        assert!(!query.contains("[{id"), "{query}");
+    }
+
+    #[test]
+    fn order_by_variable_set_to_id_adds_nothing() {
+        let payload = argus_payload(
+            "query Q($ob: Launch_orderBy!) { launches(orderBy: $ob, orderDirection: asc) { id } }",
+            json!({"ob": "id"}),
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(result.query["variables"]["ob"], json!([{"id": "asc"}]));
+    }
+
+    #[test]
+    fn tiebreak_follows_a_variable_direction() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query Q($dir: OrderDirection!) { streams(orderBy: name, orderDirection: $dir) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("order_by: [{name: $dir}, {id: $dir}]"), "{query}");
+        assert!(query.contains("$dir: order_by"), "{query}");
+    }
+
+    #[test]
+    fn tiebreak_helpers_respect_the_off_switch() {
+        assert_eq!(literal_order_by_with_tiebreak("name", "desc", false), "{name: desc}");
+        assert_eq!(
+            literal_order_by_with_tiebreak("name", "desc", true),
+            "[{name: desc}, {id: desc}]"
+        );
+        assert_eq!(literal_order_by_with_tiebreak("id", "asc", true), "{id: asc}");
+        assert_eq!(
+            order_by_json_with_tiebreak("name", "DESC", false),
+            json!([{"name": "desc"}])
+        );
+        assert_eq!(
+            order_by_json_with_tiebreak("pool__name", "asc", true),
+            json!([{"pool": {"name": "asc"}}, {"id": "asc"}])
+        );
     }
 }

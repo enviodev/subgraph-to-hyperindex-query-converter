@@ -515,7 +515,7 @@ fn argus_launch_key_page_end_to_end() {
         "query LaunchKeyPage($where: Launch_filter!, $orderBy: Launch_orderBy!, $direction: OrderDirection!, $first: Int!) { launches(first: $first, where: $where, orderBy: $orderBy, orderDirection: $direction) { id key: createdAt } }",
         json!({"where": {"dividendsPaid_gt": "0"}, "orderBy": "createdAt", "direction": "desc", "first": 25}),
         "query LaunchKeyPage($where: Launch_bool_exp!, $orderBy: [Launch_order_by!], $first: Int!) {\n  Launch(limit: $first, order_by: $orderBy, where: $where) {\n    id key: createdAt\n  }\n}",
-        json!({"where": {"dividendsPaid": {"_gt": "0"}}, "orderBy": [{"createdAt": "desc"}], "first": 25}),
+        json!({"where": {"dividendsPaid": {"_gt": "0"}}, "orderBy": [{"createdAt": "desc"}, {"id": "desc"}], "first": 25}),
     );
 }
 
@@ -524,7 +524,7 @@ fn argus_swaps_of_end_to_end() {
     assert_converts_with_variables(
         "query SwapsOf($launch: Bytes!, $from: BigInt!, $first: Int!, $skip: Int!, $direction: OrderDirection!) { swaps(first: $first, skip: $skip, where: { launch: $launch, timestamp_gte: $from }, orderBy: ordinal, orderDirection: $direction) { id ordinal } }",
         json!({"launch": "0xabc", "from": "100", "first": 50, "skip": 0, "direction": "desc"}),
-        "query SwapsOf($launch: String!, $from: numeric!, $first: Int!, $skip: Int!, $direction: order_by!) {\n  Swap(limit: $first, offset: $skip, order_by: {ordinal: $direction}, where: {chainId: {_eq: \"5042\"}, launch: {id: {_eq: $launch}}, timestamp: {_gte: $from}}) {\n    id ordinal\n  }\n}",
+        "query SwapsOf($launch: String!, $from: numeric!, $first: Int!, $skip: Int!, $direction: order_by!) {\n  Swap(limit: $first, offset: $skip, order_by: [{ordinal: $direction}, {id: $direction}], where: {chainId: {_eq: \"5042\"}, launch: {id: {_eq: $launch}}, timestamp: {_gte: $from}}) {\n    id ordinal\n  }\n}",
         json!({"launch": "0xabc", "from": "100", "first": 50, "skip": 0, "direction": "desc"}),
     );
 }

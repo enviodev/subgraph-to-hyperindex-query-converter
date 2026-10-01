@@ -64,6 +64,8 @@ HYPERINDEX_URL=https://indexer.hyperindex.xyz/your-deployment/v1/graphql
 # Optional
 PORT=3000
 HTTP_TIMEOUT_SECS=30
+# Set to off/false/0 to stop appending `id` to every `orderBy` (see "Ordering")
+CONVERTER_ORDER_ID_TIEBREAK=on
 ```
 
 ### Run with Docker
@@ -125,6 +127,30 @@ query {
 | `field_ends_with: val` | `field: { _ilike: "%val" }` |
 
 See the full filter table and known limitations in the source code.
+
+## Interfaces and type-conditioned fragments
+
+HyperIndex has no GraphQL interfaces, so an indexer that ports a subgraph `interface` models it as a concrete entity with one nullable link per implementing type (for example `UserTransaction` with `supply: Supply`, `borrow: Borrow`, ...). Hasura silently ignores a subgraph-style `... on Supply { amount }` against such an entity, so every row used to come back with only the shared fields.
+
+The converter now handles this itself, with no per-interface configuration:
+
+- `... on Supply { amount }` is rewritten to an aliased link field, `_on_Supply: supply { amount }`. The link is found from the introspected schema: the single object-valued field on the surrounding type whose type is `Supply`.
+- Named fragments work the same way (`...SupplyFields` where `fragment SupplyFields on Supply` becomes `_on_Supply: supply { ...SupplyFields }`), as do fragments inside named fragments and inside nested selections such as `user { userTransactions { ... } }`.
+- A fragment whose type condition is the surrounding type, or has none, is flattened into it.
+- In the response, each non-null `_on_*` object is merged into its row and the key removed, so rows look exactly like the subgraph's: fragment fields present for the matching type and absent for the others.
+
+A fragment is left untouched, as before, when the surrounding type is unknown, no field links to the fragment's type, or several do. A warning is logged. `__typename` is not translated: it still reports the concrete HyperIndex entity, not the implementing type. Fragments on an interface a type *implements* (`supplies { ... on UserTransaction { id } }`) are not resolved, because the schema carries no interface information.
+
+## Ordering
+
+graph-node orders rows that tie on the sort key by `id`, in the same direction (`ORDER BY timestamp DESC, id DESC`). Hasura leaves ties unordered, so with `first`/`skip` a page boundary inside a run of equal keys could repeat or skip rows. Every explicit `orderBy` now also sorts by `id` in the same direction (`order_by: [{timestamp: desc}, {id: desc}]`), for both literal and variable `orderBy`. Sorting by `id` itself adds nothing. This gives a total, repeatable order, so paging is consistent.
+
+Set `CONVERTER_ORDER_ID_TIEBREAK=off` to emit the sort key alone, for example if the extra sort column is slow on a very large table.
+
+Two things this does not do:
+
+- A query with no `orderBy` is still unordered. graph-node defaults to `id` ascending, but forcing that here could push the planner onto the primary key for selective filters.
+- Ties follow the database's string collation. graph-node compares `id` bytewise (C collation), while Postgres usually uses a locale collation that ignores punctuation, so ids that differ only around a `:` boundary (`1:` versus `15:`) can order differently inside a single block. The order is still stable and repeatable. It just may not match the subgraph's within-block order exactly.
 
 ## Known Limitations
 
