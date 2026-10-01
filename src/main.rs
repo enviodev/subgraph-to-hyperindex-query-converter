@@ -16,6 +16,7 @@ use tracing;
 use tracing_subscriber;
 
 mod conversion;
+mod fragments;
 mod http_client;
 mod metrics;
 mod schema;
@@ -133,6 +134,7 @@ async fn execute_query_with_retry(
     let converted_query = conversion_result.query;
     let field_name_map = conversion_result.field_name_map;
     let meta_selection = conversion_result.meta_selection;
+    let shape_plans = conversion_result.shape_plans;
 
     if !conversion_result.filter_variable_entities.is_empty() {
         tracing::info!(
@@ -244,6 +246,8 @@ async fn execute_query_with_retry(
 
     // Success - no errors
     let transform_start = Instant::now();
+    let mut response = response;
+    apply_shape_plans(&mut response, &shape_plans);
     let transformed =
         transform_response_to_subgraph_shape(response, &field_name_map, meta_selection.as_ref());
     let transform_duration_ms = transform_start.elapsed().as_secs_f64() * 1000.0;
@@ -400,6 +404,24 @@ async fn forward_to_hyperindex(
 
     let response_json: Value = response.json().await?;
     Ok(response_json)
+}
+
+/// Merge rewritten interface-link fields back into their rows (see `fragments`).
+/// Runs on the raw Hyperindex response, before root keys are renamed.
+fn apply_shape_plans(
+    response: &mut Value,
+    plans: &std::collections::HashMap<String, fragments::ShapePlan>,
+) {
+    if plans.is_empty() {
+        return;
+    }
+    if let Some(Value::Object(data)) = response.get_mut("data") {
+        for (root_key, plan) in plans {
+            if let Some(value) = data.get_mut(root_key) {
+                plan.apply(value);
+            }
+        }
+    }
 }
 
 fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::collections::HashMap<String, String>, meta_selection: Option<&conversion::MetaSelection>) -> Value {
@@ -676,6 +698,7 @@ async fn maybe_fetch_subgraph_debug(payload: Value) -> Option<Value> {
 #[cfg(test)]
 mod response_shape_tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_pluralize_lowercase_basic() {
@@ -765,5 +788,45 @@ mod response_shape_tests {
 
         // Should NOT have chain_metadata
         assert!(data.get("chain_metadata").is_none());
+    }
+
+    #[test]
+    fn interface_fragment_response_is_reshaped_to_the_subgraph_form() {
+        crate::schema::init_test_schema_once();
+        let payload = json!({
+            "query": "query Q($u: String!) { userTransactions(where: {user: $u}, orderBy: timestamp, orderDirection: desc, first: 3) { id action ... on Supply { amount reserve { symbol } } ... on Borrow { borrowRateMode } } }",
+            "variables": {"u": "0xabc"}
+        });
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, None).unwrap();
+
+        // What Hasura returns for the converted query.
+        let mut hasura = json!({"data": {"UserTransaction": [
+            {"id": "a", "action": "Supply", "_on_Supply": {"amount": "5", "reserve": {"symbol": "WSOMI"}}, "_on_Borrow": null},
+            {"id": "b", "action": "Borrow", "_on_Supply": null, "_on_Borrow": {"borrowRateMode": 2}},
+            {"id": "c", "action": "Supply", "_on_Supply": null, "_on_Borrow": null}
+        ]}});
+        apply_shape_plans(&mut hasura, &converted.shape_plans);
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            converted.meta_selection.as_ref(),
+        );
+
+        assert_eq!(
+            out,
+            json!({"data": {"userTransactions": [
+                {"id": "a", "action": "Supply", "amount": "5", "reserve": {"symbol": "WSOMI"}},
+                {"id": "b", "action": "Borrow", "borrowRateMode": 2},
+                {"id": "c", "action": "Supply"}
+            ]}})
+        );
+    }
+
+    #[test]
+    fn responses_without_plans_are_untouched() {
+        let mut resp = json!({"data": {"Stream": [{"id": "1", "_on_Supply": null}]}});
+        let before = resp.clone();
+        apply_shape_plans(&mut resp, &std::collections::HashMap::new());
+        assert_eq!(resp, before);
     }
 }

@@ -16,6 +16,8 @@ pub struct FieldInfo {
     pub is_nested_entity: bool,
     pub nested_type_name: Option<String>, // If nested, the type name (e.g., "Pair")
     pub field_type: String, // The actual type name (e.g., "String", "Int", "orderaction")
+    /// True when any wrapper on the field's type is a LIST (`[X!]!`, `[X]`, ...).
+    pub is_list: bool,
 }
 
 // Track when the schema was last updated
@@ -48,6 +50,10 @@ pub async fn fetch_schema() -> Result<Value, Box<dyn std::error::Error + Send + 
                                             ofType {
                                             name
                                             kind
+                                            ofType {
+                                                name
+                                                kind
+                                            }
                                             }
                                         }
                                         }
@@ -162,6 +168,7 @@ pub fn parse_and_cache_schema(introspection_response: &Value) -> Result<(), Box<
                     is_nested_entity,
                     nested_type_name,
                     field_type: type_name_str,
+                    is_list: type_has_list_wrapper(field_type),
                 },
             );
         }
@@ -196,6 +203,21 @@ fn get_actual_type(type_info: &Value) -> &Value {
     current
 }
 
+/// True when any NON_NULL/LIST wrapper on the way down to the named type is a LIST.
+fn type_has_list_wrapper(type_info: &Value) -> bool {
+    let mut current = type_info;
+    loop {
+        match current.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
+            "LIST" => return true,
+            "NON_NULL" => match current.get("ofType") {
+                Some(of_type) => current = of_type,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+}
+
 /// Check if a type is an OBJECT type (i.e., a nested entity)
 fn is_object_type(type_info: &Value) -> bool {
     let kind = type_info.get("kind").and_then(|k| k.as_str()).unwrap_or("");
@@ -208,6 +230,50 @@ pub fn get_field_info(entity_name: &str, field_name: &str) -> Option<FieldInfo> 
     SCHEMA_CACHE
         .get(entity_name)
         .and_then(|fields_ref| fields_ref.value().get(field_name).cloned())
+}
+
+/// Result of looking for the field on `parent` that links to a `target` entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkLookup {
+    /// Exactly one single-object field of `parent` has type `target`.
+    One(String),
+    /// No such field, or `parent` is not in the schema cache.
+    None,
+    /// Several fields qualify, so the right one cannot be chosen from the type alone.
+    Ambiguous,
+}
+
+/// Find the single-object field of `parent` whose type is `target`.
+///
+/// Hyperindex has no GraphQL interfaces, so a subgraph interface such as
+/// `UserTransaction` is a concrete entity with one nullable link per implementing
+/// type (`supply: Supply`, `borrow: Borrow`, ...). This is how
+/// `... on Supply { }` is translated to `supply { }`. List-valued fields are
+/// ignored: a link carries at most one record.
+pub fn link_field_for_type(parent: &str, target: &str) -> LinkLookup {
+    let Some(fields) = SCHEMA_CACHE.get(parent) else {
+        return LinkLookup::None;
+    };
+    let mut names: Vec<&String> = fields
+        .value()
+        .iter()
+        .filter(|(_, info)| {
+            info.is_nested_entity
+                && !info.is_list
+                && info.nested_type_name.as_deref() == Some(target)
+        })
+        .map(|(name, _)| name)
+        .collect();
+    match names.len() {
+        0 => LinkLookup::None,
+        1 => LinkLookup::One(names.remove(0).clone()),
+        _ => LinkLookup::Ambiguous,
+    }
+}
+
+/// Entity type of the object-valued field `field` on `parent`, if both are known.
+pub fn nested_type_of(parent: &str, field: &str) -> Option<String> {
+    get_field_info(parent, field).and_then(|info| info.nested_type_name)
 }
 
 /// Find the cached entity whose graph-node collection field is `field_name`.
@@ -387,11 +453,13 @@ pub fn init_test_schema() {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     trade_fields.insert("pair".to_string(), FieldInfo {
         is_nested_entity: true,
         nested_type_name: Some("Pair".to_string()),
         field_type: "Pair".to_string(),
+        is_list: false,
     });
     // Note: token can be either nested or regular depending on context
     // For Trade, we'll make it a regular field by default (can be overridden in specific tests)
@@ -399,21 +467,25 @@ pub fn init_test_schema() {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     trade_fields.insert("amount".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "numeric".to_string(),
+        is_list: false,
     });
     trade_fields.insert("isOpen".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "Boolean".to_string(),
+        is_list: false,
     });
     trade_fields.insert("type".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     cache.insert("Trade".to_string(), trade_fields);
 
@@ -423,26 +495,31 @@ pub fn init_test_schema() {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     pair_fields.insert("fee".to_string(), FieldInfo {
         is_nested_entity: true,
         nested_type_name: Some("Fee".to_string()),
         field_type: "Fee".to_string(),
+        is_list: false,
     });
     pair_fields.insert("token".to_string(), FieldInfo {
         is_nested_entity: true,
         nested_type_name: Some("Token".to_string()),
         field_type: "Token".to_string(),
+        is_list: false,
     });
     pair_fields.insert("from".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     pair_fields.insert("name".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     cache.insert("Pair".to_string(), pair_fields);
 
@@ -452,16 +529,19 @@ pub fn init_test_schema() {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     token_fields.insert("amount".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "numeric".to_string(),
+        is_list: false,
     });
     token_fields.insert("name".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     cache.insert("Token".to_string(), token_fields);
 
@@ -471,11 +551,13 @@ pub fn init_test_schema() {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     fee_fields.insert("liqFeeP".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "numeric".to_string(),
+        is_list: false,
     });
     cache.insert("Fee".to_string(), fee_fields);
 
@@ -485,16 +567,19 @@ pub fn init_test_schema() {
         is_nested_entity: true,
         nested_type_name: Some("User".to_string()),
         field_type: "User".to_string(),
+        is_list: false,
     });
     lp_action_fields.insert("type".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     lp_action_fields.insert("withdrawUnlockEpoch".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "Int".to_string(),
+        is_list: false,
     });
     cache.insert("LpAction".to_string(), lp_action_fields);
 
@@ -504,6 +589,7 @@ pub fn init_test_schema() {
         is_nested_entity: true,
         nested_type_name: Some("User".to_string()),
         field_type: "User".to_string(),
+        is_list: false,
     });
     cache.insert("UserGroupStat".to_string(), user_group_stat_fields);
 
@@ -513,6 +599,7 @@ pub fn init_test_schema() {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     cache.insert("User".to_string(), user_fields);
 
@@ -522,31 +609,37 @@ pub fn init_test_schema() {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     order_fields.insert("trader".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "String".to_string(),
+        is_list: false,
     });
     order_fields.insert("orderAction".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "orderaction".to_string(), // enum type
+        is_list: false,
     });
     order_fields.insert("isPending".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "Boolean".to_string(),
+        is_list: false,
     });
     order_fields.insert("executedAt".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
         field_type: "numeric".to_string(),
+        is_list: false,
     });
     order_fields.insert("pair".to_string(), FieldInfo {
         is_nested_entity: true,
         nested_type_name: Some("Pair".to_string()),
         field_type: "Pair".to_string(),
+        is_list: false,
     });
     cache.insert("Order".to_string(), order_fields);
 
@@ -569,6 +662,7 @@ pub fn init_test_schema() {
             is_nested_entity: false,
             nested_type_name: None,
             field_type: ty.to_string(),
+            is_list: false,
         });
     }
     cache.insert("Launch".to_string(), launch_fields);
@@ -579,11 +673,13 @@ pub fn init_test_schema() {
             is_nested_entity: false,
             nested_type_name: None,
             field_type: "String".to_string(),
+            is_list: false,
         });
         fields.insert("launch".to_string(), FieldInfo {
             is_nested_entity: true,
             nested_type_name: Some("Launch".to_string()),
             field_type: "Launch".to_string(),
+            is_list: false,
         });
         for (name, ty) in [
             ("periodStart", "numeric"),
@@ -599,6 +695,7 @@ pub fn init_test_schema() {
                 is_nested_entity: false,
                 nested_type_name: None,
                 field_type: ty.to_string(),
+                is_list: false,
             });
         }
         cache.insert(entity.to_string(), fields);
@@ -611,8 +708,85 @@ pub fn init_test_schema() {
             is_nested_entity: false,
             nested_type_name: None,
             field_type: "String".to_string(),
+            is_list: false,
         });
         cache.insert(entity.to_string(), fields);
+    }
+
+    // Stand-in for a subgraph interface, as Hyperindex models it: a concrete
+    // `UserTransaction` entity with one nullable single-object link per implementing
+    // type, plus the implementing types themselves.
+    {
+        let scalar = |ty: &str| FieldInfo {
+            is_nested_entity: false,
+            nested_type_name: None,
+            field_type: ty.to_string(),
+            is_list: false,
+        };
+        let object = |ty: &str, is_list: bool| FieldInfo {
+            is_nested_entity: true,
+            nested_type_name: Some(ty.to_string()),
+            field_type: ty.to_string(),
+            is_list,
+        };
+        let build = |scalars: &[(&str, &str)], objects: &[(&str, &str, bool)]| {
+            let mut m = HashMap::new();
+            for (n, t) in scalars {
+                m.insert(n.to_string(), scalar(t));
+            }
+            for (n, t, l) in objects {
+                m.insert(n.to_string(), object(t, *l));
+            }
+            m
+        };
+        cache.insert(
+            "UserTransaction".to_string(),
+            build(
+                &[("id", "String"), ("txHash", "String"), ("action", "String"), ("timestamp", "Int")],
+                &[
+                    ("supply", "Supply", false),
+                    ("borrow", "Borrow", false),
+                    ("repay", "Repay", false),
+                    ("user", "TxUser", false),
+                ],
+            ),
+        );
+        cache.insert(
+            "Supply".to_string(),
+            build(
+                &[("id", "String"), ("amount", "numeric"), ("assetPriceUSD", "numeric")],
+                &[("reserve", "Reserve", false)],
+            ),
+        );
+        cache.insert(
+            "Borrow".to_string(),
+            build(
+                &[("id", "String"), ("amount", "numeric"), ("borrowRateMode", "Int")],
+                &[("reserve", "Reserve", false)],
+            ),
+        );
+        cache.insert(
+            "Repay".to_string(),
+            build(&[("id", "String"), ("amount", "numeric")], &[("reserve", "Reserve", false)]),
+        );
+        cache.insert(
+            "Reserve".to_string(),
+            build(&[("id", "String"), ("symbol", "String"), ("decimals", "Int")], &[]),
+        );
+        cache.insert("TxUser".to_string(), build(&[("id", "String")], &[("userTransactions", "UserTransaction", true)]));
+        // A list of the interface type and two links to one target: the list must be
+        // ignored and the pair must be reported as ambiguous.
+        cache.insert(
+            "TxAccount".to_string(),
+            build(
+                &[("id", "String")],
+                &[
+                    ("txs", "UserTransaction", true),
+                    ("first", "Supply", false),
+                    ("second", "Supply", false),
+                ],
+            ),
+        );
     }
 
     // Update timestamp
