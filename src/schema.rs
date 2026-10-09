@@ -289,28 +289,68 @@ pub fn nested_type_of(parent: &str, field: &str) -> Option<String> {
 pub fn resolve_entity_for_collection_field(field_name: &str) -> Option<String> {
     let cache = SCHEMA_CACHE.clone();
 
-    // Exact match against every root-field spelling graph-node could produce.
-    let exact = cache
-        .iter()
-        .find(|entry| graph_node_field_names(entry.key()).iter().any(|c| c == field_name))
-        .map(|entry| entry.key().clone());
-    if exact.is_some() {
-        return exact;
-    }
+    // Ordered passes, most specific first. Each pass is total rather than
+    // first-hit: a pass that matches two entities is ambiguous, and picking one
+    // would depend on DashMap iteration order, so it resolves to nothing and
+    // leaves the caller on its lexical fallback.
+    let passes: [(bool, bool); 4] = [
+        // (plural, case_sensitive)
+        (true, true),
+        (false, true),
+        (true, false),
+        (false, false),
+    ];
+    let needle = field_name.to_lowercase();
 
-    // Case-insensitive fallback. Clients hand-write the other casing often
-    // enough that guessing an entity that does not exist - which surfaces as an
-    // empty list rather than an error - is the worse outcome.
-    let lower = field_name.to_lowercase();
-    let insensitive = cache
-        .iter()
-        .find(|entry| {
-            graph_node_field_names(entry.key())
-                .iter()
-                .any(|c| c.to_lowercase() == lower)
-        })
-        .map(|entry| entry.key().clone());
-    insensitive
+    for (plural, case_sensitive) in passes {
+        let mut hit: Option<String> = None;
+        for entry in cache.iter() {
+            let entity = entry.key();
+            let matches = graph_node_singulars(entity).into_iter().any(|singular| {
+                let candidate = if plural { pluralize(&singular) } else { singular };
+                if case_sensitive {
+                    candidate == field_name
+                } else {
+                    candidate.to_lowercase() == needle
+                }
+            });
+            if !matches {
+                continue;
+            }
+            if hit.is_some() {
+                tracing::debug!(
+                    field = field_name,
+                    "Root field is ambiguous across entities; leaving it to the lexical fallback"
+                );
+                hit = None;
+                break;
+            }
+            hit = Some(entity.clone());
+        }
+        if hit.is_some() {
+            return hit;
+        }
+    }
+    None
+}
+
+/// Whether `field_name` is one of `entity`'s singular spellings, i.e. a root
+/// field that returns one object rather than a list. `None` when the schema does
+/// not know the entity, so the caller can keep its own lexical guess.
+///
+/// `conversion.rs` used to decide this with `!field.ends_with('s')`, which is
+/// wrong for every entity whose own name ends in `s` (`Address`, `Status`,
+/// `Series`): `address(id: …)` would be served as a list.
+pub fn is_singular_field_for(field_name: &str, entity: &str) -> Option<bool> {
+    let cache = SCHEMA_CACHE.clone();
+    if !cache.contains_key(entity) {
+        return None;
+    }
+    Some(
+        graph_node_singulars(entity)
+            .iter()
+            .any(|singular| singular == field_name || singular.to_lowercase() == field_name.to_lowercase()),
+    )
 }
 
 /// Every root-field spelling that can refer to `entity`, singular and plural.
@@ -321,15 +361,14 @@ pub fn resolve_entity_for_collection_field(field_name: &str) -> Option<String> {
 /// rejects `aTokenBalanceHistoryItems` and `eModeCategories` outright. The
 /// lowercase-first-letter form is kept as an accepted alias so queries written
 /// against the Hyperindex schema keep working.
-fn graph_node_field_names(entity: &str) -> Vec<String> {
-    let mut singulars = vec![lower_leading_acronym(entity), lower_first_char(entity)];
-    singulars.dedup();
-    let mut names = Vec::with_capacity(singulars.len() * 2);
-    for singular in singulars {
-        names.push(pluralize(&singular));
-        names.push(singular);
+fn graph_node_singulars(entity: &str) -> Vec<String> {
+    let acronym = lower_leading_acronym(entity);
+    let first = lower_first_char(entity);
+    if acronym == first {
+        vec![acronym]
+    } else {
+        vec![acronym, first]
     }
-    names
 }
 
 /// `UserReserve` -> `userReserve`
@@ -348,13 +387,12 @@ fn lower_leading_acronym(entity: &str) -> String {
         .take_while(|c| c.is_uppercase())
         .count()
         .max(1);
-    let (head, tail) = entity.split_at(
-        entity
-            .char_indices()
-            .nth(run)
-            .map(|(i, _)| i)
-            .unwrap_or(entity.len()),
-    );
+    let split = entity
+        .char_indices()
+        .nth(run)
+        .map(|(i, _)| i)
+        .unwrap_or(entity.len());
+    let (head, tail) = entity.split_at(split);
     head.to_lowercase() + tail
 }
 

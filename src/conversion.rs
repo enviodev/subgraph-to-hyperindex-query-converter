@@ -23,7 +23,7 @@ pub enum ConversionError {
 
 /// Where one half of an `order_by` pair comes from: a GraphQL variable the client
 /// sends, or a literal written into the query text.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderValueSource {
     Variable(String),
     Literal(String),
@@ -244,19 +244,22 @@ fn convert_query_structure(
     // `_meta` is handled by a dedicated path, so it has to be recognized as an
     // actual root field. A substring test would also fire on an entity whose
     // name merely contains `_meta` (`token_metadata`) and hijack the whole query.
-    let root_fields = root_field_names(&main_query);
-    if root_fields.iter().any(|name| name == "_meta") {
+    let roots = root_fields(&main_query);
+    if let Some((meta_alias, _)) = roots.iter().find(|(_, name)| name == "_meta") {
         // `chain_metadata` replaces the whole operation, so anything alongside
         // `_meta` would be dropped without a word. Say so instead.
-        let others: Vec<&str> = root_fields
+        let others: Vec<&str> = roots
             .iter()
-            .filter(|name| *name != "_meta")
-            .map(|name| name.as_str())
+            .filter(|(_, name)| name != "_meta")
+            .map(|(_, name)| name.as_str())
             .collect();
         if !others.is_empty() {
             return Err(ConversionError::MetaWithOtherFields(others.join(", ")));
         }
-        let (converted_query, meta_selection) = convert_meta_query(&main_query)?;
+        let (converted_query, mut meta_selection) = convert_meta_query(&main_query)?;
+        // `_meta` has its own path, so it would otherwise miss the alias support
+        // every other root field gets.
+        meta_selection.alias = meta_alias.clone();
         return Ok(MainConversion {
             converted_query,
             field_name_map: HashMap::new(),
@@ -621,78 +624,119 @@ fn convert_main_query(
     // rewritten to its link fields before anything below sees the selection.
     let root_types: Vec<String> = entities
         .iter()
-        .map(|(_, entity, _, _)| singularize_and_capitalize(entity))
+        .map(|e| singularize_and_capitalize(&e.name))
         .collect();
     let root_pairs: Vec<(&str, &str)> = entities
         .iter()
         .zip(&root_types)
-        .map(|((_, _, _, selection), ty)| (ty.as_str(), selection.as_str()))
+        .map(|(e, ty)| (ty.as_str(), e.selection.as_str()))
         .collect();
     let rewrites = fragments::rewrite_all(fragments_text, &root_pairs);
     let fragments_override = rewrites.fragments;
     let mut root_rewrites = rewrites.roots.into_iter();
     let mut shape_plans: HashMap<String, ShapePlan> = HashMap::new();
 
-    for (alias, entity, params, selection) in entities {
-        // `block: { number: N }` is subgraph time travel. There is no Hasura
-        // equivalent, and letting it fall through to the generic argument
-        // handler turned it into `where: {block: {number: {_eq: N}}}` - a 200
-        // with the wrong rows instead of an error.
-        if params
-            .keys()
-            .any(|k| k == "block" || k.starts_with("block."))
-        {
-            return Err(ConversionError::BlockArgument(alias.unwrap_or(entity)));
+    // Response keys handed out in this operation, each with the caller key it
+    // resolves to. Hasura requires response names to be unique, and
+    // `field_name_map` has to stay injective or two roots collapse onto one key
+    // in the rename pass. Two roots that share a caller key are the deliberate
+    // merge case (`{ trades { a } trades { b } }`) and keep the same key.
+    let mut used_response_keys: HashMap<String, String> = HashMap::new();
+
+    for RootField {
+        alias,
+        name: entity,
+        params,
+        has_block_argument,
+        selection,
+    } in entities
+    {
+        // Subgraph time travel. There is no Hasura equivalent, and letting it
+        // fall through to the generic argument handler turned it into
+        // `where: {block: {number: {_eq: N}}}` - a 200 with the wrong rows
+        // instead of an error. Read from the raw arguments, so a legitimate
+        // `where: { block: ... }` filter is untouched.
+        if has_block_argument {
+            return Err(ConversionError::BlockArgument(entity));
         }
         let entity_cap = singularize_and_capitalize(&entity);
-        // Hasura honours aliases, so an aliased root field is emitted as
-        // `alias: Entity(...)` and comes back already keyed the way the caller
-        // asked. Without this the alias was dropped and the response key
-        // silently reverted to the entity's own name.
-        let emitted_root = match &alias {
-            Some(a) => format!("{}: {}", a, entity_cap),
-            None => entity_cap.clone(),
+
+        // Whether this root returns one object rather than a list. Ask the
+        // schema which spelling was used; `!entity.ends_with('s')` is only a
+        // fallback, and it is wrong for entities whose own name ends in `s`.
+        let is_pk = params.len() == 1
+            && params.contains_key("id")
+            && schema::is_singular_field_for(&entity, &entity_cap)
+                .unwrap_or_else(|| !entity.ends_with('s'));
+
+        // The key the caller expects to read the result under.
+        let client_key = alias.clone().unwrap_or_else(|| entity.clone());
+        // The key we would naturally emit for it.
+        let natural_key = match (&alias, is_pk) {
+            (Some(a), _) => a.clone(),
+            (None, true) => format!("{}_by_pk", entity_cap),
+            (None, false) => entity_cap.clone(),
         };
+        // An alias is free-form, so it can collide with another root's entity
+        // name (`users: reserves` beside `users`, or `Reserve: users` beside
+        // `reserves`). Hasura rejects duplicate response names outright, and a
+        // duplicate `field_name_map` key silently drops one result set, so
+        // disambiguate before either can happen.
+        let response_key = {
+            let mut candidate = natural_key.clone();
+            let mut n = 2;
+            while used_response_keys
+                .get(&candidate)
+                .is_some_and(|taken| *taken != client_key)
+            {
+                candidate = format!("{}_{}", natural_key, n);
+                n += 1;
+            }
+            candidate
+        };
+        used_response_keys.insert(response_key.clone(), client_key.clone());
+
+        // Hasura honours aliases, so the root is emitted under the key the
+        // response needs. Without this the alias was dropped and the response
+        // key silently reverted to the entity's own name.
+        let hasura_field = if is_pk {
+            format!("{}_by_pk", entity_cap)
+        } else {
+            entity_cap.clone()
+        };
+        let emitted_root = if response_key == hasura_field {
+            hasura_field.clone()
+        } else {
+            format!("{}: {}", response_key, hasura_field)
+        };
+
         let selection = match root_rewrites.next().flatten() {
             Some(rewrite) => {
                 // Key by the root field actually emitted below, and merge: the same
                 // entity can be selected twice in one operation (GraphQL merges them).
-                let is_pk = !entity.ends_with('s') && params.len() == 1 && params.contains_key("id");
-                let key = match (&alias, is_pk) {
-                    (Some(a), _) => a.clone(),
-                    (None, true) => format!("{}_by_pk", entity_cap),
-                    (None, false) => entity_cap.clone(),
-                };
-                shape_plans.entry(key).or_default().merge(rewrite.plan);
+                shape_plans
+                    .entry(response_key.clone())
+                    .or_default()
+                    .merge(rewrite.plan);
                 rewrite.selection
             }
             None => selection,
         };
 
-        // Record the mapping: Hyperindex name -> original query name
-        // e.g., "LpAction" -> "lpActions", "LpAction_by_pk" -> "lpActions".
-        // An aliased field already comes back under the alias, so it maps to
-        // itself - the identity entry keeps the PascalCase fallback in
+        // Record the mapping: emitted response key -> the key the caller asked
+        // for. For an unaliased root those differ ("LpAction" -> "lpActions");
+        // for an aliased one the alias maps to itself, and that identity entry
+        // also keeps the PascalCase fallback in
         // `transform_response_to_subgraph_shape` from rewriting it.
-        match &alias {
-            Some(a) => {
-                field_name_map.insert(a.clone(), a.clone());
-            }
-            None => {
-                field_name_map.insert(entity_cap.clone(), entity.clone());
-                field_name_map.insert(format!("{}_by_pk", entity_cap), entity.clone());
-            }
-        }
+        field_name_map.insert(response_key.clone(), client_key);
+
         // Extract limit/offset, preserving GraphQL variables (e.g., $first/$skip)
         let limit = params.get("first").cloned();
         let offset = params.get("skip").cloned();
 
         // Single-entity by primary key: singular entity, only 'id' param
-        if !entity.ends_with('s') && params.len() == 1 && params.contains_key("id") {
-            let pk_root = match &alias {
-                Some(a) => format!("{}: {}_by_pk", a, entity_cap),
-                None => format!("{}_by_pk", entity_cap),
-            };
+        if is_pk {
+            let pk_root = emitted_root.clone();
             let pk_query = format!(
                 "  {}(id: {}) {}",
                 pk_root,
@@ -991,9 +1035,25 @@ fn plan_order_by(
     // instead of quietly returning unordered rows.
     let var = field.trim_start_matches('$').to_string();
 
+    let direction_source = match (&dir_var, order_dir) {
+        (Some(d), _) => OrderValueSource::Variable(d.clone()),
+        (None, Some(lit)) => OrderValueSource::Literal(lit.to_string()),
+        (None, None) => OrderValueSource::Literal("asc".to_string()),
+    };
+
+    // Two roots can share one `orderBy` variable while asking for different
+    // directions (`a: reserves(orderBy: $o, orderDirection: $d1)` beside
+    // `b: … $d2`). They cannot then share one rewritten variable, or the second
+    // root silently inherits the first root's direction.
+    let direction_conflict = order_var_owner.get(&var).is_some()
+        && specs
+            .iter()
+            .any(|sp| sp.target_var == var && sp.direction_source != direction_source);
+
     let target_var = match order_var_owner.get(&var) {
-        // One variable cannot be typed as two different entities' order_by.
-        Some(prev) if prev != entity_cap => {
+        // One variable cannot be typed as two different entities' order_by, nor
+        // carry two different directions.
+        Some(prev) if prev != entity_cap || direction_conflict => {
             let mut name;
             loop {
                 *synth_counter += 1;
@@ -1015,15 +1075,14 @@ fn plan_order_by(
         dead_candidates.push(dir);
     }
 
-    if !specs.iter().any(|sp| sp.target_var == target_var) {
+    if !specs
+        .iter()
+        .any(|sp| sp.target_var == target_var && sp.direction_source == direction_source)
+    {
         specs.push(OrderBySpec {
             target_var: target_var.clone(),
             field_source: OrderValueSource::Variable(var),
-            direction_source: match (&dir_var, order_dir) {
-                (Some(d), _) => OrderValueSource::Variable(d.clone()),
-                (None, Some(lit)) => OrderValueSource::Literal(lit.to_string()),
-                (None, None) => OrderValueSource::Literal("asc".to_string()),
-            },
+            direction_source,
             entity: entity_cap.to_string(),
         });
     }
@@ -1257,12 +1316,25 @@ fn rewrite_filter_type_names(header: &str) -> String {
     out
 }
 
-/// Returns `(alias, field, params, selection)` per root field. `alias` is set
-/// only when the query renamed the field (`a: reserves`), in which case the
-/// response must come back under `a`.
-fn extract_multiple_entities(
-    query: &str,
-) -> Result<Vec<(Option<String>, String, HashMap<String, String>, String)>, ConversionError> {
+/// One root field of the operation.
+struct RootField {
+    /// Set only when the query renamed the field (`a: reserves`), in which case
+    /// the response must come back under `a`.
+    alias: Option<String>,
+    name: String,
+    params: HashMap<String, String>,
+    /// A literal top-level `block:` argument, i.e. subgraph time travel.
+    ///
+    /// Recorded here rather than inferred from `params`, because
+    /// `parse_single_param` deliberately hoists the contents of `where: {...}`
+    /// into the same map unprefixed. By then a `block` key is ambiguous: it is
+    /// equally a time-travel argument and a filter on an entity that has a
+    /// `block` field.
+    has_block_argument: bool,
+    selection: String,
+}
+
+fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionError> {
     let mut entities = Vec::new();
     let query_chars: Vec<char> = query.chars().collect();
     let mut current_pos = 0;
@@ -1309,6 +1381,7 @@ fn extract_multiple_entities(
             continue;
         }
 
+        let mut token_end = current_pos;
         let mut entity_name = query_chars[entity_start..current_pos]
             .iter()
             .collect::<String>();
@@ -1337,6 +1410,7 @@ fn extract_multiple_entities(
                     alias = Some(entity_name.clone());
                     entity_name = query_chars[field_start..probe].iter().collect::<String>();
                     current_pos = probe;
+                    token_end = probe;
                 }
             }
         }
@@ -1365,6 +1439,7 @@ fn extract_multiple_entities(
         }
 
         let mut params = HashMap::new();
+        let mut has_block_argument = false;
 
         if current_pos < query_chars.len() && query_chars[current_pos] == '(' {
             println!("DEBUG: Found entity definition for '{}'", entity_name);
@@ -1398,6 +1473,7 @@ fn extract_multiple_entities(
             let params_str = query_chars[params_start..current_pos]
                 .iter()
                 .collect::<String>();
+            has_block_argument = has_top_level_argument(&params_str, "block");
             parse_graphql_params(&params_str, &mut params)?;
 
             // Advance past the closing parenthesis
@@ -1413,8 +1489,14 @@ fn extract_multiple_entities(
                 "DEBUG: No opening parenthesis or brace after '{}', skipping",
                 entity_name
             );
-            // This is not an entity definition, skip
-            current_pos += 1;
+            // Not an entity definition. Resume at the end of the token just
+            // read: `current_pos` has been advanced past trailing whitespace and
+            // is sitting inside the next identifier, so stepping on from here
+            // would read that identifier from its second character.
+            current_pos = token_end;
+            if current_pos <= entity_start {
+                current_pos = entity_start + 1;
+            }
             continue;
         }
 
@@ -1486,13 +1568,19 @@ fn extract_multiple_entities(
         println!("DEBUG: Params for {}: {:?}", entity_name, params);
         println!("DEBUG: Selection for {}: {}", entity_name, selection_set);
 
-        entities.push((alias, entity_name, params, selection_set));
+        entities.push(RootField {
+            alias,
+            name: entity_name,
+            params,
+            has_block_argument,
+            selection: selection_set,
+        });
     }
 
     println!(
         "DEBUG: Found {} entities: {:?}",
         entities.len(),
-        entities.iter().map(|(_, name, _, _)| name).collect::<Vec<_>>()
+        entities.iter().map(|e| &e.name).collect::<Vec<_>>()
     );
     Ok(entities)
 }
@@ -1577,12 +1665,12 @@ fn sanitize_fragment_arguments(fragment_text: &str) -> String {
 /// Root-level field names of an operation, in source order.
 ///
 /// Only the outermost selection set is inspected: nested fields, arguments and
-/// string literals are skipped, and an alias label is discarded in favour of the
-/// field it points at (`recent: streams` yields `streams`).
+/// string literals are skipped. Each entry is `(alias, field)`; `recent: streams`
+/// yields `(Some("recent"), "streams")`.
 ///
 /// This exists so `_meta` can be recognized as a real root field rather than by
 /// substring, which also matches an entity like `token_metadata`.
-fn root_field_names(query: &str) -> Vec<String> {
+fn root_fields(query: &str) -> Vec<(Option<String>, String)> {
     let start = match query.find('{') {
         Some(i) => i,
         None => return Vec::new(),
@@ -1593,7 +1681,8 @@ fn root_field_names(query: &str) -> Vec<String> {
     };
     let body: Vec<char> = query[start + 1..end].chars().collect();
 
-    let mut names = Vec::new();
+    let mut names: Vec<(Option<String>, String)> = Vec::new();
+    let mut pending_alias: Option<String> = None;
     let mut depth = 0i32;
     let mut in_str = false;
     let mut i = 0;
@@ -1636,8 +1725,9 @@ fn root_field_names(query: &str) -> Vec<String> {
                 }
                 if j < body.len() && body[j] == ':' {
                     i = j + 1;
+                    pending_alias = Some(name);
                 } else {
-                    names.push(name);
+                    names.push((pending_alias.take(), name));
                 }
             }
             _ => i += 1,
@@ -1656,6 +1746,8 @@ pub struct MetaSelection {
     pub block_number: bool,
     pub typename: bool,
     pub block_typename: bool,
+    /// Set when the caller wrote `m: _meta`, so the response uses that key.
+    pub alias: Option<String>,
 }
 
 /// Leaf paths a `_meta` selection may request and still be answered in full.
@@ -1692,6 +1784,7 @@ fn convert_meta_query(query: &str) -> Result<(String, MetaSelection), Conversion
         block_number: requested.iter().any(|p| p == "block.number"),
         typename: requested.iter().any(|p| p == "__typename"),
         block_typename: requested.iter().any(|p| p == "block.__typename"),
+            alias: None,
     };
 
     Ok((
@@ -2776,6 +2869,81 @@ fn parse_single_param(
 
 // Removed unused brace matching helper
 
+/// Whether `params_str` has `name` as a *top-level* argument.
+///
+/// `parse_single_param` hoists `where: {...}` contents into the same map without
+/// a prefix, so by the time arguments are parsed a key like `block` is
+/// ambiguous. This reads the raw argument text instead, where nesting is still
+/// visible.
+fn has_top_level_argument(params_str: &str, name: &str) -> bool {
+    let (mut brace, mut bracket, mut paren) = (0usize, 0usize, 0usize);
+    let mut in_string = false;
+    let mut escape = false;
+    let mut ident = String::new();
+
+    for ch in params_str.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        let top = brace == 0 && bracket == 0 && paren == 0;
+        match ch {
+            '"' => {
+                in_string = true;
+                ident.clear();
+            }
+            '{' => {
+                brace += 1;
+                ident.clear();
+            }
+            '}' => {
+                brace = brace.saturating_sub(1);
+                ident.clear();
+            }
+            '[' => {
+                bracket += 1;
+                ident.clear();
+            }
+            ']' => {
+                bracket = bracket.saturating_sub(1);
+                ident.clear();
+            }
+            '(' => {
+                paren += 1;
+                ident.clear();
+            }
+            ')' => {
+                paren = paren.saturating_sub(1);
+                ident.clear();
+            }
+            ':' if top => {
+                if ident == name {
+                    return true;
+                }
+                ident.clear();
+            }
+            c if c.is_alphanumeric() || c == '_' => {
+                if top {
+                    ident.push(c);
+                }
+            }
+            // Whitespace between the name and its colon is allowed; anything
+            // else ends the candidate.
+            c if c.is_whitespace() => {}
+            _ => ident.clear(),
+        }
+    }
+    false
+}
+
 fn singularize_and_capitalize(s: &str) -> String {
     // Prefer an entity the schema actually declares. Word rules cannot recover
     // `TxTransfers` from `txTransferses`, and a wrong guess queries a table that
@@ -2995,6 +3163,7 @@ mod tests {
                 block_number: true,
                 typename: false,
                 block_typename: false,
+                alias: None,
             })
         );
     }
@@ -3012,6 +3181,7 @@ mod tests {
                 block_number: true,
                 typename: true,
                 block_typename: true,
+                alias: None,
             })
         );
     }
@@ -3424,6 +3594,120 @@ mod tests {
             Err(ConversionError::InvalidQueryFormat) => {}
             _ => panic!("Expected InvalidQueryFormat error"),
         }
+    }
+
+    #[test]
+    fn a_where_filter_on_a_block_field_is_not_mistaken_for_time_travel() {
+        init_test_schema_if_needed();
+        // `parse_single_param` hoists `where: {...}` into the same param map
+        // unprefixed, so the guard cannot read the flattened keys.
+        let payload = create_test_payload(r#"query { trades(where: { block: 123 }, first: 1) { id } }"#);
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("where: {block: {_eq: 123}}"), "{converted}");
+    }
+
+    #[test]
+    fn a_nested_where_filter_named_block_is_not_mistaken_for_time_travel() {
+        init_test_schema_if_needed();
+        let payload =
+            create_test_payload(r#"query { trades(where: { block: { number: 5 } }, first: 1) { id } }"#);
+        assert!(convert_subgraph_to_hyperindex(&payload, None).is_ok());
+    }
+
+    #[test]
+    fn an_alias_colliding_with_another_roots_entity_name_gets_a_distinct_hasura_key() {
+        init_test_schema_if_needed();
+        // `users:` is the alias of one root; `User` is the Hasura name of the
+        // other. Emitting both under the same response name makes Hasura reject
+        // the whole operation, so the keys must differ.
+        //
+        // (The two roots here share the caller-facing name `users`, which is
+        // itself invalid GraphQL - graph-node rejects two root fields with the
+        // same response name. The converter only has to avoid turning it into a
+        // 502 from Hasura.)
+        let payload = create_test_payload("query { users: trades(first: 1) { id } users(first: 1) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let keys: std::collections::HashSet<&String> = result.field_name_map.keys().collect();
+        assert_eq!(keys.len(), 2, "map: {:?}", result.field_name_map);
+    }
+
+    #[test]
+    fn an_alias_equal_to_an_entity_name_does_not_duplicate_a_response_name() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { Trade: users(first: 1) { id } trades(first: 1) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        // Whatever the emitted keys are, they must be distinct or Hasura rejects
+        // the operation with "specify the same response name".
+        let emitted: Vec<&String> = result.field_name_map.keys().collect();
+        assert_eq!(
+            emitted.iter().collect::<std::collections::HashSet<_>>().len(),
+            emitted.len(),
+            "{converted}"
+        );
+        assert!(result.field_name_map.values().any(|v| v == "Trade"), "{:?}", result.field_name_map);
+        assert!(result.field_name_map.values().any(|v| v == "trades"), "{:?}", result.field_name_map);
+    }
+
+    #[test]
+    fn two_roots_sharing_an_order_by_variable_keep_their_own_directions() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query Q($o: Trade_orderBy!, $d1: OrderDirection!, $d2: OrderDirection!) { \
+             a: trades(first: 2, orderBy: $o, orderDirection: $d1) { id } \
+             b: trades(first: 2, orderBy: $o, orderDirection: $d2) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        // One spec per direction, or the second root silently inherits the first.
+        assert_eq!(
+            result.order_by_variables.len(),
+            2,
+            "specs: {:?}",
+            result.order_by_variables
+        );
+        let targets: std::collections::HashSet<&String> = result
+            .order_by_variables
+            .iter()
+            .map(|sp| &sp.target_var)
+            .collect();
+        assert_eq!(targets.len(), 2, "specs: {:?}", result.order_by_variables);
+    }
+
+    #[test]
+    fn by_id_lookup_on_an_entity_whose_name_ends_in_s_returns_an_object() {
+        init_test_schema_if_needed();
+        // `TxTransfers` is a real entity name; `txTransfers` is its singular
+        // graph-node spelling, so this is a primary-key lookup, not a list.
+        let payload = create_test_payload(r#"query { txTransfers(id: "1") { id } }"#);
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("TxTransfers_by_pk(id:"), "{converted}");
+    }
+
+    #[test]
+    fn a_root_typename_does_not_corrupt_the_next_fields_alias() {
+        init_test_schema_if_needed();
+        // Apollo injects `__typename` into every selection set, root included.
+        // The scanner used to resume one character into the next identifier.
+        let payload = create_test_payload("query { __typename recent: trades(first: 1) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert!(
+            result.field_name_map.values().any(|v| v == "recent"),
+            "map: {:?}",
+            result.field_name_map
+        );
+    }
+
+    #[test]
+    fn an_aliased_meta_keeps_its_alias() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { m: _meta { block { number } } }");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        assert_eq!(
+            result.meta_selection.as_ref().and_then(|m| m.alias.clone()),
+            Some("m".to_string())
+        );
     }
 
     #[test]
@@ -6190,4 +6474,3 @@ mod tests {
         );
     }
 }
-
