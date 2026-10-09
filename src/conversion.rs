@@ -17,6 +17,8 @@ pub enum ConversionError {
     ComplexMetaQuery(String),
     #[error("_meta cannot be combined with other root fields: {0}")]
     MetaWithOtherFields(String),
+    #[error("Time-travel queries are not supported: `{0}` was asked for at a specific block. HyperIndex serves current state only, so answering at the latest block would look like an answer at the requested block")]
+    BlockArgument(String),
 }
 
 /// Where one half of an `order_by` pair comes from: a GraphQL variable the client
@@ -573,14 +575,15 @@ fn convert_main_query(
             (None, main_query.to_string())
         }
     } else if main_query.trim().starts_with('{') {
-        // Already a selection body, no header
-        (
-            None,
-            main_query
-                .trim_start_matches('{')
-                .trim_end_matches('}')
-                .to_string(),
-        )
+        // Already a selection body, no header. Strip exactly one brace at each
+        // end: `trim_start_matches`/`trim_end_matches` remove *every* repeat, so
+        // `{reserves{id}}` lost the inner `}` and the selection never closed.
+        let trimmed = main_query.trim();
+        let body = trimmed
+            .strip_prefix('{')
+            .map(|rest| rest.strip_suffix('}').unwrap_or(rest))
+            .unwrap_or(trimmed);
+        (None, body.to_string())
     } else {
         (None, main_query.to_string())
     };
@@ -618,29 +621,47 @@ fn convert_main_query(
     // rewritten to its link fields before anything below sees the selection.
     let root_types: Vec<String> = entities
         .iter()
-        .map(|(entity, _, _)| singularize_and_capitalize(entity))
+        .map(|(_, entity, _, _)| singularize_and_capitalize(entity))
         .collect();
     let root_pairs: Vec<(&str, &str)> = entities
         .iter()
         .zip(&root_types)
-        .map(|((_, _, selection), ty)| (ty.as_str(), selection.as_str()))
+        .map(|((_, _, _, selection), ty)| (ty.as_str(), selection.as_str()))
         .collect();
     let rewrites = fragments::rewrite_all(fragments_text, &root_pairs);
     let fragments_override = rewrites.fragments;
     let mut root_rewrites = rewrites.roots.into_iter();
     let mut shape_plans: HashMap<String, ShapePlan> = HashMap::new();
 
-    for (entity, params, selection) in entities {
+    for (alias, entity, params, selection) in entities {
+        // `block: { number: N }` is subgraph time travel. There is no Hasura
+        // equivalent, and letting it fall through to the generic argument
+        // handler turned it into `where: {block: {number: {_eq: N}}}` - a 200
+        // with the wrong rows instead of an error.
+        if params
+            .keys()
+            .any(|k| k == "block" || k.starts_with("block."))
+        {
+            return Err(ConversionError::BlockArgument(alias.unwrap_or(entity)));
+        }
         let entity_cap = singularize_and_capitalize(&entity);
+        // Hasura honours aliases, so an aliased root field is emitted as
+        // `alias: Entity(...)` and comes back already keyed the way the caller
+        // asked. Without this the alias was dropped and the response key
+        // silently reverted to the entity's own name.
+        let emitted_root = match &alias {
+            Some(a) => format!("{}: {}", a, entity_cap),
+            None => entity_cap.clone(),
+        };
         let selection = match root_rewrites.next().flatten() {
             Some(rewrite) => {
                 // Key by the root field actually emitted below, and merge: the same
                 // entity can be selected twice in one operation (GraphQL merges them).
                 let is_pk = !entity.ends_with('s') && params.len() == 1 && params.contains_key("id");
-                let key = if is_pk {
-                    format!("{}_by_pk", entity_cap)
-                } else {
-                    entity_cap.clone()
+                let key = match (&alias, is_pk) {
+                    (Some(a), _) => a.clone(),
+                    (None, true) => format!("{}_by_pk", entity_cap),
+                    (None, false) => entity_cap.clone(),
                 };
                 shape_plans.entry(key).or_default().merge(rewrite.plan);
                 rewrite.selection
@@ -649,18 +670,32 @@ fn convert_main_query(
         };
 
         // Record the mapping: Hyperindex name -> original query name
-        // e.g., "LpAction" -> "lpActions", "LpAction_by_pk" -> "lpActions"
-        field_name_map.insert(entity_cap.clone(), entity.clone());
-        field_name_map.insert(format!("{}_by_pk", entity_cap), entity.clone());
+        // e.g., "LpAction" -> "lpActions", "LpAction_by_pk" -> "lpActions".
+        // An aliased field already comes back under the alias, so it maps to
+        // itself - the identity entry keeps the PascalCase fallback in
+        // `transform_response_to_subgraph_shape` from rewriting it.
+        match &alias {
+            Some(a) => {
+                field_name_map.insert(a.clone(), a.clone());
+            }
+            None => {
+                field_name_map.insert(entity_cap.clone(), entity.clone());
+                field_name_map.insert(format!("{}_by_pk", entity_cap), entity.clone());
+            }
+        }
         // Extract limit/offset, preserving GraphQL variables (e.g., $first/$skip)
         let limit = params.get("first").cloned();
         let offset = params.get("skip").cloned();
 
         // Single-entity by primary key: singular entity, only 'id' param
         if !entity.ends_with('s') && params.len() == 1 && params.contains_key("id") {
+            let pk_root = match &alias {
+                Some(a) => format!("{}: {}_by_pk", a, entity_cap),
+                None => format!("{}_by_pk", entity_cap),
+            };
             let pk_query = format!(
-                "  {}_by_pk(id: {}) {}",
-                entity_cap,
+                "  {}(id: {}) {}",
+                pk_root,
                 params.get("id").unwrap(),
                 selection
             );
@@ -746,7 +781,7 @@ fn convert_main_query(
             format!("({})", params_vec.join(", "))
         };
 
-        let converted_entity = format!("  {}{} {}", entity_cap, params_str, selection);
+        let converted_entity = format!("  {}{} {}", emitted_root, params_str, selection);
         converted_entities.push(converted_entity);
     }
 
@@ -1222,9 +1257,12 @@ fn rewrite_filter_type_names(header: &str) -> String {
     out
 }
 
+/// Returns `(alias, field, params, selection)` per root field. `alias` is set
+/// only when the query renamed the field (`a: reserves`), in which case the
+/// response must come back under `a`.
 fn extract_multiple_entities(
     query: &str,
-) -> Result<Vec<(String, HashMap<String, String>, String)>, ConversionError> {
+) -> Result<Vec<(Option<String>, String, HashMap<String, String>, String)>, ConversionError> {
     let mut entities = Vec::new();
     let query_chars: Vec<char> = query.chars().collect();
     let mut current_pos = 0;
@@ -1271,9 +1309,37 @@ fn extract_multiple_entities(
             continue;
         }
 
-        let entity_name = query_chars[entity_start..current_pos]
+        let mut entity_name = query_chars[entity_start..current_pos]
             .iter()
             .collect::<String>();
+
+        // `alias: field` - GraphQL lets any root field be renamed, and the
+        // response must use the alias. This has to run before the validity
+        // guard below, which would otherwise discard a short alias like `a`.
+        let mut alias: Option<String> = None;
+        {
+            let mut probe = current_pos;
+            while probe < query_chars.len() && query_chars[probe].is_whitespace() {
+                probe += 1;
+            }
+            if probe < query_chars.len() && query_chars[probe] == ':' {
+                probe += 1;
+                while probe < query_chars.len() && query_chars[probe].is_whitespace() {
+                    probe += 1;
+                }
+                let field_start = probe;
+                while probe < query_chars.len()
+                    && (query_chars[probe].is_alphanumeric() || query_chars[probe] == '_')
+                {
+                    probe += 1;
+                }
+                if probe > field_start {
+                    alias = Some(entity_name.clone());
+                    entity_name = query_chars[field_start..probe].iter().collect::<String>();
+                    current_pos = probe;
+                }
+            }
+        }
         println!("DEBUG: Found potential entity name: '{}'", entity_name);
 
         // Skip if this is not a valid entity name (too short or common words)
@@ -1420,13 +1486,13 @@ fn extract_multiple_entities(
         println!("DEBUG: Params for {}: {:?}", entity_name, params);
         println!("DEBUG: Selection for {}: {}", entity_name, selection_set);
 
-        entities.push((entity_name, params, selection_set));
+        entities.push((alias, entity_name, params, selection_set));
     }
 
     println!(
         "DEBUG: Found {} entities: {:?}",
         entities.len(),
-        entities.iter().map(|(name, _, _)| name).collect::<Vec<_>>()
+        entities.iter().map(|(_, name, _, _)| name).collect::<Vec<_>>()
     );
     Ok(entities)
 }
@@ -3357,6 +3423,88 @@ mod tests {
         match result {
             Err(ConversionError::InvalidQueryFormat) => {}
             _ => panic!("Expected InvalidQueryFormat error"),
+        }
+    }
+
+    #[test]
+    fn acronym_entity_names_use_graph_nodes_spelling() {
+        init_test_schema_if_needed();
+        // graph-node lowercases the leading run of capitals and rejects any other
+        // spelling, so these are the only names a real subgraph client can send.
+        assert_eq!(
+            singularize_and_capitalize("atokenBalanceHistoryItems"),
+            "ATokenBalanceHistoryItem"
+        );
+        assert_eq!(
+            singularize_and_capitalize("atokenBalanceHistoryItem"),
+            "ATokenBalanceHistoryItem"
+        );
+        assert_eq!(singularize_and_capitalize("emodeCategories"), "EModeCategory");
+        assert_eq!(singularize_and_capitalize("emodeCategory"), "EModeCategory");
+        // The lowercase-first-letter spelling stays accepted.
+        assert_eq!(
+            singularize_and_capitalize("aTokenBalanceHistoryItems"),
+            "ATokenBalanceHistoryItem"
+        );
+        assert_eq!(singularize_and_capitalize("eModeCategories"), "EModeCategory");
+    }
+
+    #[test]
+    fn root_field_alias_is_preserved() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { a: streams(first: 1) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(
+            converted.contains("a: Stream(limit: 1)"),
+            "alias missing from converted query: {converted}"
+        );
+        // The response already arrives keyed by the alias, so it must map to itself.
+        assert_eq!(result.field_name_map.get("a"), Some(&"a".to_string()));
+    }
+
+    #[test]
+    fn primary_key_alias_is_preserved() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(r#"query { s: stream(id: "1") { id } }"#);
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(
+            converted.contains(r#"s: Stream_by_pk(id: "1")"#),
+            "alias missing from converted pk query: {converted}"
+        );
+    }
+
+    #[test]
+    fn two_aliases_of_one_entity_both_survive() {
+        init_test_schema_if_needed();
+        let payload =
+            create_test_payload("query { first: streams(first: 1) { id } second: streams(first: 2) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("first: Stream(limit: 1)"), "{converted}");
+        assert!(converted.contains("second: Stream(limit: 2)"), "{converted}");
+    }
+
+    #[test]
+    fn selection_set_survives_a_body_with_no_spaces() {
+        init_test_schema_if_needed();
+        // `trim_end_matches('}')` used to eat both closing braces, leaving the
+        // selection set unterminated and the query empty.
+        let payload = create_test_payload("{streams{id}}");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("Stream"), "{converted}");
+        assert!(converted.contains("id"), "{converted}");
+    }
+
+    #[test]
+    fn block_argument_is_rejected_rather_than_turned_into_a_filter() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { streams(first: 1, block: { number: 100 }) { id } }");
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::BlockArgument(field)) => assert_eq!(field, "streams"),
+            other => panic!("expected BlockArgument, got {other:?}"),
         }
     }
 
@@ -6042,3 +6190,4 @@ mod tests {
         );
     }
 }
+

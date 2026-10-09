@@ -288,36 +288,92 @@ pub fn nested_type_of(parent: &str, field: &str) -> Option<String> {
 /// on its lexical fallback.
 pub fn resolve_entity_for_collection_field(field_name: &str) -> Option<String> {
     let cache = SCHEMA_CACHE.clone();
-    let found = cache
+
+    // Exact match against every root-field spelling graph-node could produce.
+    let exact = cache
         .iter()
-        .find(|entry| graph_node_plural(entry.key()) == field_name)
+        .find(|entry| graph_node_field_names(entry.key()).iter().any(|c| c == field_name))
         .map(|entry| entry.key().clone());
-    found
+    if exact.is_some() {
+        return exact;
+    }
+
+    // Case-insensitive fallback. Clients hand-write the other casing often
+    // enough that guessing an entity that does not exist - which surfaces as an
+    // empty list rather than an error - is the worse outcome.
+    let lower = field_name.to_lowercase();
+    let insensitive = cache
+        .iter()
+        .find(|entry| {
+            graph_node_field_names(entry.key())
+                .iter()
+                .any(|c| c.to_lowercase() == lower)
+        })
+        .map(|entry| entry.key().clone());
+    insensitive
 }
 
-/// graph-node's plural collection field for an entity: lowercase the first
-/// letter, then apply English pluralization.
-fn graph_node_plural(entity: &str) -> String {
+/// Every root-field spelling that can refer to `entity`, singular and plural.
+///
+/// graph-node lowercases the *leading run of capitals*, not just the first
+/// letter: `ATokenBalanceHistoryItem` is queried as `atokenBalanceHistoryItems`
+/// and `EModeCategory` as `emodeCategories`. Verified against graph-node, which
+/// rejects `aTokenBalanceHistoryItems` and `eModeCategories` outright. The
+/// lowercase-first-letter form is kept as an accepted alias so queries written
+/// against the Hyperindex schema keep working.
+fn graph_node_field_names(entity: &str) -> Vec<String> {
+    let mut singulars = vec![lower_leading_acronym(entity), lower_first_char(entity)];
+    singulars.dedup();
+    let mut names = Vec::with_capacity(singulars.len() * 2);
+    for singular in singulars {
+        names.push(pluralize(&singular));
+        names.push(singular);
+    }
+    names
+}
+
+/// `UserReserve` -> `userReserve`
+fn lower_first_char(entity: &str) -> String {
     let mut chars = entity.chars();
-    let lower_first = match chars.next() {
-        None => return String::new(),
+    match chars.next() {
+        None => String::new(),
         Some(f) => f.to_lowercase().collect::<String>() + chars.as_str(),
-    };
+    }
+}
 
-    let ends_with_any = |suffixes: &[&str]| suffixes.iter().any(|s| lower_first.ends_with(s));
+/// `ATokenBalanceHistoryItem` -> `atokenBalanceHistoryItem`, `UserReserve` -> `userReserve`.
+fn lower_leading_acronym(entity: &str) -> String {
+    let run = entity
+        .chars()
+        .take_while(|c| c.is_uppercase())
+        .count()
+        .max(1);
+    let (head, tail) = entity.split_at(
+        entity
+            .char_indices()
+            .nth(run)
+            .map(|(i, _)| i)
+            .unwrap_or(entity.len()),
+    );
+    head.to_lowercase() + tail
+}
 
-    if lower_first.ends_with('y')
-        && !lower_first.ends_with("ay")
-        && !lower_first.ends_with("ey")
-        && !lower_first.ends_with("iy")
-        && !lower_first.ends_with("oy")
-        && !lower_first.ends_with("uy")
+/// English pluralization, applied to an already-lowercased-head field name.
+fn pluralize(name: &str) -> String {
+    let ends_with_any = |suffixes: &[&str]| suffixes.iter().any(|s| name.ends_with(s));
+
+    if name.ends_with('y')
+        && !name.ends_with("ay")
+        && !name.ends_with("ey")
+        && !name.ends_with("iy")
+        && !name.ends_with("oy")
+        && !name.ends_with("uy")
     {
-        format!("{}ies", &lower_first[..lower_first.len() - 1])
+        format!("{}ies", &name[..name.len() - 1])
     } else if ends_with_any(&["s", "x", "z", "ch", "sh"]) {
-        format!("{}es", lower_first)
+        format!("{}es", name)
     } else {
-        format!("{}s", lower_first)
+        format!("{}s", name)
     }
 }
 
@@ -787,6 +843,23 @@ pub fn init_test_schema() {
                 ],
             ),
         );
+    }
+
+    // Entities whose names open with a run of capitals. graph-node queries these
+    // as `atokenBalanceHistoryItems` / `emodeCategories`, not `aToken…` / `eMode…`.
+    {
+        let mut id_only = HashMap::new();
+        id_only.insert(
+            "id".to_string(),
+            FieldInfo {
+                is_nested_entity: false,
+                nested_type_name: None,
+                field_type: "String".to_string(),
+                is_list: false,
+            },
+        );
+        cache.insert("ATokenBalanceHistoryItem".to_string(), id_only.clone());
+        cache.insert("EModeCategory".to_string(), id_only);
     }
 
     // Update timestamp

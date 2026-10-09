@@ -112,6 +112,8 @@ async fn execute_query_with_retry(
                     "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
                 conversion::ConversionError::MetaWithOtherFields(_) =>
                     "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
+                conversion::ConversionError::BlockArgument(_) =>
+                    "Hyperindex stores current state, not per-block history, so a query pinned to a past block cannot be answered. It is rejected rather than served at the latest block, because the caller could not tell the difference.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -193,6 +195,7 @@ async fn execute_query_with_retry(
             tracing::error!(
                 original_query = original_query,
                 converted_query = converted_query_str,
+                hyperindex_url = %hyperindex_url,
                 error = %details,
                 "Error forwarding converted query to Hyperindex"
             );
@@ -205,7 +208,6 @@ async fn execute_query_with_retry(
                     "debug": {
                         "originalQuery": original_query,
                         "convertedQuery": converted_query_str,
-                        "hyperindexUrl": hyperindex_url,
                         "chainId": chain_id.map(|c| serde_json::Value::String(c.to_string())).unwrap_or(serde_json::Value::Null),
                     },
                     "subgraphResponse": subgraph_debug,
@@ -223,12 +225,12 @@ async fn execute_query_with_retry(
         tracing::error!(
             original_query = original_query,
             converted_query = converted_query_str,
+            hyperindex_url = %hyperindex_url,
             "Upstream GraphQL returned errors for converted query"
         );
         let mut debug = serde_json::json!({
             "originalQuery": original_query,
             "convertedQuery": converted_query_str,
-            "hyperindexUrl": hyperindex_url,
         });
         if let Some(chain_id) = chain_id {
             debug["chainId"] = serde_json::Value::String(chain_id.to_string());
@@ -310,6 +312,8 @@ async fn handle_debug(Json(payload): Json<Value>) -> impl IntoResponse {
                     "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
                 conversion::ConversionError::MetaWithOtherFields(_) =>
                     "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
+                conversion::ConversionError::BlockArgument(_) =>
+                    "Hyperindex stores current state, not per-block history, so a query pinned to a past block cannot be answered. It is rejected rather than served at the latest block, because the caller could not tell the difference.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -370,6 +374,8 @@ async fn handle_chain_debug(
                     "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
                 conversion::ConversionError::MetaWithOtherFields(_) =>
                     "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
+                conversion::ConversionError::BlockArgument(_) =>
+                    "Hyperindex stores current state, not per-block history, so a query pinned to a past block cannot be answered. It is rejected rather than served at the latest block, because the caller could not tell the difference.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
