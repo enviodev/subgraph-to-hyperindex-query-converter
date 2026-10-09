@@ -84,7 +84,7 @@ async fn execute_query_with_retry(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": "Schema initialization failed",
-                "details": e.to_string()
+                "details": client_safe_upstream_error(&e)
             })),
         );
     }
@@ -112,6 +112,8 @@ async fn execute_query_with_retry(
                     "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
                 conversion::ConversionError::MetaWithOtherFields(_) =>
                     "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
+                conversion::ConversionError::BlockArgument(_) =>
+                    "Hyperindex stores current state, not per-block history, so a query pinned to a past block cannot be answered. It is rejected rather than served at the latest block, because the caller could not tell the difference.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -188,12 +190,13 @@ async fn execute_query_with_retry(
             metrics::QUERY_EXECUTION_ERRORS.inc();
             metrics::TOTAL_ERRORS.inc();
             tracing::error!("Hyperindex request error: {}", e);
-            let details = e.to_string();
+            let details = client_safe_upstream_error(&e);
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
             tracing::error!(
                 original_query = original_query,
                 converted_query = converted_query_str,
-                error = %details,
+                hyperindex_url = %loggable_upstream(&hyperindex_url),
+                error = %e,
                 "Error forwarding converted query to Hyperindex"
             );
             metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
@@ -205,7 +208,6 @@ async fn execute_query_with_retry(
                     "debug": {
                         "originalQuery": original_query,
                         "convertedQuery": converted_query_str,
-                        "hyperindexUrl": hyperindex_url,
                         "chainId": chain_id.map(|c| serde_json::Value::String(c.to_string())).unwrap_or(serde_json::Value::Null),
                     },
                     "subgraphResponse": subgraph_debug,
@@ -223,12 +225,12 @@ async fn execute_query_with_retry(
         tracing::error!(
             original_query = original_query,
             converted_query = converted_query_str,
+            hyperindex_url = %loggable_upstream(&hyperindex_url),
             "Upstream GraphQL returned errors for converted query"
         );
         let mut debug = serde_json::json!({
             "originalQuery": original_query,
             "convertedQuery": converted_query_str,
-            "hyperindexUrl": hyperindex_url,
         });
         if let Some(chain_id) = chain_id {
             debug["chainId"] = serde_json::Value::String(chain_id.to_string());
@@ -287,7 +289,7 @@ async fn handle_debug(Json(payload): Json<Value>) -> impl IntoResponse {
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": "Schema initialization failed",
-                "details": e.to_string()
+                "details": client_safe_upstream_error(&e)
             })),
         );
     }
@@ -310,6 +312,8 @@ async fn handle_debug(Json(payload): Json<Value>) -> impl IntoResponse {
                     "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
                 conversion::ConversionError::MetaWithOtherFields(_) =>
                     "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
+                conversion::ConversionError::BlockArgument(_) =>
+                    "Hyperindex stores current state, not per-block history, so a query pinned to a past block cannot be answered. It is rejected rather than served at the latest block, because the caller could not tell the difference.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -347,7 +351,7 @@ async fn handle_chain_debug(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": "Schema initialization failed",
-                "details": e.to_string()
+                "details": client_safe_upstream_error(&e)
             })),
         );
     }
@@ -370,6 +374,8 @@ async fn handle_chain_debug(
                     "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
                 conversion::ConversionError::MetaWithOtherFields(_) =>
                     "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
+                conversion::ConversionError::BlockArgument(_) =>
+                    "Hyperindex stores current state, not per-block history, so a query pinned to a past block cannot be answered. It is rejected rather than served at the latest block, because the caller could not tell the difference.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -424,6 +430,43 @@ fn apply_shape_plans(
     }
 }
 
+/// The upstream URL, with anything secret-shaped removed, for logs.
+///
+/// `HYPERINDEX_URL` is operator-supplied and can carry credentials in the
+/// userinfo or the query string. Scheme, host, port and path are kept because
+/// they identify which deployment was being talked to, which is the reason to
+/// log it at all.
+fn loggable_upstream(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Err(_) => "<unparseable HYPERINDEX_URL>".to_string(),
+    }
+}
+
+/// An upstream failure, with the upstream address stripped out, for the caller.
+///
+/// `reqwest::Error`'s `Display` embeds the request URL - "error sending request
+/// for url (http://internal-host:8080/v1/graphql)" - so returning it verbatim
+/// put an internal cluster address in a response body. The full error still goes
+/// to the logs.
+fn client_safe_upstream_error(e: &impl std::fmt::Display) -> String {
+    let text = e.to_string();
+    match (text.find("for url ("), text.rfind(')')) {
+        (Some(start), Some(end)) if end > start => {
+            let mut redacted = text.clone();
+            redacted.replace_range(start..=end, "for url (<upstream>)");
+            redacted
+        }
+        _ => text,
+    }
+}
+
 fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::collections::HashMap<String, String>, meta_selection: Option<&conversion::MetaSelection>) -> Value {
     let mut root = match resp {
         Value::Object(map) => map,
@@ -463,7 +506,8 @@ fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::colle
                 }
 
                 let mut out = serde_json::Map::new();
-                out.insert("_meta".to_string(), Value::Object(meta));
+                let meta_key = selection.alias.clone().unwrap_or_else(|| "_meta".to_string());
+                out.insert(meta_key, Value::Object(meta));
                 *data_obj = out;
                 return Value::Object(root);
             }
@@ -775,6 +819,7 @@ mod response_shape_tests {
                 block_number: true,
                 typename: false,
                 block_typename: false,
+                alias: None,
             }),
         );
         let data = out.get("data").unwrap();
