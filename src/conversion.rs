@@ -586,57 +586,55 @@ fn convert_main_query(
     };
 
     // Extract multiple entities from the main query body
-    let entities = extract_multiple_entities(&stripped_query)?;
+    let roots = extract_multiple_entities(&stripped_query)?;
 
     let mut converted_entities = Vec::new();
     // Build mapping from Hyperindex field names to original query field names
     let mut field_name_map: HashMap<String, String> = HashMap::new();
-    // Collect variable type overrides from all entities
-    let mut all_variable_type_overrides: HashMap<String, String> = HashMap::new();
-    // Track variables used as a top-level `where: $var` so their JSON value can
-    // be translated from subgraph filter shape to Hasura bool_exp shape at request time.
-    // Only variables whose declared type is a subgraph `*_filter` are recorded;
-    // variables typed as anything else (custom input types, already-migrated
-    // `*_bool_exp`, etc.) pass through verbatim.
-    let mut filter_variable_entities: HashMap<String, String> = HashMap::new();
-    // Unconditional header retypes for order arguments. Kept separate from
-    // `all_variable_type_overrides`, which only ever replaces a declared
-    // `String`/`Int` and so cannot touch `OrderDirection!` or `Entity_orderBy!`.
-    let mut order_by_retypes: HashMap<String, String> = HashMap::new();
-    let mut order_by_specs: Vec<OrderBySpec> = Vec::new();
-    // Declarations that may have become unused; confirmed against the built body.
-    let mut dead_candidates: Vec<String> = Vec::new();
-    let mut order_var_owner: HashMap<String, String> = HashMap::new();
-    let mut synth_counter: usize = 0;
     // Parse variable declarations once for the whole query.
-    let header_var_types: HashMap<String, String> = query_header
-        .as_deref()
-        .map(parse_variable_declarations)
-        .unwrap_or_default();
+    let mut ctx = ArgContext {
+        header_var_types: query_header
+            .as_deref()
+            .map(parse_variable_declarations)
+            .unwrap_or_default(),
+        ..ArgContext::default()
+    };
+
+    // Each root's Hyperindex entity, and whether it is a primary-key lookup.
+    let classified: Vec<(String, bool)> = roots
+        .iter()
+        .map(|root| classify_root_field(&root.name, &root.params))
+        .collect();
+    let selections: Vec<String> = roots
+        .iter()
+        .map(|root| format!("{{\n    {}\n  }}", sanitize_selection_set(&root.selection)))
+        .collect();
 
     // Type-conditioned fragments (`... on Supply { }`) on an interface stand-in are
     // rewritten to its link fields before anything below sees the selection.
-    let root_types: Vec<String> = entities
-        .iter()
-        .map(|(entity, _, _)| singularize_and_capitalize(entity))
-        .collect();
-    let root_pairs: Vec<(&str, &str)> = entities
-        .iter()
-        .zip(&root_types)
-        .map(|((_, _, selection), ty)| (ty.as_str(), selection.as_str()))
-        .collect();
-    let rewrites = fragments::rewrite_all(fragments_text, &root_pairs);
+    let rewrites = {
+        let root_pairs: Vec<(&str, &str)> = classified
+            .iter()
+            .zip(&selections)
+            .map(|((ty, _), selection)| (ty.as_str(), selection.as_str()))
+            .collect();
+        fragments::rewrite_all(fragments_text, &root_pairs)
+    };
     let fragments_override = rewrites.fragments;
     let mut root_rewrites = rewrites.roots.into_iter();
     let mut shape_plans: HashMap<String, ShapePlan> = HashMap::new();
 
-    for (entity, params, selection) in entities {
-        let entity_cap = singularize_and_capitalize(&entity);
+    for ((root, (entity_cap, is_pk)), selection) in roots.into_iter().zip(classified).zip(selections)
+    {
+        let RootField {
+            name: entity,
+            params,
+            ..
+        } = root;
         let selection = match root_rewrites.next().flatten() {
             Some(rewrite) => {
                 // Key by the root field actually emitted below, and merge: the same
                 // entity can be selected twice in one operation (GraphQL merges them).
-                let is_pk = !entity.ends_with('s') && params.len() == 1 && params.contains_key("id");
                 let key = if is_pk {
                     format!("{}_by_pk", entity_cap)
                 } else {
@@ -652,12 +650,9 @@ fn convert_main_query(
         // e.g., "LpAction" -> "lpActions", "LpAction_by_pk" -> "lpActions"
         field_name_map.insert(entity_cap.clone(), entity.clone());
         field_name_map.insert(format!("{}_by_pk", entity_cap), entity.clone());
-        // Extract limit/offset, preserving GraphQL variables (e.g., $first/$skip)
-        let limit = params.get("first").cloned();
-        let offset = params.get("skip").cloned();
 
         // Single-entity by primary key: singular entity, only 'id' param
-        if !entity.ends_with('s') && params.len() == 1 && params.contains_key("id") {
+        if is_pk {
             let pk_query = format!(
                 "  {}_by_pk(id: {}) {}",
                 entity_cap,
@@ -668,78 +663,7 @@ fn convert_main_query(
             continue;
         }
 
-        let mut converted_params = params.clone();
-
-        // Add chainId to params if provided
-        if let Some(chain_id) = chain_id {
-            converted_params.insert("chainId".to_string(), format!("\"{}\"", chain_id));
-        }
-
-        // Check if where is a variable reference (e.g., where: $where)
-        let where_is_variable = params
-            .get("where")
-            .map(|w| w.trim_start().starts_with('$'))
-            .unwrap_or(false);
-
-        // Convert filters to where clause (flattened)
-        // If where is a variable, it will be handled separately
-        let (where_clause, entity_var_overrides) = if where_is_variable {
-            // If where is a variable, pass it through directly
-            let clause = if let Some(where_var) = params.get("where") {
-                // Only opt the variable into runtime JSON translation when it
-                // was declared with a subgraph-style `*_filter` type. Other
-                // input-object types pass through verbatim — both for
-                // backwards compatibility and because we don't know how to
-                // translate an arbitrary user-defined input type.
-                let var_name = where_var.trim().trim_start_matches('$').to_string();
-                if !var_name.is_empty() {
-                    let declared = header_var_types.get(&var_name);
-                    if declared
-                        .map(|t| is_subgraph_filter_type(t))
-                        .unwrap_or(false)
-                    {
-                        filter_variable_entities.insert(var_name, entity_cap.clone());
-                    }
-                }
-                format!("where: {}", where_var)
-            } else {
-                String::new()
-            };
-            (clause, HashMap::new())
-        } else {
-            let result = convert_filters_to_where_clause(&converted_params, &entity_cap)?;
-            (result.where_clause, result.variable_type_overrides)
-        };
-
-        // Merge variable type overrides
-        all_variable_type_overrides.extend(entity_var_overrides);
-
-        let mut params_vec = Vec::new();
-        if let Some(l) = limit.as_ref() {
-            // Include limit whether it's a literal or a variable (e.g., $first)
-            params_vec.push(format!("limit: {}", l));
-        }
-        if let Some(o) = offset.as_ref() {
-            // Include offset whether it's a literal or a variable (e.g., $skip)
-            params_vec.push(format!("offset: {}", o));
-        }
-        // Map orderBy/orderDirection to Hasura order_by
-        if let Some(order_arg) = plan_order_by(
-            &params,
-            &entity_cap,
-            &header_var_types,
-            &mut order_by_retypes,
-            &mut order_by_specs,
-            &mut dead_candidates,
-            &mut order_var_owner,
-            &mut synth_counter,
-        ) {
-            params_vec.push(order_arg);
-        }
-        if !where_clause.is_empty() {
-            // The where_clause already has the correct format, just use it directly
-            params_vec.push(where_clause);
-        }
+        let params_vec = convert_collection_args(&params, &entity_cap, chain_id, &mut ctx)?;
         let params_str = if params_vec.is_empty() {
             String::new()
         } else {
@@ -754,7 +678,7 @@ fn convert_main_query(
     // answered against the emitted arguments.
     let body = converted_entities.join("\n");
     let referenced = referenced_variables(&body);
-    let removals: HashSet<String> = dead_candidates
+    let removals: HashSet<String> = std::mem::take(&mut ctx.dead_candidates)
         .into_iter()
         .filter(|name| !referenced.contains(name))
         .collect();
@@ -766,7 +690,7 @@ fn convert_main_query(
     let query_header_str = if let Some(header) = &query_header {
         // Convert variable type definitions: ID -> String, Bytes -> String, and enum types
         let converted_header =
-            convert_variable_types_in_header(header, &all_variable_type_overrides);
+            convert_variable_types_in_header(header, &ctx.variable_type_overrides);
         // Additionally rewrite subgraph filter type names (e.g., `Foo_filter`)
         // to their Hyperindex/Hasura equivalents (`Foo_bool_exp`). This is a
         // syntactic rename only — see `translate_subgraph_filter_value` for
@@ -775,7 +699,7 @@ fn convert_main_query(
         // Order-argument retypes and removals run last, over the now
         // whitespace-normalized single-line header.
         let converted_header =
-            rewrite_variable_definitions(&converted_header, &order_by_retypes, &removals);
+            rewrite_variable_definitions(&converted_header, &ctx.order_by_retypes, &removals);
         tracing::debug!(
             "Using preserved query header: '{}' (converted to: '{}')",
             header,
@@ -793,13 +717,134 @@ fn convert_main_query(
     Ok(MainConversion {
         converted_query,
         field_name_map,
-        filter_variable_entities,
-        order_by_variables: order_by_specs,
+        filter_variable_entities: ctx.filter_variable_entities,
+        order_by_variables: ctx.order_by_specs,
         dropped_variables,
         meta_selection: None,
         shape_plans,
         fragments_override,
     })
+}
+
+/// Per-operation state that argument conversion builds up across every root and
+/// nested field: header retypes, variables whose JSON value is rewritten before
+/// forwarding, and declarations that may have become unused.
+#[derive(Default)]
+struct ArgContext {
+    /// Declared types from the operation header, by variable name.
+    header_var_types: HashMap<String, String>,
+    /// Variables declared `String`/`Int` that the field they filter needs typed
+    /// otherwise (enums, numeric).
+    variable_type_overrides: HashMap<String, String>,
+    /// Variables used as `where: $var` with a subgraph `*_filter` type, by the
+    /// entity whose filter shape their value must be translated into.
+    filter_variable_entities: HashMap<String, String>,
+    /// Unconditional header retypes for order arguments. Kept separate from
+    /// `variable_type_overrides`, which only ever replaces a declared
+    /// `String`/`Int` and so cannot touch `OrderDirection!` or `Entity_orderBy!`.
+    order_by_retypes: HashMap<String, String>,
+    order_by_specs: Vec<OrderBySpec>,
+    /// Declarations that may have become unused; confirmed against the built body.
+    dead_candidates: Vec<String>,
+    order_var_owner: HashMap<String, String>,
+    synth_counter: usize,
+}
+
+/// The Hyperindex entity a root field reads, and whether it is a primary-key
+/// lookup (`token(id: "0x..")`) rather than a collection (`tokens(...)`).
+fn classify_root_field(name: &str, params: &HashMap<String, String>) -> (String, bool) {
+    let entity = singularize_and_capitalize(name);
+    let is_pk = !name.ends_with('s') && params.len() == 1 && params.contains_key("id");
+    (entity, is_pk)
+}
+
+/// Hasura arguments for a collection field from its subgraph arguments: `first`
+/// and `skip` become `limit`/`offset`, `orderBy`/`orderDirection` become
+/// `order_by`, and everything else is a filter for `where`.
+fn convert_collection_args(
+    params: &HashMap<String, String>,
+    entity_cap: &str,
+    chain_id: Option<&str>,
+    ctx: &mut ArgContext,
+) -> Result<Vec<String>, ConversionError> {
+    // Extract limit/offset, preserving GraphQL variables (e.g., $first/$skip)
+    let limit = params.get("first").cloned();
+    let offset = params.get("skip").cloned();
+
+    let mut converted_params = params.clone();
+
+    // Add chainId to params if provided
+    if let Some(chain_id) = chain_id {
+        converted_params.insert("chainId".to_string(), format!("\"{}\"", chain_id));
+    }
+
+    // Check if where is a variable reference (e.g., where: $where)
+    let where_is_variable = params
+        .get("where")
+        .map(|w| w.trim_start().starts_with('$'))
+        .unwrap_or(false);
+
+    // Convert filters to where clause (flattened)
+    // If where is a variable, it will be handled separately
+    let (where_clause, entity_var_overrides) = if where_is_variable {
+        // If where is a variable, pass it through directly
+        let clause = if let Some(where_var) = params.get("where") {
+            // Only opt the variable into runtime JSON translation when it
+            // was declared with a subgraph-style `*_filter` type. Other
+            // input-object types pass through verbatim — both for
+            // backwards compatibility and because we don't know how to
+            // translate an arbitrary user-defined input type.
+            let var_name = where_var.trim().trim_start_matches('$').to_string();
+            if !var_name.is_empty() {
+                let declared = ctx.header_var_types.get(&var_name);
+                if declared
+                    .map(|t| is_subgraph_filter_type(t))
+                    .unwrap_or(false)
+                {
+                    ctx.filter_variable_entities
+                        .insert(var_name, entity_cap.to_string());
+                }
+            }
+            format!("where: {}", where_var)
+        } else {
+            String::new()
+        };
+        (clause, HashMap::new())
+    } else {
+        let result = convert_filters_to_where_clause(&converted_params, entity_cap)?;
+        (result.where_clause, result.variable_type_overrides)
+    };
+
+    // Merge variable type overrides
+    ctx.variable_type_overrides.extend(entity_var_overrides);
+
+    let mut params_vec = Vec::new();
+    if let Some(l) = limit.as_ref() {
+        // Include limit whether it's a literal or a variable (e.g., $first)
+        params_vec.push(format!("limit: {}", l));
+    }
+    if let Some(o) = offset.as_ref() {
+        // Include offset whether it's a literal or a variable (e.g., $skip)
+        params_vec.push(format!("offset: {}", o));
+    }
+    // Map orderBy/orderDirection to Hasura order_by
+    if let Some(order_arg) = plan_order_by(
+        params,
+        entity_cap,
+        &ctx.header_var_types,
+        &mut ctx.order_by_retypes,
+        &mut ctx.order_by_specs,
+        &mut ctx.dead_candidates,
+        &mut ctx.order_var_owner,
+        &mut ctx.synth_counter,
+    ) {
+        params_vec.push(order_arg);
+    }
+    if !where_clause.is_empty() {
+        // The where_clause already has the correct format, just use it directly
+        params_vec.push(where_clause);
+    }
+    Ok(params_vec)
 }
 
 /// Build a literal `order_by` object, expanding subgraph's `parent__child` nested
@@ -1222,9 +1267,18 @@ fn rewrite_filter_type_names(header: &str) -> String {
     out
 }
 
-fn extract_multiple_entities(
-    query: &str,
-) -> Result<Vec<(String, HashMap<String, String>, String)>, ConversionError> {
+/// One root field of an operation, as written by the client.
+struct RootField {
+    /// Response key the client asked for (`recent` in `recent: swaps`).
+    alias: Option<String>,
+    /// The subgraph field name (`swaps`).
+    name: String,
+    params: HashMap<String, String>,
+    /// The selection set's contents, without the enclosing braces.
+    selection: String,
+}
+
+fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionError> {
     let mut entities = Vec::new();
     let query_chars: Vec<char> = query.chars().collect();
     let mut current_pos = 0;
@@ -1413,20 +1467,23 @@ fn extract_multiple_entities(
             .collect::<String>()
             .trim()
             .to_string();
-        let sanitized = sanitize_selection_set(&raw_selection);
-        let selection_set = format!("{{\n    {}\n  }}", sanitized);
 
         println!("DEBUG: Found entity: {}", entity_name);
         println!("DEBUG: Params for {}: {:?}", entity_name, params);
-        println!("DEBUG: Selection for {}: {}", entity_name, selection_set);
+        println!("DEBUG: Selection for {}: {}", entity_name, raw_selection);
 
-        entities.push((entity_name, params, selection_set));
+        entities.push(RootField {
+            alias: None,
+            name: entity_name,
+            params,
+            selection: raw_selection,
+        });
     }
 
     println!(
         "DEBUG: Found {} entities: {:?}",
         entities.len(),
-        entities.iter().map(|(name, _, _)| name).collect::<Vec<_>>()
+        entities.iter().map(|root| &root.name).collect::<Vec<_>>()
     );
     Ok(entities)
 }
