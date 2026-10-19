@@ -16,6 +16,7 @@ use tracing;
 use tracing_subscriber;
 
 mod conversion;
+mod fragments;
 mod http_client;
 mod metrics;
 mod schema;
@@ -107,8 +108,10 @@ async fn execute_query_with_retry(
                     if field == "query" { "The request body must include a 'query' string field." } else { "A required field is missing from the request." },
                 conversion::ConversionError::UnsupportedFilter(_filter) =>
                     "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
-                conversion::ConversionError::ComplexMetaQuery =>
-                    "Only _meta { block { number } } is supported. Remove extra fields like hash, timestamp, etc.",
+                conversion::ConversionError::ComplexMetaQuery(_) =>
+                    "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
+                conversion::ConversionError::MetaWithOtherFields(_) =>
+                    "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -130,12 +133,33 @@ async fn execute_query_with_retry(
 
     let converted_query = conversion_result.query;
     let field_name_map = conversion_result.field_name_map;
-    let is_meta_query = conversion_result.is_meta_query;
+    let meta_selection = conversion_result.meta_selection;
+    let shape_plans = conversion_result.shape_plans;
 
     if !conversion_result.filter_variable_entities.is_empty() {
         tracing::info!(
             "Translated subgraph filter variables to bool_exp shape: {:?}",
             conversion_result.filter_variable_entities
+        );
+    }
+
+    if !conversion_result.order_by_variables.is_empty() {
+        tracing::info!(
+            "Rebuilt subgraph order variables into Hasura order_by shape: {:?}",
+            conversion_result
+                .order_by_variables
+                .iter()
+                .map(|spec| (spec.target_var.as_str(), spec.entity.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    if !conversion_result.dropped_variables.is_empty() {
+        // GraphQL rejects a declared-but-unused variable, so these were removed
+        // from the operation header and from the forwarded payload alike.
+        tracing::info!(
+            "Dropped now-unused variable declarations: {:?}",
+            conversion_result.dropped_variables
         );
     }
 
@@ -222,7 +246,10 @@ async fn execute_query_with_retry(
 
     // Success - no errors
     let transform_start = Instant::now();
-    let transformed = transform_response_to_subgraph_shape(response, &field_name_map, is_meta_query);
+    let mut response = response;
+    apply_shape_plans(&mut response, &shape_plans);
+    let transformed =
+        transform_response_to_subgraph_shape(response, &field_name_map, meta_selection.as_ref());
     let transform_duration_ms = transform_start.elapsed().as_secs_f64() * 1000.0;
     metrics::RESPONSE_TRANSFORM_DURATION.observe(transform_duration_ms);
 
@@ -279,8 +306,10 @@ async fn handle_debug(Json(payload): Json<Value>) -> impl IntoResponse {
                     if field == "query" { "The request body must include a 'query' string field." } else { "A required field is missing from the request." },
                 conversion::ConversionError::UnsupportedFilter(_filter) =>
                     "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
-                conversion::ConversionError::ComplexMetaQuery =>
-                    "Only _meta { block { number } } is supported. Remove extra fields like hash, timestamp, etc.",
+                conversion::ConversionError::ComplexMetaQuery(_) =>
+                    "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
+                conversion::ConversionError::MetaWithOtherFields(_) =>
+                    "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -337,8 +366,10 @@ async fn handle_chain_debug(
                     if field == "query" { "The request body must include a 'query' string field." } else { "A required field is missing from the request." },
                 conversion::ConversionError::UnsupportedFilter(_filter) =>
                     "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
-                conversion::ConversionError::ComplexMetaQuery =>
-                    "Only _meta { block { number } } is supported. Remove extra fields like hash, timestamp, etc.",
+                conversion::ConversionError::ComplexMetaQuery(_) =>
+                    "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
+                conversion::ConversionError::MetaWithOtherFields(_) =>
+                    "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -375,7 +406,25 @@ async fn forward_to_hyperindex(
     Ok(response_json)
 }
 
-fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::collections::HashMap<String, String>, is_meta_query: bool) -> Value {
+/// Merge rewritten interface-link fields back into their rows (see `fragments`).
+/// Runs on the raw Hyperindex response, before root keys are renamed.
+fn apply_shape_plans(
+    response: &mut Value,
+    plans: &std::collections::HashMap<String, fragments::ShapePlan>,
+) {
+    if plans.is_empty() {
+        return;
+    }
+    if let Some(Value::Object(data)) = response.get_mut("data") {
+        for (root_key, plan) in plans {
+            if let Some(value) = data.get_mut(root_key) {
+                plan.apply(value);
+            }
+        }
+    }
+}
+
+fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::collections::HashMap<String, String>, meta_selection: Option<&conversion::MetaSelection>) -> Value {
     let mut root = match resp {
         Value::Object(map) => map,
         other => return other,
@@ -383,11 +432,14 @@ fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::colle
 
     if let Some(Value::Object(data_obj)) = root.get_mut("data") {
         // Special handling for _meta query response
-        if is_meta_query {
+        if let Some(selection) = meta_selection {
             if let Some(chain_metadata) = data_obj.get("chain_metadata") {
                 // Transform chain_metadata response to _meta format
                 // From: {"data":{"chain_metadata":[{"latest_fetched_block_number":419538012}]}}
                 // To:   {"data":{"_meta":{"block":{"number":419538012}}}}
+                //
+                // Conversion already rejected any selection we cannot answer in
+                // full, so echoing back exactly what was asked for is safe here.
                 let block_number = chain_metadata
                     .as_array()
                     .and_then(|arr| arr.first())
@@ -395,17 +447,24 @@ fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::colle
                     .cloned()
                     .unwrap_or(Value::Null);
 
-                let meta_response = serde_json::json!({
-                    "_meta": {
-                        "block": {
-                            "number": block_number
-                        }
+                let mut meta = serde_json::Map::new();
+                if selection.block_number || selection.block_typename {
+                    let mut block = serde_json::Map::new();
+                    if selection.block_number {
+                        block.insert("number".to_string(), block_number);
                     }
-                });
-
-                if let Value::Object(meta_obj) = meta_response {
-                    *data_obj = meta_obj;
+                    if selection.block_typename {
+                        block.insert("__typename".to_string(), Value::String("_Block_".into()));
+                    }
+                    meta.insert("block".to_string(), Value::Object(block));
                 }
+                if selection.typename {
+                    meta.insert("__typename".to_string(), Value::String("_Meta_".into()));
+                }
+
+                let mut out = serde_json::Map::new();
+                out.insert("_meta".to_string(), Value::Object(meta));
+                *data_obj = out;
                 return Value::Object(root);
             }
         }
@@ -639,6 +698,7 @@ async fn maybe_fetch_subgraph_debug(payload: Value) -> Option<Value> {
 #[cfg(test)]
 mod response_shape_tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_pluralize_lowercase_basic() {
@@ -659,7 +719,7 @@ mod response_shape_tests {
             }
         });
         let empty_map = std::collections::HashMap::new();
-        let out = transform_response_to_subgraph_shape(resp, &empty_map, false);
+        let out = transform_response_to_subgraph_shape(resp, &empty_map, None);
         let data = out.get("data").unwrap();
         assert!(data.get("streams").is_some());
         assert!(data.get("batches").is_some());
@@ -684,7 +744,7 @@ mod response_shape_tests {
         field_map.insert("LpShare".to_string(), "lpShares".to_string());
         field_map.insert("LpNFT".to_string(), "lpNFTs".to_string());
 
-        let out = transform_response_to_subgraph_shape(resp, &field_map, false);
+        let out = transform_response_to_subgraph_shape(resp, &field_map, None);
         let data = out.get("data").unwrap();
 
         // Should use exact names from the map (original query field names)
@@ -708,7 +768,15 @@ mod response_shape_tests {
             }
         });
         let empty_map = std::collections::HashMap::new();
-        let out = transform_response_to_subgraph_shape(resp, &empty_map, true);
+        let out = transform_response_to_subgraph_shape(
+            resp,
+            &empty_map,
+            Some(&conversion::MetaSelection {
+                block_number: true,
+                typename: false,
+                block_typename: false,
+            }),
+        );
         let data = out.get("data").unwrap();
 
         // Should have _meta structure
@@ -720,5 +788,45 @@ mod response_shape_tests {
 
         // Should NOT have chain_metadata
         assert!(data.get("chain_metadata").is_none());
+    }
+
+    #[test]
+    fn interface_fragment_response_is_reshaped_to_the_subgraph_form() {
+        crate::schema::init_test_schema_once();
+        let payload = json!({
+            "query": "query Q($u: String!) { userTransactions(where: {user: $u}, orderBy: timestamp, orderDirection: desc, first: 3) { id action ... on Supply { amount reserve { symbol } } ... on Borrow { borrowRateMode } } }",
+            "variables": {"u": "0xabc"}
+        });
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, None).unwrap();
+
+        // What Hasura returns for the converted query.
+        let mut hasura = json!({"data": {"UserTransaction": [
+            {"id": "a", "action": "Supply", "_on_Supply": {"amount": "5", "reserve": {"symbol": "WSOMI"}}, "_on_Borrow": null},
+            {"id": "b", "action": "Borrow", "_on_Supply": null, "_on_Borrow": {"borrowRateMode": 2}},
+            {"id": "c", "action": "Supply", "_on_Supply": null, "_on_Borrow": null}
+        ]}});
+        apply_shape_plans(&mut hasura, &converted.shape_plans);
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            converted.meta_selection.as_ref(),
+        );
+
+        assert_eq!(
+            out,
+            json!({"data": {"userTransactions": [
+                {"id": "a", "action": "Supply", "amount": "5", "reserve": {"symbol": "WSOMI"}},
+                {"id": "b", "action": "Borrow", "borrowRateMode": 2},
+                {"id": "c", "action": "Supply"}
+            ]}})
+        );
+    }
+
+    #[test]
+    fn responses_without_plans_are_untouched() {
+        let mut resp = json!({"data": {"Stream": [{"id": "1", "_on_Supply": null}]}});
+        let before = resp.clone();
+        apply_shape_plans(&mut resp, &std::collections::HashMap::new());
+        assert_eq!(resp, before);
     }
 }

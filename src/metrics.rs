@@ -113,16 +113,6 @@ pub static SCHEMA_FETCH_DURATION: Lazy<Histogram> = Lazy::new(|| {
     histogram
 });
 
-/// Schema cache lookups (hits are implicit - we track misses)
-pub static SCHEMA_CACHE_LOOKUPS: Lazy<Counter> = Lazy::new(|| {
-    let counter = Counter::with_opts(
-        Opts::new("converter_schema_cache_lookups_total", "Total number of schema cache lookups")
-            .namespace("converter")
-    ).unwrap();
-    REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
 // ============================================================================
 // ERROR METRICS
 // ============================================================================
