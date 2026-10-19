@@ -159,6 +159,7 @@ pub fn convert_subgraph_to_hyperindex(
         fragments_override: _,
         min_blocks,
         like_variables,
+        chain_filter_variables,
     } = convert_query_structure(query, chain_id)?;
 
     // Variables are read before any are dropped from the forwarded payload: a
@@ -180,7 +181,10 @@ pub fn convert_subgraph_to_hyperindex(
     let variables = payload
         .get("variables")
         .cloned()
-        .or_else(|| (!like_variables.is_empty()).then(|| serde_json::json!({})));
+        .or_else(|| {
+            (!like_variables.is_empty() || !chain_filter_variables.is_empty())
+                .then(|| serde_json::json!({}))
+        });
     if let Some(mut variables) = variables {
         // Values for the operations that were not selected would be rejected as
         // unexpected variables.
@@ -195,6 +199,13 @@ pub fn convert_subgraph_to_hyperindex(
                         map.insert(var_name.clone(), translated);
                     }
                 }
+            }
+        }
+        // After translation, so the chain condition is added in Hasura's shape.
+        if let Value::Object(map) = &mut variables {
+            for (var_name, chain_id) in &chain_filter_variables {
+                let filter = map.remove(var_name).unwrap_or(Value::Null);
+                map.insert(var_name.clone(), with_chain_condition(filter, chain_id));
             }
         }
         // Rebuild `order_by` variables into Hasura's `[{field: direction}]` shape.
@@ -268,6 +279,17 @@ pub fn convert_subgraph_to_hyperindex(
         shape_plans,
         min_block,
     })
+}
+
+/// A `where` variable's value restricted to one chain: the chain condition alone
+/// when the client sent none (or an empty one), otherwise both under `_and`.
+fn with_chain_condition(filter: Value, chain_id: &str) -> Value {
+    let chain = serde_json::json!({"chainId": {"_eq": chain_id}});
+    match filter {
+        Value::Null => chain,
+        Value::Object(ref m) if m.is_empty() => chain,
+        filter => serde_json::json!({"_and": [filter, chain]}),
+    }
 }
 
 /// The highest block any `block: {number_gte: N}` argument requires, with
@@ -527,6 +549,8 @@ struct MainConversion {
     min_blocks: Vec<MinBlockSource>,
     /// Variables carrying the LIKE pattern for a `name_contains: $q`.
     like_variables: Vec<LikeVariable>,
+    /// `where: $var` variables that need the route's chain condition added.
+    chain_filter_variables: HashMap<String, String>,
 }
 
 fn convert_query_structure(
@@ -559,6 +583,7 @@ fn convert_query_structure(
         fragments_override: None,
         min_blocks: main.min_blocks,
         like_variables: main.like_variables,
+        chain_filter_variables: main.chain_filter_variables,
     })
 }
 
@@ -1088,6 +1113,7 @@ fn convert_main_query(
         fragments_override,
         min_blocks,
         like_variables,
+        chain_filter_variables: ctx.chain_filter_variables,
     })
 }
 
@@ -1212,6 +1238,9 @@ struct ArgContext {
     /// Variables used as `where: $var` with a subgraph `*_filter` type, by the
     /// entity whose filter shape their value must be translated into.
     filter_variable_entities: HashMap<String, String>,
+    /// `where: $var` variables on the `/chainId/{id}` route, by that chain id. The
+    /// chain condition is added to their value at request time.
+    chain_filter_variables: HashMap<String, String>,
     /// Unconditional header retypes, for order arguments and pattern variables.
     /// A name the client never declared gets a declaration of its own. Kept
     /// separate from `variable_type_overrides`, which only ever replaces a
@@ -1283,6 +1312,12 @@ fn convert_collection_args(
             // backwards compatibility and because we don't know how to
             // translate an arbitrary user-defined input type.
             let var_name = where_var.trim().trim_start_matches('$').to_string();
+            // `where: {_and: [{chainId: ...}, $var]}` is rejected for a nullable
+            // `$var`, since `_and` items are non-null.
+            if let (Some(chain_id), false) = (chain_id, var_name.is_empty()) {
+                ctx.chain_filter_variables
+                    .insert(var_name.clone(), chain_id.to_string());
+            }
             if !var_name.is_empty() {
                 let declared = ctx.header_var_types.get(&var_name);
                 if declared
@@ -6088,9 +6123,8 @@ mod tests {
     #[test]
     fn end_to_end_filter_variable_with_chain_id() {
         // chain_id is normally injected into the where clause. When `where`
-        // is a variable, the converter currently forwards the variable as-is
-        // — chain_id isn't merged in. This test pins that behaviour so a
-        // future change doesn't silently start double-applying chain_id.
+        // is a variable it is added to the variable's value instead, once,
+        // and the query text is left alone.
         init_test_schema_if_needed();
         let payload = json!({
             "query": "query Q($where: Trade_filter) { trades(where: $where) { id } }",
@@ -6111,7 +6145,7 @@ mod tests {
         );
         assert_eq!(
             &result.query["variables"]["where"],
-            &json!({ "amount": { "_gt": 1 } })
+            &json!({ "_and": [{ "amount": { "_gt": 1 } }, { "chainId": { "_eq": "1" } }] })
         );
     }
 
@@ -7976,6 +8010,53 @@ mod tests {
             result.query["variables"],
             json!({"s__ends_with": "%.e", "t__contains": "%0xab%"})
         );
+    }
+
+
+    #[test]
+    fn where_variable_on_the_chain_route_keeps_the_chain_filter() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($w: Swap_filter) { swaps(where: $w) { id } }",
+            "variables": {"w": {"fee_gt": 3}}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, Some("5031")).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("where: $w"), "{query}");
+        assert_eq!(
+            result.query["variables"]["w"],
+            json!({"_and": [{"fee": {"_gt": 3}}, {"chainId": {"_eq": "5031"}}]})
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_where_variable_on_the_chain_route() {
+        init_test_schema_if_needed();
+        for variables in [None, Some(json!({})), Some(json!({"w": null})), Some(json!({"w": {}}))] {
+            let mut payload = json!({
+                "query": "query Q($w: Swap_bool_exp) { swaps(where: $w) { id } }"
+            });
+            if let Some(v) = variables.clone() {
+                payload["variables"] = v;
+            }
+            let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+            assert_eq!(
+                result.query["variables"],
+                json!({"w": {"chainId": {"_eq": "1"}}}),
+                "{variables:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn where_variable_off_the_chain_route_is_untouched() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($w: Swap_bool_exp) { swaps(where: $w) { id } }",
+            "variables": {"w": {"id": {"_eq": "a"}}}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(result.query["variables"], json!({"w": {"id": {"_eq": "a"}}}));
     }
 
 }

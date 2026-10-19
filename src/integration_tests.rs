@@ -515,7 +515,7 @@ fn argus_launch_key_page_end_to_end() {
         "query LaunchKeyPage($where: Launch_filter!, $orderBy: Launch_orderBy!, $direction: OrderDirection!, $first: Int!) { launches(first: $first, where: $where, orderBy: $orderBy, orderDirection: $direction) { id key: createdAt } }",
         json!({"where": {"dividendsPaid_gt": "0"}, "orderBy": "createdAt", "direction": "desc", "first": 25}),
         "query LaunchKeyPage($where: Launch_bool_exp!, $orderBy: [Launch_order_by!], $first: Int!) {\n  Launch(limit: $first, order_by: $orderBy, where: $where) {\n    id key: createdAt\n  }\n}",
-        json!({"where": {"dividendsPaid": {"_gt": "0"}}, "orderBy": [{"createdAt": "desc"}, {"id": "desc"}], "first": 25}),
+        json!({"where": {"_and": [{"dividendsPaid": {"_gt": "0"}}, {"chainId": {"_eq": "5042"}}]}, "orderBy": [{"createdAt": "desc"}, {"id": "desc"}], "first": 25}),
     );
 }
 
