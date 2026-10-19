@@ -2338,6 +2338,18 @@ fn convert_filters_to_where_clause(
     flat_filters.remove("orderDirection");
     flat_filters.remove("where");
 
+    // Inline `and: [{...}, {...}]` / `or: [...]`. Each item is a filter of its own.
+    let logical_keys: Vec<String> = flat_filters
+        .iter()
+        .filter(|(key, value)| is_logical_list(key, value))
+        .map(|(key, _)| key.clone())
+        .collect();
+    let mut logical: Vec<(String, String)> = logical_keys
+        .into_iter()
+        .filter_map(|key| flat_filters.remove(&key).map(|value| (key, value)))
+        .collect();
+    logical.sort();
+
     // Group filters by parent object to avoid duplicates
     let mut grouped_filters: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut basic_filters: HashMap<String, Vec<(String, String)>> = HashMap::new();
@@ -2419,6 +2431,18 @@ fn convert_filters_to_where_clause(
             }
         }
     }
+    // `and` items join the field-level `_and`, since an object cannot carry two
+    // `_and` keys; `or` items become one `_or`.
+    for (key, value) in logical {
+        let (items, overrides) = convert_logical_items(&value, entity_name)?;
+        variable_type_overrides.extend(overrides);
+        if key.trim_start_matches('_') == "and" {
+            and_conditions.extend(items);
+        } else {
+            where_conditions.push(format!("_or: [{}]", items.join(", ")));
+        }
+    }
+
     // Add grouped nested filters (recursively handle arbitrary depth)
     //
     // A relation can be constrained both by id (`launch_not_in: $ids`, emitted
@@ -2455,6 +2479,104 @@ fn convert_filters_to_where_clause(
     })
 }
 
+/// Whether `key: value` is an inline logical filter: `and`/`or` (or Hasura's
+/// `_and`/`_or`) over a list literal.
+fn is_logical_list(key: &str, value: &str) -> bool {
+    matches!(key, "and" | "or" | "_and" | "_or") && value.trim_start().starts_with('[')
+}
+
+/// Convert each item of an inline `and`/`or` list into a Hasura condition object,
+/// with the same rules as a top-level `where`. An item that is not an object
+/// literal (a `$variable`) is passed through as written. Returns the items and
+/// any variable type overrides they imply.
+fn convert_logical_items(
+    list: &str,
+    entity_name: &str,
+) -> Result<(Vec<String>, HashMap<String, String>), ConversionError> {
+    let mut items = Vec::new();
+    let mut overrides = HashMap::new();
+    for item in split_list_items(list) {
+        let item = item.trim();
+        let Some(content) = item.strip_prefix('{').and_then(|i| i.strip_suffix('}')) else {
+            items.push(item.to_string());
+            continue;
+        };
+        let mut params = HashMap::new();
+        parse_graphql_params(content, &mut params)?;
+        let converted = convert_filters_to_where_clause(&params, entity_name)?;
+        overrides.extend(converted.variable_type_overrides);
+        let condition = converted
+            .where_clause
+            .strip_prefix("where: ")
+            .unwrap_or("{}")
+            .to_string();
+        items.push(if condition.is_empty() {
+            "{}".to_string()
+        } else {
+            condition
+        });
+    }
+    Ok((items, overrides))
+}
+
+/// The items of a list literal (`[{a: 1}, {b: 2}]`), split at its top-level
+/// commas; brackets, braces and strings inside an item are respected.
+fn split_list_items(list: &str) -> Vec<String> {
+    let inner = list
+        .trim()
+        .strip_prefix('[')
+        .and_then(|l| l.strip_suffix(']'))
+        .unwrap_or(list);
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    for c in inner.chars() {
+        if in_str {
+            current.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                current.push(c);
+            }
+            '{' | '[' | '(' => {
+                // Commas are optional in GraphQL: `[{a: 1} {b: 2}]`.
+                if depth == 0 && !current.trim().is_empty() {
+                    items.push(current.trim().to_string());
+                    current.clear();
+                }
+                depth += 1;
+                current.push(c);
+            }
+            '}' | ']' | ')' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                if !current.trim().is_empty() {
+                    items.push(current.trim().to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.trim().is_empty() {
+        items.push(current.trim().to_string());
+    }
+    items
+}
+
 fn parse_nested_where_clause(
     where_value: &str,
 ) -> Result<HashMap<String, String>, ConversionError> {
@@ -2479,6 +2601,17 @@ fn convert_basic_filter_to_hasura_condition(
     if key == "where" {
         // Should never emit a 'where' key at this stage
         return Ok(String::new());
+    }
+
+    // `and`/`or` inside a relation filter (`pair_: {or: [...]}`).
+    if is_logical_list(key, value) {
+        let (items, _) = convert_logical_items(value, entity_name)?;
+        let op = if key.trim_start_matches('_') == "and" {
+            "_and"
+        } else {
+            "_or"
+        };
+        return Ok(format!("{}: [{}]", op, items.join(", ")));
     }
 
     // Handle different filter patterns - check longer suffixes first
@@ -6905,5 +7038,114 @@ mod tests {
         assert!(!starts_with_argument_name(" 100"));
         assert!(!starts_with_argument_name(" desc"));
         assert!(!starts_with_argument_name(" {a: 1}"));
+    }
+
+    // ── Inline and / or ──────────────────────────────────────────────────────
+
+    #[test]
+    fn inline_or_of_two_equality_filters() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { tokens(where: {or: [{symbol: \"USDT\"}, {symbol: \"USDC.e\"}]}) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("Token(where: {_or: [{symbol: {_eq: \"USDT\"}}, {symbol: {_eq: \"USDC.e\"}}]})"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn inline_and_with_a_range_inside_one_item() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swaps(where: {and: [{fee_gt: 1, fee_lt: 5}, {trader: \"0xa\"}]}) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("Swap(where: {_and: [{_and: [{fee: {_gt: 1}}, {fee: {_lt: 5}}]}, {trader: {_eq: \"0xa\"}}]})"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn inline_or_nested_inside_and() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swaps(where: {and: [{trader: \"0xa\"}, {or: [{fee: 1}, {fee: 2}]}]}) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("where: {_and: [{trader: {_eq: \"0xa\"}}, {_or: [{fee: {_eq: 1}}, {fee: {_eq: 2}}]}]}"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn inline_or_items_use_operators_and_relation_filters() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swaps(where: {or: [{fee_in: [1, 2]}, {tokenIn_: {symbol: \"USDT\"}}, {tokenIn: \"0xt\"}]}) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("_or: [{fee: {_in: [1, 2]}}, {tokenIn: {symbol: {_eq: \"USDT\"}}}, {tokenIn: {id: {_eq: \"0xt\"}}}]"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn inline_or_on_the_chain_route_keeps_the_chain_filter_outside() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { tokens(where: {or: [{symbol: \"A\"}, {symbol: \"B\"}]}) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, Some("5031")).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("where: {chainId: {_eq: \"5031\"}, _or: [{symbol: {_eq: \"A\"}}, {symbol: {_eq: \"B\"}}]}"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn inline_or_items_with_variables_retype_them() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($a: String!, $b: String!) { swaps(where: {or: [{fee: $a}, {trader: $b}]}) { id } }",
+            "variables": {"a": "1", "b": "0xb"}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("_or: [{fee: {_eq: $a}}, {trader: {_eq: $b}}]"), "{query}");
+        // `fee` is numeric, so `$a` has to be declared that way.
+        assert!(query.contains("$a: numeric!"), "{query}");
+        assert!(query.contains("$b: String!"), "{query}");
+    }
+
+    #[test]
+    fn inline_or_inside_a_relation_filter() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swaps(where: {tokenIn_: {or: [{symbol: \"A\"}, {symbol: \"B\"}]}}) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("tokenIn: {_or: [{symbol: {_eq: \"A\"}}, {symbol: {_eq: \"B\"}}]}"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn split_list_items_handles_nesting_strings_and_missing_commas() {
+        assert_eq!(
+            split_list_items("[{a: \"x,}\"}, {b: [1, 2]} {c: 3}]"),
+            vec!["{a: \"x,}\"}", "{b: [1, 2]}", "{c: 3}"]
+        );
     }
 }
