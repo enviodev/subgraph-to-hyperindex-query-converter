@@ -823,6 +823,27 @@ mod response_shape_tests {
     }
 
     #[test]
+    fn aliased_roots_come_back_under_their_alias() {
+        let payload = json!({
+            "query": "query { Recent: streams(first: 1) { id } top: tokens(first: 1) { id } }"
+        });
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let hasura = json!({"data": {
+            "Recent": [{"id": "s1"}],
+            "top": [{"id": "t1"}]
+        }});
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            converted.meta_selection.as_ref(),
+        );
+        assert_eq!(
+            out,
+            json!({"data": {"Recent": [{"id": "s1"}], "top": [{"id": "t1"}]}})
+        );
+    }
+
+    #[test]
     fn responses_without_plans_are_untouched() {
         let mut resp = json!({"data": {"Stream": [{"id": "1", "_on_Supply": null}]}});
         let before = resp.clone();

@@ -627,18 +627,20 @@ fn convert_main_query(
     for ((root, (entity_cap, is_pk)), selection) in roots.into_iter().zip(classified).zip(selections)
     {
         let RootField {
+            alias,
             name: entity,
             params,
             ..
         } = root;
         let selection = match root_rewrites.next().flatten() {
             Some(rewrite) => {
-                // Key by the root field actually emitted below, and merge: the same
-                // entity can be selected twice in one operation (GraphQL merges them).
-                let key = if is_pk {
-                    format!("{}_by_pk", entity_cap)
-                } else {
-                    entity_cap.clone()
+                // Key by the response key of the root field actually emitted below,
+                // and merge: the same entity can be selected twice in one operation
+                // (GraphQL merges them).
+                let key = match &alias {
+                    Some(alias) => alias.clone(),
+                    None if is_pk => format!("{}_by_pk", entity_cap),
+                    None => entity_cap.clone(),
                 };
                 shape_plans.entry(key).or_default().merge(rewrite.plan);
                 rewrite.selection
@@ -650,11 +652,22 @@ fn convert_main_query(
         // e.g., "LpAction" -> "lpActions", "LpAction_by_pk" -> "lpActions"
         field_name_map.insert(entity_cap.clone(), entity.clone());
         field_name_map.insert(format!("{}_by_pk", entity_cap), entity.clone());
+        // An aliased root comes back under the alias, which the client chose and
+        // expects verbatim. Mapping it to itself keeps the PascalCase fallback in
+        // the response transform from renaming it.
+        let alias_prefix = match &alias {
+            Some(alias) => {
+                field_name_map.insert(alias.clone(), alias.clone());
+                format!("{}: ", alias)
+            }
+            None => String::new(),
+        };
 
         // Single-entity by primary key: singular entity, only 'id' param
         if is_pk {
             let pk_query = format!(
-                "  {}_by_pk(id: {}) {}",
+                "  {}{}_by_pk(id: {}) {}",
+                alias_prefix,
                 entity_cap,
                 params.get("id").unwrap(),
                 selection
@@ -670,7 +683,10 @@ fn convert_main_query(
             format!("({})", params_vec.join(", "))
         };
 
-        let converted_entity = format!("  {}{} {}", entity_cap, params_str, selection);
+        let converted_entity = format!(
+            "  {}{}{} {}",
+            alias_prefix, entity_cap, params_str, selection
+        );
         converted_entities.push(converted_entity);
     }
 
@@ -1328,6 +1344,33 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
         let entity_name = query_chars[entity_start..current_pos]
             .iter()
             .collect::<String>();
+
+        // `recent: swaps(...)`: the first name is the response key the client
+        // asked for, and the field itself follows the colon.
+        let mut alias = None;
+        let mut lookahead = current_pos;
+        while lookahead < query_chars.len() && query_chars[lookahead].is_whitespace() {
+            lookahead += 1;
+        }
+        let entity_name = if lookahead < query_chars.len() && query_chars[lookahead] == ':' {
+            let mut field_start = lookahead + 1;
+            while field_start < query_chars.len() && query_chars[field_start].is_whitespace() {
+                field_start += 1;
+            }
+            current_pos = field_start;
+            while current_pos < query_chars.len()
+                && (query_chars[current_pos].is_alphanumeric() || query_chars[current_pos] == '_')
+            {
+                current_pos += 1;
+            }
+            if current_pos == field_start {
+                continue;
+            }
+            alias = Some(entity_name);
+            query_chars[field_start..current_pos].iter().collect::<String>()
+        } else {
+            entity_name
+        };
         println!("DEBUG: Found potential entity name: '{}'", entity_name);
 
         // Skip if this is not a valid entity name (too short or common words)
@@ -1473,7 +1516,7 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
         println!("DEBUG: Selection for {}: {}", entity_name, raw_selection);
 
         entities.push(RootField {
-            alias: None,
+            alias,
             name: entity_name,
             params,
             selection: raw_selection,
@@ -6097,5 +6140,70 @@ mod tests {
             order_by_json_with_tiebreak("pool__name", "asc", true),
             json!([{"pool": {"name": "asc"}}, {"id": "asc"}])
         );
+    }
+
+    // ── Root aliases ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn aliased_collection_keeps_its_alias() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { recent: streams(first: 2, orderBy: timestamp, orderDirection: desc) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("recent: Stream(limit: 2, order_by: [{timestamp: desc}, {id: desc}])"),
+            "{query}"
+        );
+        assert_eq!(result.field_name_map.get("recent"), Some(&"recent".to_string()));
+    }
+
+    #[test]
+    fn aliased_primary_key_lookup_keeps_its_alias() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { mine: token(id: \"0xabc\") { id symbol } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("mine: Token_by_pk(id: \"0xabc\")"), "{query}");
+        assert_eq!(result.field_name_map.get("mine"), Some(&"mine".to_string()));
+    }
+
+    #[test]
+    fn same_entity_twice_under_two_aliases() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { a: tokens(first: 1, orderBy: id) { id } b: tokens(first: 1, orderBy: id, orderDirection: desc) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("a: Token(limit: 1, order_by: {id: asc})"), "{query}");
+        assert!(query.contains("b: Token(limit: 1, order_by: {id: desc})"), "{query}");
+        assert_eq!(result.field_name_map.get("a"), Some(&"a".to_string()));
+        assert_eq!(result.field_name_map.get("b"), Some(&"b".to_string()));
+    }
+
+    #[test]
+    fn alias_beside_an_unaliased_root_of_the_same_entity() {
+        init_test_schema_if_needed();
+        let payload =
+            create_test_payload("query { tokens(first: 1) { id } top: tokens(first: 5) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("  Token(limit: 1)"), "{query}");
+        assert!(query.contains("top: Token(limit: 5)"), "{query}");
+        assert_eq!(result.field_name_map.get("Token"), Some(&"tokens".to_string()));
+        assert_eq!(result.field_name_map.get("top"), Some(&"top".to_string()));
+    }
+
+    #[test]
+    fn aliased_root_with_fragments_keys_its_shape_plan_by_the_alias() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { recent: userTransactions(first: 1) { id ... on Supply { amount } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert!(result.shape_plans.contains_key("recent"), "{:?}", result.shape_plans.keys());
+        assert!(!result.shape_plans.contains_key("UserTransaction"));
     }
 }
