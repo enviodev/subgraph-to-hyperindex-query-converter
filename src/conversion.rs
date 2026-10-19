@@ -2727,112 +2727,14 @@ fn convert_basic_filter_to_hasura_condition(
     }
 
     // Handle different filter patterns - check longer suffixes first
-    if key.ends_with("_not_starts_with_nocase") {
-        let field = &key[..key.len() - 23];
-        return Ok(format!(
-            "_not: {{{}: {{_ilike: \"{}%\"}}}}",
-            field,
-            value.trim_matches('"')
-        ));
-    }
-
-    if key.ends_with("_not_ends_with_nocase") {
-        let field = &key[..key.len() - 21];
-        return Ok(format!(
-            "_not: {{{}: {{_ilike: \"%{}\"}}}}",
-            field,
-            value.trim_matches('"')
-        ));
-    }
-
-    if key.ends_with("_not_contains_nocase") {
-        let field = &key[..key.len() - 20];
-        return Ok(format!(
-            "_not: {{{}: {{_ilike: \"%{}%\"}}}}",
-            field,
-            value.trim_matches('"')
-        ));
-    }
-
-    if key.ends_with("_starts_with_nocase") {
-        let field = &key[..key.len() - 19];
-        return Ok(format!(
-            "{}: {{_ilike: \"{}%\"}}",
-            field,
-            value.trim_matches('"')
-        ));
-    }
-
-    if key.ends_with("_ends_with_nocase") {
-        let field = &key[..key.len() - 17];
-        return Ok(format!(
-            "{}: {{_ilike: \"%{}\"}}",
-            field,
-            value.trim_matches('"')
-        ));
-    }
-
-    if key.ends_with("_contains_nocase") {
-        let field = &key[..key.len() - 16];
-        return Ok(format!(
-            "{}: {{_ilike: \"%{}%\"}}",
-            field,
-            value.trim_matches('"')
-        ));
-    }
-
-    if key.ends_with("_not_starts_with") {
-        let field = &key[..key.len() - 16];
-        return Ok(format!(
-            "_not: {{{}: {{_ilike: \"{}%\"}}}}",
-            field,
-            value.trim_matches('"')
-        ));
-    }
-
-    if key.ends_with("_not_ends_with") {
-        let field = &key[..key.len() - 14];
-        return Ok(format!(
-            "_not: {{{}: {{_ilike: \"%{}\"}}}}",
-            field,
-            value.trim_matches('"')
-        ));
-    }
-
-    if key.ends_with("_not_contains") {
-        let field = &key[..key.len() - 13];
-        return Ok(format!(
-            "_not: {{{}: {{_ilike: \"%{}%\"}}}}",
-            field,
-            value.trim_matches('"')
-        ));
-    }
-
-    if key.ends_with("_starts_with") {
-        let field = &key[..key.len() - 12];
-        return Ok(format!(
-            "{}: {{_ilike: \"{}%\"}}",
-            field,
-            value.trim_matches('"')
-        ));
-    }
-
-    if key.ends_with("_ends_with") {
-        let field = &key[..key.len() - 10];
-        return Ok(format!(
-            "{}: {{_ilike: \"%{}\"}}",
-            field,
-            value.trim_matches('"')
-        ));
-    }
-
-    if key.ends_with("_contains") {
-        let field = &key[..key.len() - 9];
-        return Ok(format!(
-            "{}: {{_ilike: \"%{}%\"}}",
-            field,
-            value.trim_matches('"')
-        ));
+    if let Some((field, filter)) = string_match_filter(key) {
+        let pattern = like_pattern(value.trim_matches('"'), filter.shape);
+        let condition = format!("{}: {{{}: \"{}\"}}", field, filter.operator, pattern);
+        return Ok(if filter.negated {
+            format!("_not: {{{}}}", condition)
+        } else {
+            condition
+        });
     }
 
     if key.ends_with("_not_in") {
@@ -2995,67 +2897,9 @@ fn translate_leaf_filter(
     // ordering in `convert_basic_filter_to_hasura_condition`. Changes here
     // must be applied to both functions.
 
-    if let Some(field) = key.strip_suffix("_not_starts_with_nocase") {
-        not_accum.insert(
-            field.to_string(),
-            ilike_value(value, IlikeShape::StartsWith),
-        );
-        return;
-    }
-    if let Some(field) = key.strip_suffix("_not_ends_with_nocase") {
-        not_accum.insert(field.to_string(), ilike_value(value, IlikeShape::EndsWith));
-        return;
-    }
-    if let Some(field) = key.strip_suffix("_not_contains_nocase") {
-        not_accum.insert(field.to_string(), ilike_value(value, IlikeShape::Contains));
-        return;
-    }
-    if let Some(field) = key.strip_suffix("_starts_with_nocase") {
-        out.insert(
-            field.to_string(),
-            ilike_value(value, IlikeShape::StartsWith),
-        );
-        return;
-    }
-    if let Some(field) = key.strip_suffix("_ends_with_nocase") {
-        out.insert(field.to_string(), ilike_value(value, IlikeShape::EndsWith));
-        return;
-    }
-    if let Some(field) = key.strip_suffix("_contains_nocase") {
-        out.insert(field.to_string(), ilike_value(value, IlikeShape::Contains));
-        return;
-    }
-    if let Some(field) = key.strip_suffix("_not_starts_with") {
-        not_accum.insert(
-            field.to_string(),
-            ilike_value(value, IlikeShape::StartsWith),
-        );
-        return;
-    }
-    if let Some(field) = key.strip_suffix("_not_ends_with") {
-        not_accum.insert(field.to_string(), ilike_value(value, IlikeShape::EndsWith));
-        return;
-    }
-    if let Some(field) = key.strip_suffix("_not_contains") {
-        not_accum.insert(field.to_string(), ilike_value(value, IlikeShape::Contains));
-        return;
-    }
-    if let Some(field) = key.strip_suffix("_starts_with") {
-        out.insert(
-            field.to_string(),
-            ilike_value(value, IlikeShape::StartsWith),
-        );
-        return;
-    }
-    if let Some(field) = key.strip_suffix("_ends_with") {
-        out.insert(field.to_string(), ilike_value(value, IlikeShape::EndsWith));
-        return;
-    }
-    if let Some(field) = key.strip_suffix("_contains") {
-        // NOTE: inline path maps `_contains` to `_ilike` (case-insensitive)
-        // even though subgraph's `_contains` is case-sensitive on strings.
-        // Mirrored here for behaviour parity.
-        out.insert(field.to_string(), ilike_value(value, IlikeShape::Contains));
+    if let Some((field, filter)) = string_match_filter(key) {
+        let target = if filter.negated { not_accum } else { out };
+        target.insert(field.to_string(), like_value(value, filter));
         return;
     }
     if let Some(field) = key.strip_suffix("_not_in") {
@@ -3195,27 +3039,85 @@ fn op_wrap(op: &str, value: Value) -> Value {
 }
 
 #[derive(Clone, Copy)]
-enum IlikeShape {
+enum LikeShape {
     Contains,
     StartsWith,
     EndsWith,
 }
 
-fn ilike_value(value: &Value, shape: IlikeShape) -> Value {
+/// A graph-node string-matching filter suffix and the Hasura comparison it maps to.
+#[derive(Clone, Copy)]
+struct StringMatchFilter {
+    suffix: &'static str,
+    /// `_like` (case-sensitive, like graph-node's plain forms) or `_ilike`
+    /// (the `_nocase` forms).
+    operator: &'static str,
+    shape: LikeShape,
+    /// The `_not_` forms, which Hasura spells `_not: {field: {...}}`.
+    negated: bool,
+}
+
+/// Longest suffix first, so `_not_contains_nocase` is not read as `_contains`.
+const STRING_MATCH_FILTERS: [StringMatchFilter; 12] = {
+    use LikeShape::*;
+    const fn f(
+        suffix: &'static str,
+        operator: &'static str,
+        shape: LikeShape,
+        negated: bool,
+    ) -> StringMatchFilter {
+        StringMatchFilter {
+            suffix,
+            operator,
+            shape,
+            negated,
+        }
+    }
+    [
+        f("_not_starts_with_nocase", "_ilike", StartsWith, true),
+        f("_not_ends_with_nocase", "_ilike", EndsWith, true),
+        f("_not_contains_nocase", "_ilike", Contains, true),
+        f("_starts_with_nocase", "_ilike", StartsWith, false),
+        f("_ends_with_nocase", "_ilike", EndsWith, false),
+        f("_contains_nocase", "_ilike", Contains, false),
+        f("_not_starts_with", "_like", StartsWith, true),
+        f("_not_ends_with", "_like", EndsWith, true),
+        f("_not_contains", "_like", Contains, true),
+        f("_starts_with", "_like", StartsWith, false),
+        f("_ends_with", "_like", EndsWith, false),
+        f("_contains", "_like", Contains, false),
+    ]
+};
+
+/// The field and filter of a string-matching key (`name_contains_nocase`).
+fn string_match_filter(key: &str) -> Option<(&str, StringMatchFilter)> {
+    STRING_MATCH_FILTERS
+        .iter()
+        .find_map(|filter| key.strip_suffix(filter.suffix).map(|field| (field, *filter)))
+}
+
+/// The LIKE pattern graph-node builds for a value. It does not escape `%` or
+/// `_`, so they act as wildcards there too, and `_contains` leaves a value that
+/// already starts or ends with `%` as it is.
+fn like_pattern(value: &str, shape: LikeShape) -> String {
+    match shape {
+        LikeShape::Contains if value.starts_with('%') || value.ends_with('%') => value.to_string(),
+        LikeShape::Contains => format!("%{}%", value),
+        LikeShape::StartsWith => format!("{}%", value),
+        LikeShape::EndsWith => format!("%{}", value),
+    }
+}
+
+fn like_value(value: &Value, filter: StringMatchFilter) -> Value {
     let s = match value {
         Value::String(s) => s.clone(),
         Value::Number(n) => n.to_string(),
         Value::Bool(b) => b.to_string(),
-        // Object/array/null aren't valid ILIKE patterns; forward the raw value
+        // Object/array/null aren't valid LIKE patterns; forward the raw value
         // so the upstream returns a meaningful type error.
-        _ => return op_wrap("_ilike", value.clone()),
+        _ => return op_wrap(filter.operator, value.clone()),
     };
-    let pattern = match shape {
-        IlikeShape::Contains => format!("%{}%", s),
-        IlikeShape::StartsWith => format!("{}%", s),
-        IlikeShape::EndsWith => format!("%{}", s),
-    };
-    op_wrap("_ilike", Value::String(pattern))
+    op_wrap(filter.operator, Value::String(like_pattern(&s, filter.shape)))
 }
 
 /// Same as convert_basic_filter_to_hasura_condition but also returns variable type override info
@@ -3886,7 +3788,7 @@ mod tests {
         let payload = create_test_payload("query { streams(name_contains: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"%test%\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_like: \"%test%\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3897,7 +3799,7 @@ mod tests {
             create_test_payload("query { streams(name_not_contains: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"%test%\"}}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_like: \"%test%\"}}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3908,7 +3810,7 @@ mod tests {
             create_test_payload("query { streams(name_starts_with: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"test%\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_like: \"test%\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3919,7 +3821,7 @@ mod tests {
             create_test_payload("query { streams(name_ends_with: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"%test\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_like: \"%test\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3930,7 +3832,7 @@ mod tests {
             create_test_payload("query { streams(name_not_starts_with: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"test%\"}}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_like: \"test%\"}}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3941,7 +3843,7 @@ mod tests {
             create_test_payload("query { streams(name_not_ends_with: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"%test\"}}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_like: \"%test\"}}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -4054,7 +3956,7 @@ mod tests {
         let query = result.query["query"].as_str().unwrap();
         // Check for all filter fragments regardless of order
         assert!(query.contains("chainId: {_eq: \"1\"}"));
-        assert!(query.contains("name: {_ilike: \"%test%\"}"));
+        assert!(query.contains("name: {_like: \"%test%\"}"));
         assert!(query.contains("amount: {_gt: 100}"));
         assert!(query.contains("status: {_eq: \"active\"}"));
         // Also check the selection set
@@ -4068,7 +3970,7 @@ mod tests {
         let payload = create_test_payload("query { users(name_contains: \"john\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  User(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"%john%\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  User(where: {chainId: {_eq: \"1\"}, name: {_like: \"%john%\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -4102,7 +4004,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(offset: 10, order_by: [{alias: asc}, {id: asc}], where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%113%\"}}) {\n    alias asset { address }\n  }\n}"
+            "query": "query {\n  Stream(offset: 10, order_by: [{alias: asc}, {id: asc}], where: {chainId: {_eq: \"1\"}, alias: {_like: \"%113%\"}}) {\n    alias asset { address }\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -4189,7 +4091,7 @@ mod tests {
         let payload = create_test_payload("query { users(name_contains: \"john\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let expected = json!({
-            "query": "query {\n  User(where: {name: {_ilike: \"%john%\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  User(where: {name: {_like: \"%john%\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -4214,7 +4116,7 @@ mod tests {
         println!("Converted query: {}", query);
 
         // Check that both filters are included
-        assert!(query.contains("alias: {_ilike: \"%113%\"}"));
+        assert!(query.contains("alias: {_like: \"%113%\"}"));
         assert!(query.contains("chainId: {_eq: \"1\"}"));
         assert!(query.contains("Stream"));
     }
@@ -4228,7 +4130,7 @@ mod tests {
         println!("Converted query: {}", query);
 
         // Check that the filter is included
-        assert!(query.contains("alias: {_ilike: \"%113%\"}"));
+        assert!(query.contains("alias: {_like: \"%113%\"}"));
         assert!(query.contains("chainId: {_eq: \"1\"}"));
         assert!(query.contains("Stream"));
     }
@@ -5596,20 +5498,21 @@ mod tests {
     #[test]
     fn translate_contains_starts_ends_with() {
         init_test_schema_if_needed();
+        // graph-node's plain forms are case-sensitive (`like`); `_nocase` is `ilike`.
         let cases = [
-            ("name_contains", "%X%"),
-            ("name_starts_with", "X%"),
-            ("name_ends_with", "%X"),
-            ("name_contains_nocase", "%X%"),
-            ("name_starts_with_nocase", "X%"),
-            ("name_ends_with_nocase", "%X"),
+            ("name_contains", "_like", "%X%"),
+            ("name_starts_with", "_like", "X%"),
+            ("name_ends_with", "_like", "%X"),
+            ("name_contains_nocase", "_ilike", "%X%"),
+            ("name_starts_with_nocase", "_ilike", "X%"),
+            ("name_ends_with_nocase", "_ilike", "%X"),
         ];
-        for (suffix, pattern) in cases {
+        for (suffix, op, pattern) in cases {
             let v = json!({ suffix: "X" });
             let out = translate_subgraph_filter_value(&v, "Pair");
             assert_eq!(
                 out,
-                json!({ "name": { "_ilike": pattern } }),
+                json!({ "name": { op: pattern } }),
                 "suffix {}",
                 suffix
             );
@@ -5620,19 +5523,19 @@ mod tests {
     fn translate_negated_string_ops_go_into_not() {
         init_test_schema_if_needed();
         let cases = [
-            ("name_not_contains", "%X%"),
-            ("name_not_starts_with", "X%"),
-            ("name_not_ends_with", "%X"),
-            ("name_not_contains_nocase", "%X%"),
-            ("name_not_starts_with_nocase", "X%"),
-            ("name_not_ends_with_nocase", "%X"),
+            ("name_not_contains", "_like", "%X%"),
+            ("name_not_starts_with", "_like", "X%"),
+            ("name_not_ends_with", "_like", "%X"),
+            ("name_not_contains_nocase", "_ilike", "%X%"),
+            ("name_not_starts_with_nocase", "_ilike", "X%"),
+            ("name_not_ends_with_nocase", "_ilike", "%X"),
         ];
-        for (suffix, pattern) in cases {
+        for (suffix, op, pattern) in cases {
             let v = json!({ suffix: "X" });
             let out = translate_subgraph_filter_value(&v, "Pair");
             assert_eq!(
                 out,
-                json!({ "_not": { "name": { "_ilike": pattern } } }),
+                json!({ "_not": { "name": { op: pattern } } }),
                 "suffix {}",
                 suffix
             );
@@ -6072,7 +5975,7 @@ mod tests {
         );
         assert_eq!(
             &result.query["variables"]["pw"],
-            &json!({ "name": { "_ilike": "%ETH%" } })
+            &json!({ "name": { "_like": "%ETH%" } })
         );
         assert_eq!(result.filter_variable_entities.len(), 2);
     }
@@ -7522,5 +7425,69 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         assert!(result.meta_selection.is_none());
         assert!(!result.query["query"].as_str().unwrap().contains("progressBlock"));
+    }
+
+    // ── Case-sensitive string operators ──────────────────────────────────────
+
+    #[test]
+    fn plain_string_operators_are_case_sensitive_and_nocase_ones_are_not() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { tokens(where: {symbol_contains: \"usd\", name_starts_with_nocase: \"wr\"}) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("symbol: {_like: \"%usd%\"}"), "{query}");
+        assert!(query.contains("name: {_ilike: \"wr%\"}"), "{query}");
+    }
+
+    #[test]
+    fn like_patterns_follow_graph_node() {
+        // graph-node does not escape `%`/`_`, and `_contains` keeps a value that
+        // already starts or ends with `%` as it is.
+        assert_eq!(like_pattern("a_b", LikeShape::Contains), "%a_b%");
+        assert_eq!(like_pattern("%ab", LikeShape::Contains), "%ab");
+        assert_eq!(like_pattern("ab%", LikeShape::Contains), "ab%");
+        assert_eq!(like_pattern("%ab", LikeShape::StartsWith), "%ab%");
+        assert_eq!(like_pattern("ab", LikeShape::EndsWith), "%ab");
+    }
+
+    #[test]
+    fn negated_case_sensitive_operator_in_a_relation_filter() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swaps(where: {tokenIn_: {symbol_not_ends_with: \".e\"}}) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("tokenIn: {_not: {symbol: {_like: \"%.e\"}}}"), "{query}");
+    }
+
+    #[test]
+    fn variable_filters_use_the_same_operators() {
+        init_test_schema_if_needed();
+        let out = translate_subgraph_filter_value(
+            &json!({"name_contains": "ETH", "name_not_contains_nocase": "btc", "symbol_starts_with": "W"}),
+            "Pair",
+        );
+        assert_eq!(
+            out,
+            json!({
+                "name": {"_like": "%ETH%"},
+                "symbol": {"_like": "W%"},
+                "_not": {"name": {"_ilike": "%btc%"}}
+            })
+        );
+    }
+
+    #[test]
+    fn string_match_filter_prefers_the_longest_suffix() {
+        let (field, filter) = string_match_filter("name_not_contains_nocase").unwrap();
+        assert_eq!(field, "name");
+        assert!(filter.negated && filter.operator == "_ilike");
+        let (field, filter) = string_match_filter("name_contains").unwrap();
+        assert_eq!(field, "name");
+        assert!(!filter.negated && filter.operator == "_like");
+        assert!(string_match_filter("name_in").is_none());
     }
 }

@@ -88,7 +88,7 @@ fn test_streams_with_filter_query() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
+    let expected = "query {\n  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -118,7 +118,7 @@ fn test_streams_with_order_by_skip_and_filter_query() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
+    let expected = "query {\n  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -142,7 +142,7 @@ fn test_complex_nested_query_with_multiple_filters() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 10, offset: 5, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%test%\"}, asset: {address: {_ilike: \"0x%\"}}}) {\n    id\n    alias\n    asset {\n      address\n      decimals\n      symbol\n    }\n  }\n}";
+    let expected = "query {\n  Stream(limit: 10, offset: 5, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%test%\"}, asset: {address: {_like: \"0x%\"}}}) {\n    id\n    alias\n    asset {\n      address\n      decimals\n      symbol\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -163,7 +163,7 @@ fn test_multiple_entities_single_query() {
     symbol
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 5, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%test%\"}}) {\n    id\n    alias\n  }\n  Action(limit: 3, where: {chainId: {_eq: \"1\"}}) {\n    id\n    category\n  }\n  Asset(limit: 2, where: {chainId: {_eq: \"1\"}}) {\n    id\n    address\n    symbol\n  }\n}";
+    let expected = "query {\n  Stream(limit: 5, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%test%\"}}) {\n    id\n    alias\n  }\n  Action(limit: 3, where: {chainId: {_eq: \"1\"}}) {\n    id\n    category\n  }\n  Asset(limit: 2, where: {chainId: {_eq: \"1\"}}) {\n    id\n    address\n    symbol\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -181,8 +181,8 @@ fn test_advanced_filter_combinations() {
     alias
   }
 }"#;
-    let variant_a = "query {\n  Stream(limit: 20, where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%test%\"}}, {_not: {alias: {_ilike: \"%invalid%\"}}}]}) {\n    id\n    alias\n  }\n}";
-    let variant_b = "query {\n  Stream(limit: 20, where: {chainId: {_eq: \"1\"}, _and: [{_not: {alias: {_ilike: \"%invalid%\"}}}, {alias: {_ilike: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_a = "query {\n  Stream(limit: 20, where: {chainId: {_eq: \"1\"}, _and: [{alias: {_like: \"%test%\"}}, {_not: {alias: {_like: \"%invalid%\"}}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_b = "query {\n  Stream(limit: 20, where: {chainId: {_eq: \"1\"}, _and: [{_not: {alias: {_like: \"%invalid%\"}}}, {alias: {_like: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
     assert_converts_to_any(subgraph, &[variant_a, variant_b]);
 }
 
@@ -200,7 +200,7 @@ fn test_pagination_and_ordering_edge_cases() {
     alias
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 1, offset: 999, order_by: {id: desc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%test%\"}}) {\n    id\n    alias\n  }\n}";
+    let expected = "query {\n  Stream(limit: 1, offset: 999, order_by: {id: desc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%test%\"}}) {\n    id\n    alias\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -218,8 +218,8 @@ fn test_string_vs_numeric_filter_values() {
     asset { decimals }
   }
 }"#;
-    let variant_a = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%ll%\"}, asset: {_and: [{decimals: {_lte: 18}}, {decimals: {_gte: 6}}]}}) {\n    id\n    alias\n    asset { decimals }\n  }\n}";
-    let variant_b = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%ll%\"}, asset: {_and: [{decimals: {_gte: 6}}, {decimals: {_lte: 18}}]}}) {\n    id\n    alias\n    asset { decimals }\n  }\n}";
+    let variant_a = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, alias: {_like: \"%ll%\"}, asset: {_and: [{decimals: {_lte: 18}}, {decimals: {_gte: 6}}]}}) {\n    id\n    alias\n    asset { decimals }\n  }\n}";
+    let variant_b = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, alias: {_like: \"%ll%\"}, asset: {_and: [{decimals: {_gte: 6}}, {decimals: {_lte: 18}}]}}) {\n    id\n    alias\n    asset { decimals }\n  }\n}";
     assert_converts_to_any(subgraph, &[variant_a, variant_b]);
 }
 
@@ -236,8 +236,8 @@ fn test_case_sensitive_vs_insensitive_filters() {
     alias
   }
 }"#;
-    let variant_a = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%test%\"}}, {alias: {_ilike: \"%TEST%\"}}]}) {\n    id\n    alias\n  }\n}";
-    let variant_b = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%TEST%\"}}, {alias: {_ilike: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_a = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%test%\"}}, {alias: {_like: \"%TEST%\"}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_b = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _and: [{alias: {_like: \"%TEST%\"}}, {alias: {_ilike: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
     assert_converts_to_any(subgraph, &[variant_a, variant_b]);
 }
 
@@ -253,7 +253,7 @@ fn test_response_format_comparison() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 10, offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
+    let expected = "query {\n  Stream(limit: 10, offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -329,7 +329,7 @@ fn test_gist_query_3_streams_with_filter() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
+    let expected = "query {\n  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -353,7 +353,7 @@ fn test_gist_query_4_complex_nested_query() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 10, offset: 5, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%test%\"}, asset: {address: {_ilike: \"0x%\"}}}) {\n    id\n    alias\n    asset {\n      address\n      decimals\n      symbol\n    }\n  }\n}";
+    let expected = "query {\n  Stream(limit: 10, offset: 5, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%test%\"}, asset: {address: {_like: \"0x%\"}}}) {\n    id\n    alias\n    asset {\n      address\n      decimals\n      symbol\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -374,7 +374,7 @@ fn test_gist_query_5_multiple_entities() {
     symbol
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 5, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%test%\"}}) {\n    id\n    alias\n  }\n  Action(limit: 3, where: {chainId: {_eq: \"1\"}}) {\n    id\n    category\n  }\n  Asset(limit: 2, where: {chainId: {_eq: \"1\"}}) {\n    id\n    address\n    symbol\n  }\n}";
+    let expected = "query {\n  Stream(limit: 5, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%test%\"}}) {\n    id\n    alias\n  }\n  Action(limit: 3, where: {chainId: {_eq: \"1\"}}) {\n    id\n    category\n  }\n  Asset(limit: 2, where: {chainId: {_eq: \"1\"}}) {\n    id\n    address\n    symbol\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -392,8 +392,8 @@ fn test_gist_query_6_advanced_filters() {
     alias
   }
 }"#;
-    let variant_a = "query {\n  Stream(limit: 20, where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%test%\"}}, {_not: {alias: {_ilike: \"%invalid%\"}}}]}) {\n    id\n    alias\n  }\n}";
-    let variant_b = "query {\n  Stream(limit: 20, where: {chainId: {_eq: \"1\"}, _and: [{_not: {alias: {_ilike: \"%invalid%\"}}}, {alias: {_ilike: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_a = "query {\n  Stream(limit: 20, where: {chainId: {_eq: \"1\"}, _and: [{alias: {_like: \"%test%\"}}, {_not: {alias: {_like: \"%invalid%\"}}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_b = "query {\n  Stream(limit: 20, where: {chainId: {_eq: \"1\"}, _and: [{_not: {alias: {_like: \"%invalid%\"}}}, {alias: {_like: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
     assert_converts_to_any(subgraph, &[variant_a, variant_b]);
 }
 
@@ -411,7 +411,7 @@ fn test_gist_query_7_pagination_edge_cases() {
     alias
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 1, offset: 999, order_by: {id: desc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%test%\"}}) {\n    id\n    alias\n  }\n}";
+    let expected = "query {\n  Stream(limit: 1, offset: 999, order_by: {id: desc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%test%\"}}) {\n    id\n    alias\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -448,8 +448,8 @@ fn test_gist_query_9_case_sensitivity() {
     alias
   }
 }"#;
-    let variant_a = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%test%\"}}, {alias: {_ilike: \"%TEST%\"}}]}) {\n    id\n    alias\n  }\n}";
-    let variant_b = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%TEST%\"}}, {alias: {_ilike: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_a = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%test%\"}}, {alias: {_like: \"%TEST%\"}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_b = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _and: [{alias: {_like: \"%TEST%\"}}, {alias: {_ilike: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
     assert_converts_to_any(subgraph, &[variant_a, variant_b]);
 }
 
