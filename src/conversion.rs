@@ -158,6 +158,7 @@ pub fn convert_subgraph_to_hyperindex(
         shape_plans,
         fragments_override: _,
         min_blocks,
+        like_variables,
     } = convert_query_structure(query, chain_id)?;
 
     // Variables are read before any are dropped from the forwarded payload: a
@@ -174,8 +175,13 @@ pub fn convert_subgraph_to_hyperindex(
     // subgraph filter shape (flat keys like `date_gt`) into Hasura `bool_exp` shape
     // (`date: {_gt: ...}`). This keeps clients that still send subgraph-shaped
     // filter JSON working transparently after the query-level rewrite.
-    if let Some(variables) = payload.get("variables") {
-        let mut variables = variables.clone();
+    // A pattern variable can need a value (from a declared default) even when
+    // the request sends no variables at all.
+    let variables = payload
+        .get("variables")
+        .cloned()
+        .or_else(|| (!like_variables.is_empty()).then(|| serde_json::json!({})));
+    if let Some(mut variables) = variables {
         // Values for the operations that were not selected would be rejected as
         // unexpected variables.
         if let (Some(selected), Value::Object(map)) = (&selected, &mut variables) {
@@ -228,6 +234,14 @@ pub fn convert_subgraph_to_hyperindex(
                         spec.target_var.clone(),
                         order_by_json_with_tiebreak(&field, &direction, id_tiebreak_enabled()),
                     );
+                }
+            }
+        }
+        // Patterns are built before their source variable is dropped below.
+        if let Value::Object(map) = &mut variables {
+            for spec in &like_variables {
+                if let Some(pattern) = like_variable_value(spec, map) {
+                    map.insert(spec.target.clone(), pattern);
                 }
             }
         }
@@ -511,6 +525,8 @@ struct MainConversion {
     fragments_override: Option<String>,
     /// `block: {number_gte: N}` requirements found on root fields.
     min_blocks: Vec<MinBlockSource>,
+    /// Variables carrying the LIKE pattern for a `name_contains: $q`.
+    like_variables: Vec<LikeVariable>,
 }
 
 fn convert_query_structure(
@@ -542,6 +558,7 @@ fn convert_query_structure(
         shape_plans: main.shape_plans,
         fragments_override: None,
         min_blocks: main.min_blocks,
+        like_variables: main.like_variables,
     })
 }
 
@@ -1005,7 +1022,25 @@ fn convert_main_query(
     // Build the body first: whether a declaration is still referenced can only be
     // answered against the emitted arguments.
     let body = converted_entities.join("\n");
-    let referenced = referenced_variables(&body);
+    let referenced = referenced_variables(&format!(
+        "{}\n{}",
+        body,
+        fragments_override.as_deref().unwrap_or_default()
+    ));
+    // `name_contains: $q` now reads `$q__contains`, declared here as a String;
+    // `$q` itself goes if nothing else reads it.
+    let like_variables = like_variables(&referenced, &ctx.header_var_types);
+    for spec in &like_variables {
+        let non_null = ctx.header_var_types[&spec.source]
+            .split('=')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .ends_with('!');
+        let ty = if non_null { "String!" } else { "String" };
+        ctx.order_by_retypes.insert(spec.target.clone(), ty.to_string());
+        ctx.dead_candidates.push(spec.source.clone());
+    }
     let removals: HashSet<String> = std::mem::take(&mut ctx.dead_candidates)
         .into_iter()
         .filter(|name| !referenced.contains(name))
@@ -1052,6 +1087,7 @@ fn convert_main_query(
         shape_plans,
         fragments_override,
         min_blocks,
+        like_variables,
     })
 }
 
@@ -1176,9 +1212,11 @@ struct ArgContext {
     /// Variables used as `where: $var` with a subgraph `*_filter` type, by the
     /// entity whose filter shape their value must be translated into.
     filter_variable_entities: HashMap<String, String>,
-    /// Unconditional header retypes for order arguments. Kept separate from
-    /// `variable_type_overrides`, which only ever replaces a declared
-    /// `String`/`Int` and so cannot touch `OrderDirection!` or `Entity_orderBy!`.
+    /// Unconditional header retypes, for order arguments and pattern variables.
+    /// A name the client never declared gets a declaration of its own. Kept
+    /// separate from `variable_type_overrides`, which only ever replaces a
+    /// declared `String`/`Int` and so cannot touch `OrderDirection!` or
+    /// `Entity_orderBy!`.
     order_by_retypes: HashMap<String, String>,
     order_by_specs: Vec<OrderBySpec>,
     /// Declarations that may have become unused; confirmed against the built body.
@@ -2781,8 +2819,15 @@ fn convert_basic_filter_to_hasura_condition(
 
     // Handle different filter patterns - check longer suffixes first
     if let Some((field, filter)) = string_match_filter(key) {
-        let pattern = like_pattern(value.trim_matches('"'), filter.shape);
-        let condition = format!("{}: {{{}: \"{}\"}}", field, filter.operator, pattern);
+        let value = value.trim();
+        // A pattern cannot be spelled around a variable in the query text, so
+        // `$q` is swapped for a variable holding the finished pattern, filled in
+        // from `$q` at request time (see `like_variables`).
+        let pattern = match value.strip_prefix('$') {
+            Some(var) => format!("${}", like_variable_name(var, filter.shape)),
+            None => format!("\"{}\"", like_pattern(value.trim_matches('"'), filter.shape)),
+        };
+        let condition = format!("{}: {{{}: {}}}", field, filter.operator, pattern);
         return Ok(if filter.negated {
             format!("_not: {{{}}}", condition)
         } else {
@@ -3118,7 +3163,7 @@ fn op_wrap(op: &str, value: Value) -> Value {
     Value::Object(m)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum LikeShape {
     Contains,
     StartsWith,
@@ -3198,6 +3243,88 @@ fn like_value(value: &Value, filter: StringMatchFilter) -> Value {
         _ => return op_wrap(filter.operator, value.clone()),
     };
     op_wrap(filter.operator, Value::String(like_pattern(&s, filter.shape)))
+}
+
+impl LikeShape {
+    const ALL: [LikeShape; 3] = [LikeShape::Contains, LikeShape::StartsWith, LikeShape::EndsWith];
+
+    fn name(self) -> &'static str {
+        match self {
+            LikeShape::Contains => "contains",
+            LikeShape::StartsWith => "starts_with",
+            LikeShape::EndsWith => "ends_with",
+        }
+    }
+}
+
+/// The variable that stands in for `$var` under a string-matching filter and
+/// carries its LIKE pattern: `q__contains` for `name_contains: $q`.
+fn like_variable_name(var: &str, shape: LikeShape) -> String {
+    format!("{}__{}", var, shape.name())
+}
+
+/// A variable holding the LIKE pattern built from another variable's value.
+#[derive(Debug, Clone)]
+struct LikeVariable {
+    /// The variable the converted query reads (`q__contains`).
+    target: String,
+    /// The client's variable whose value the pattern is built from (`q`).
+    source: String,
+    shape: LikeShape,
+    /// The source's default value from its declaration, used when the request
+    /// leaves it out.
+    default: Option<Value>,
+}
+
+/// The pattern variables a converted operation references, from the names in
+/// its text. Only names whose source the client declared, and which the
+/// client did not declare themselves, count.
+fn like_variables(
+    referenced: &HashSet<String>,
+    header_var_types: &HashMap<String, String>,
+) -> Vec<LikeVariable> {
+    let mut found: Vec<LikeVariable> = referenced
+        .iter()
+        .filter(|name| !header_var_types.contains_key(*name))
+        .filter_map(|name| {
+            LikeShape::ALL.iter().find_map(|&shape| {
+                let source = name.strip_suffix(&format!("__{}", shape.name()))?;
+                let declared = header_var_types.get(source)?;
+                Some(LikeVariable {
+                    target: name.clone(),
+                    source: source.to_string(),
+                    shape,
+                    default: declared_default(declared),
+                })
+            })
+        })
+        .collect();
+    found.sort_by(|a, b| a.target.cmp(&b.target));
+    found
+}
+
+/// The default value in a declared variable type (`String = "abc"`), when it is
+/// a plain scalar literal.
+fn declared_default(declared: &str) -> Option<Value> {
+    let (_, default) = declared.split_once('=')?;
+    let default = default.trim();
+    if default == "null" {
+        return Some(Value::Null);
+    }
+    serde_json::from_str(default).ok().filter(|v: &Value| !v.is_object() && !v.is_array())
+}
+
+/// The value of a pattern variable for a request, or `None` when the source is
+/// unset (and has no default) or null, leaving the pattern unset too.
+fn like_variable_value(spec: &LikeVariable, variables: &serde_json::Map<String, Value>) -> Option<Value> {
+    let source = variables.get(&spec.source).or(spec.default.as_ref())?;
+    let text = match source {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => return None,
+    };
+    Some(Value::String(like_pattern(&text, spec.shape)))
 }
 
 /// Same as convert_basic_filter_to_hasura_condition but also returns variable type override info
@@ -7770,6 +7897,85 @@ mod tests {
         for off in ["off", "OFF", " 0 ", "false", "no"] {
             assert!(!tiebreak_setting(Some(off)), "{off}");
         }
+    }
+
+
+    #[test]
+    fn contains_with_a_variable_builds_the_pattern_from_its_value() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($q: String!) { pairs(where: {name_contains: $q}) { id } }",
+            "variables": {"q": "eth"}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("where: {name: {_like: $q__contains}}"), "{query}");
+        assert!(query.starts_with("query Q($q__contains: String!)"), "{query}");
+        assert!(!query.contains("$q:"), "{query}");
+        assert_eq!(result.query["variables"], json!({"q__contains": "%eth%"}));
+        assert_eq!(result.dropped_variables, vec!["q".to_string()]);
+    }
+
+    #[test]
+    fn one_variable_in_several_string_filters_and_an_equality() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($q: String) { pairs(where: {name_starts_with: $q, name_not_ends_with_nocase: $q, symbol: $q}) { id } }",
+            "variables": {"q": "W"}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("name: {_like: $q__starts_with}"), "{query}");
+        assert!(query.contains("_not: {name: {_ilike: $q__ends_with}}"), "{query}");
+        assert!(query.contains("symbol: {_eq: $q}"), "{query}");
+        // `$q` is still read by the equality, so it stays.
+        assert!(
+            query.starts_with("query Q($q: String, $q__ends_with: String, $q__starts_with: String)"),
+            "{query}"
+        );
+        assert_eq!(
+            result.query["variables"],
+            json!({"q": "W", "q__starts_with": "W%", "q__ends_with": "%W"})
+        );
+        assert!(result.dropped_variables.is_empty());
+    }
+
+    #[test]
+    fn pattern_variable_uses_the_declared_default() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($q: String = \"ab\") { pairs(where: {name_contains: $q}) { id } }"
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(result.query["variables"], json!({"q__contains": "%ab%"}));
+    }
+
+    #[test]
+    fn null_pattern_variable_is_left_unset() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($q: String) { pairs(where: {name_contains: $q}) { id } }",
+            "variables": {"q": null}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(result.query["variables"], json!({}));
+    }
+
+    #[test]
+    fn pattern_variables_in_relation_filters_and_nested_fields() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($s: String!, $t: String!) { swaps(where: {tokenIn_: {symbol_ends_with: $s}}) { id } swapUsers { swap(where: {trader_contains: $t}) { id } } }",
+            "variables": {"s": ".e", "t": "0xab"}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("tokenIn: {symbol: {_like: $s__ends_with}}"), "{query}");
+        assert!(query.contains("trader: {_like: $t__contains}"), "{query}");
+        assert_eq!(
+            result.query["variables"],
+            json!({"s__ends_with": "%.e", "t__contains": "%0xab%"})
+        );
     }
 
 }
