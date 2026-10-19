@@ -109,9 +109,7 @@ async fn execute_query_with_retry(
                 conversion::ConversionError::UnsupportedFilter(_filter) =>
                     "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
                 conversion::ConversionError::ComplexMetaQuery(_) =>
-                    "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
-                conversion::ConversionError::MetaWithOtherFields(_) =>
-                    "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
+                    "Hyperindex can answer _meta { block { number timestamp } } (timestamp needs an indexer with Hasura's _meta). deployment, block.hash and hasIndexingErrors have no Hyperindex source. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
                 conversion::ConversionError::MissingOperationName =>
                     "The document holds several operations. Set operationName to the one to run.",
                 conversion::ConversionError::UnknownOperation(_) =>
@@ -316,9 +314,7 @@ async fn handle_debug(Json(payload): Json<Value>) -> impl IntoResponse {
                 conversion::ConversionError::UnsupportedFilter(_filter) =>
                     "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
                 conversion::ConversionError::ComplexMetaQuery(_) =>
-                    "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
-                conversion::ConversionError::MetaWithOtherFields(_) =>
-                    "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
+                    "Hyperindex can answer _meta { block { number timestamp } } (timestamp needs an indexer with Hasura's _meta). deployment, block.hash and hasIndexingErrors have no Hyperindex source. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
                 conversion::ConversionError::MissingOperationName =>
                     "The document holds several operations. Set operationName to the one to run.",
                 conversion::ConversionError::UnknownOperation(_) =>
@@ -382,9 +378,7 @@ async fn handle_chain_debug(
                 conversion::ConversionError::UnsupportedFilter(_filter) =>
                     "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
                 conversion::ConversionError::ComplexMetaQuery(_) =>
-                    "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
-                conversion::ConversionError::MetaWithOtherFields(_) =>
-                    "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
+                    "Hyperindex can answer _meta { block { number timestamp } } (timestamp needs an indexer with Hasura's _meta). deployment, block.hash and hasIndexingErrors have no Hyperindex source. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
                 conversion::ConversionError::MissingOperationName =>
                     "The document holds several operations. Set operationName to the one to run.",
                 conversion::ConversionError::UnknownOperation(_) =>
@@ -499,41 +493,10 @@ fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::colle
     };
 
     if let Some(Value::Object(data_obj)) = root.get_mut("data") {
-        // Special handling for _meta query response
+        // `_meta` arrives as Hyperindex's progress rows; rebuild graph-node's object.
         if let Some(selection) = meta_selection {
-            if let Some(chain_metadata) = data_obj.get("chain_metadata") {
-                // Transform chain_metadata response to _meta format
-                // From: {"data":{"chain_metadata":[{"latest_fetched_block_number":419538012}]}}
-                // To:   {"data":{"_meta":{"block":{"number":419538012}}}}
-                //
-                // Conversion already rejected any selection we cannot answer in
-                // full, so echoing back exactly what was asked for is safe here.
-                let block_number = chain_metadata
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|obj| obj.get("latest_fetched_block_number"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-
-                let mut meta = serde_json::Map::new();
-                if selection.block_number || selection.block_typename {
-                    let mut block = serde_json::Map::new();
-                    if selection.block_number {
-                        block.insert("number".to_string(), block_number);
-                    }
-                    if selection.block_typename {
-                        block.insert("__typename".to_string(), Value::String("_Block_".into()));
-                    }
-                    meta.insert("block".to_string(), Value::Object(block));
-                }
-                if selection.typename {
-                    meta.insert("__typename".to_string(), Value::String("_Meta_".into()));
-                }
-
-                let mut out = serde_json::Map::new();
-                out.insert("_meta".to_string(), Value::Object(meta));
-                *data_obj = out;
-                return Value::Object(root);
+            if let Some(rows) = data_obj.remove(&selection.key) {
+                data_obj.insert(selection.key.clone(), subgraph_meta(&rows, selection));
             }
         }
 
@@ -557,6 +520,49 @@ fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::colle
     }
 
     Value::Object(root)
+}
+
+/// graph-node's `_meta` object from Hyperindex's progress rows (Hasura `_meta`
+/// or `chain_metadata`), with only the fields the client selected.
+///
+/// With one row per chain, the lowest processed block is reported: the block
+/// every chain has reached.
+fn subgraph_meta(rows: &Value, selection: &conversion::MetaSelection) -> Value {
+    let progress = |row: &&Value| {
+        row.get("progressBlock")
+            .or_else(|| row.get("latest_processed_block"))
+            .and_then(Value::as_u64)
+    };
+    let row = rows
+        .as_array()
+        .and_then(|rows| rows.iter().filter(|row| progress(row).is_some()).min_by_key(|row| progress(row)));
+
+    let mut meta = serde_json::Map::new();
+    if selection.block_number || selection.block_timestamp || selection.block_typename {
+        let mut block = serde_json::Map::new();
+        if selection.block_number {
+            let number = row.and_then(|r| progress(&r)).map(Value::from).unwrap_or(Value::Null);
+            block.insert("number".to_string(), number);
+        }
+        if selection.block_timestamp {
+            // graph-node's `timestamp` is unix seconds; Hasura gives timestamptz.
+            let timestamp = row
+                .and_then(|r| r.get("progressBlockTime"))
+                .and_then(Value::as_str)
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| Value::from(t.timestamp()))
+                .unwrap_or(Value::Null);
+            block.insert("timestamp".to_string(), timestamp);
+        }
+        if selection.block_typename {
+            block.insert("__typename".to_string(), Value::String("_Block_".into()));
+        }
+        meta.insert("block".to_string(), Value::Object(block));
+    }
+    if selection.typename {
+        meta.insert("__typename".to_string(), Value::String("_Meta_".into()));
+    }
+    Value::Object(meta)
 }
 
 fn is_pascal_case(s: &str) -> bool {
@@ -830,8 +836,8 @@ mod response_shape_tests {
         // Test _meta query response transformation
         let resp = serde_json::json!({
             "data": {
-                "chain_metadata": [
-                    {"latest_fetched_block_number": 419538012}
+                "_meta": [
+                    {"progressBlock": 419538012}
                 ]
             }
         });
@@ -841,8 +847,8 @@ mod response_shape_tests {
             &empty_map,
             Some(&conversion::MetaSelection {
                 block_number: true,
-                typename: false,
-                block_typename: false,
+                key: "_meta".to_string(),
+                ..conversion::MetaSelection::default()
             }),
         );
         let data = out.get("data").unwrap();
@@ -968,6 +974,82 @@ mod response_shape_tests {
             converted.meta_selection.as_ref(),
         );
         assert_eq!(out, json!({"data": {"tokens": [{"id": "t"}]}}));
+    }
+
+    #[test]
+    fn meta_response_reports_the_lowest_chain_with_its_block_time() {
+        let selection = conversion::MetaSelection {
+            block_number: true,
+            block_timestamp: true,
+            typename: true,
+            block_typename: true,
+            key: "_meta".to_string(),
+        };
+        let rows = json!([
+            {"progressBlock": 442680100, "progressBlockTime": "2026-10-19T15:03:00+00:00"},
+            {"progressBlock": 442680053, "progressBlockTime": "2026-10-19T15:02:36+00:00"}
+        ]);
+        assert_eq!(
+            subgraph_meta(&rows, &selection),
+            json!({
+                "__typename": "_Meta_",
+                "block": {"number": 442680053, "timestamp": 1792422156i64, "__typename": "_Block_"}
+            })
+        );
+    }
+
+    #[test]
+    fn meta_timestamp_with_fractional_seconds_and_null() {
+        let selection = conversion::MetaSelection {
+            block_timestamp: true,
+            key: "_meta".to_string(),
+            ..conversion::MetaSelection::default()
+        };
+        assert_eq!(
+            subgraph_meta(
+                &json!([{"progressBlock": 1, "progressBlockTime": "2026-10-19T13:05:36.429+00:00"}]),
+                &selection
+            ),
+            json!({"block": {"timestamp": 1792415136i64}})
+        );
+        // During backfill Hasura has no block time yet; graph-node's field is nullable.
+        assert_eq!(
+            subgraph_meta(&json!([{"progressBlock": 1, "progressBlockTime": null}]), &selection),
+            json!({"block": {"timestamp": null}})
+        );
+    }
+
+    #[test]
+    fn meta_alongside_entities_keeps_the_rest_of_the_response() {
+        crate::schema::init_test_schema_once();
+        let payload = json!({"query": "query { m: _meta { block { number } } tokens(first: 1) { id } }"});
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let hasura = json!({"data": {
+            "m": [{"progressBlock": 7}],
+            "Token": [{"id": "t"}]
+        }});
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            converted.meta_selection.as_ref(),
+        );
+        assert_eq!(
+            out,
+            json!({"data": {"m": {"block": {"number": 7}}, "tokens": [{"id": "t"}]}})
+        );
+    }
+
+    #[test]
+    fn meta_response_from_chain_metadata_fallback() {
+        let selection = conversion::MetaSelection {
+            block_number: true,
+            key: "_meta".to_string(),
+            ..conversion::MetaSelection::default()
+        };
+        assert_eq!(
+            subgraph_meta(&json!([{"latest_processed_block": 99}]), &selection),
+            json!({"block": {"number": 99}})
+        );
     }
 
     #[test]

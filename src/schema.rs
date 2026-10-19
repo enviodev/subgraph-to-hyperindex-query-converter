@@ -818,6 +818,20 @@ pub fn init_test_schema() {
             ),
         );
 
+        // Hasura's native `_meta` (newer Hyperindex versions): indexing progress
+        // per chain.
+        cache.insert(
+            "_meta".to_string(),
+            build(
+                &[
+                    ("chainId", "Int"),
+                    ("progressBlock", "Int"),
+                    ("progressBlockTime", "timestamptz"),
+                ],
+                &[],
+            ),
+        );
+
         // A singular entity name ending in `s`, which word rules would take for
         // a plural.
         cache.insert(

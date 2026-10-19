@@ -539,9 +539,9 @@ fn argus_hours_of_launches_end_to_end() {
     );
 }
 
-/// Argus `Meta` asks for `block { timestamp }` and `hasIndexingErrors`, neither of
-/// which Hyperindex can answer. The query is rejected rather than served partially:
-/// a response missing `hasIndexingErrors` would read as "no indexing errors".
+/// Argus `Meta` asks for `hasIndexingErrors`, which Hyperindex cannot answer. The
+/// query is rejected rather than served partially: a response missing
+/// `hasIndexingErrors` would read as "no indexing errors".
 #[test]
 fn argus_meta_end_to_end_is_rejected() {
     crate::schema::init_test_schema_once();
@@ -549,7 +549,7 @@ fn argus_meta_end_to_end_is_rejected() {
         json!({ "query": "query Meta { _meta { block { number timestamp } hasIndexingErrors } }" });
     match conversion::convert_subgraph_to_hyperindex(&payload, Some("5042")) {
         Err(conversion::ConversionError::ComplexMetaQuery(fields)) => {
-            assert_eq!(fields, "block.timestamp, hasIndexingErrors")
+            assert_eq!(fields, "hasIndexingErrors")
         }
         other => panic!("expected ComplexMetaQuery, got {:?}", other.map(|r| r.query)),
     }
@@ -564,7 +564,7 @@ fn argus_meta_reduced_end_to_end() {
         .expect("block { number } is servable");
     assert_eq!(
         result.query["query"].as_str().unwrap(),
-        "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
+        "query Meta {\n  _meta(where: {chainId: {_eq: 5042}}) {\n    progressBlock\n  }\n}"
     );
     assert!(result.meta_selection.is_some());
 }

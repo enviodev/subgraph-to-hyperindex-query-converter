@@ -13,10 +13,8 @@ pub enum ConversionError {
     MissingField(String),
     #[error("Unsupported filter: {0}")]
     UnsupportedFilter(String),
-    #[error("_meta fields with no Hyperindex equivalent: {0}. Only _meta {{ block {{ number }} }} can be served, and a partial answer would look like a complete one to the caller")]
+    #[error("_meta fields with no Hyperindex equivalent: {0}. Only _meta {{ block {{ number timestamp }} }} can be served (block.timestamp needs an indexer with Hasura's _meta), and a partial answer would look like a complete one to the caller")]
     ComplexMetaQuery(String),
-    #[error("_meta cannot be combined with other root fields: {0}")]
-    MetaWithOtherFields(String),
     #[error("Must provide operation name if query contains multiple operations")]
     MissingOperationName,
     #[error("Unknown operation named \"{0}\"")]
@@ -522,35 +520,6 @@ fn convert_query_structure(
     // Extract fragments and main query
     let (fragments, main_query) = extract_fragments_and_main_query(query)?;
 
-    // `_meta` is handled by a dedicated path, so it has to be recognized as an
-    // actual root field. A substring test would also fire on an entity whose
-    // name merely contains `_meta` (`token_metadata`) and hijack the whole query.
-    let root_fields = root_field_names(&main_query);
-    if root_fields.iter().any(|name| name == "_meta") {
-        // `chain_metadata` replaces the whole operation, so anything alongside
-        // `_meta` would be dropped without a word. Say so instead.
-        let others: Vec<&str> = root_fields
-            .iter()
-            .filter(|name| *name != "_meta")
-            .map(|name| name.as_str())
-            .collect();
-        if !others.is_empty() {
-            return Err(ConversionError::MetaWithOtherFields(others.join(", ")));
-        }
-        let (converted_query, meta_selection) = convert_meta_query(&main_query)?;
-        return Ok(MainConversion {
-            converted_query,
-            field_name_map: HashMap::new(),
-            filter_variable_entities: HashMap::new(),
-            order_by_variables: Vec::new(),
-            dropped_variables: Vec::new(),
-            meta_selection: Some(meta_selection),
-            shape_plans: HashMap::new(),
-            fragments_override: None,
-            min_blocks: Vec::new(),
-        });
-    }
-
     // Convert the main query
     let main = convert_main_query(&main_query, chain_id, &fragments)?;
 
@@ -569,7 +538,7 @@ fn convert_query_structure(
         filter_variable_entities: main.filter_variable_entities,
         order_by_variables: main.order_by_variables,
         dropped_variables: main.dropped_variables,
-        meta_selection: None,
+        meta_selection: main.meta_selection,
         shape_plans: main.shape_plans,
         fragments_override: None,
         min_blocks: main.min_blocks,
@@ -891,6 +860,31 @@ fn convert_main_query(
         min_blocks.extend(take_block_arguments(&mut root.params, &mut ctx)?);
     }
 
+    // `_meta` reads Hyperindex's indexing progress, not an entity.
+    let (meta_roots, roots): (Vec<RootField>, Vec<RootField>) =
+        roots.into_iter().partition(|root| root.name == "_meta");
+    let native_meta = native_meta_available();
+    let mut meta_selection: Option<MetaSelection> = None;
+    let mut meta_lines = Vec::new();
+    for meta in meta_roots {
+        if meta_selection.is_some() {
+            return Err(ConversionError::ComplexMetaQuery(
+                "a second _meta root field".to_string(),
+            ));
+        }
+        let key = meta.alias.unwrap_or_else(|| "_meta".to_string());
+        let selection = convert_meta_selection(&meta.selection, native_meta, key.clone())?;
+        // The response key is rebuilt in place and must not be renamed after.
+        field_name_map.insert(key.clone(), key.clone());
+        meta_lines.push(progress_root(
+            &key,
+            chain_id,
+            native_meta,
+            selection.block_timestamp,
+        ));
+        meta_selection = Some(selection);
+    }
+
     // Each root's Hyperindex entity, and whether it is a primary-key lookup.
     let classified: Vec<(String, bool)> = roots
         .iter()
@@ -997,6 +991,7 @@ fn convert_main_query(
         converted_entities.push(converted_entity);
     }
 
+    converted_entities.extend(meta_lines);
     if !min_blocks.is_empty() {
         converted_entities.push(progress_root(
             BLOCK_CHECK_KEY,
@@ -1052,7 +1047,7 @@ fn convert_main_query(
         filter_variable_entities: ctx.filter_variable_entities,
         order_by_variables: ctx.order_by_specs,
         dropped_variables,
-        meta_selection: None,
+        meta_selection,
         shape_plans,
         fragments_override,
         min_blocks,
@@ -2205,152 +2200,59 @@ fn convert_fragment_arguments(
 
 // Removed unused selection set helpers
 
-/// Root-level field names of an operation, in source order.
+/// Which parts of a `_meta` selection the caller asked for, and where its
+/// answer goes in the response.
 ///
-/// Only the outermost selection set is inspected: nested fields, arguments and
-/// string literals are skipped, and an alias label is discarded in favour of the
-/// field it points at (`recent: streams` yields `streams`).
-///
-/// This exists so `_meta` can be recognized as a real root field rather than by
-/// substring, which also matches an entity like `token_metadata`.
-fn root_field_names(query: &str) -> Vec<String> {
-    let start = match query.find('{') {
-        Some(i) => i,
-        None => return Vec::new(),
-    };
-    let end = match query.rfind('}') {
-        Some(i) if i > start => i,
-        _ => return Vec::new(),
-    };
-    let body: Vec<char> = query[start + 1..end].chars().collect();
-
-    let mut names = Vec::new();
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut i = 0;
-
-    while i < body.len() {
-        let c = body[i];
-
-        if in_str {
-            if c == '"' {
-                in_str = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        match c {
-            '"' => {
-                in_str = true;
-                i += 1;
-            }
-            '{' | '(' | '[' => {
-                depth += 1;
-                i += 1;
-            }
-            '}' | ')' | ']' => {
-                depth -= 1;
-                i += 1;
-            }
-            _ if depth == 0 && (c.is_alphabetic() || c == '_') => {
-                let name: String = body[i..]
-                    .iter()
-                    .take_while(|c| c.is_alphanumeric() || **c == '_')
-                    .collect();
-                i += name.chars().count();
-
-                // An alias label is followed by `:`; the field it names comes next.
-                let mut j = i;
-                while j < body.len() && body[j].is_whitespace() {
-                    j += 1;
-                }
-                if j < body.len() && body[j] == ':' {
-                    i = j + 1;
-                } else {
-                    names.push(name);
-                }
-            }
-            _ => i += 1,
-        }
-    }
-
-    names
-}
-
-/// Which parts of a `_meta` selection the caller asked for.
-///
-/// Only `block { number }` maps onto Hyperindex (`chain_metadata`), plus the
-/// `__typename` introspection fields, which we can answer ourselves.
+/// `block { number timestamp }` maps onto Hyperindex's indexing progress
+/// (`_meta.progressBlock` / `progressBlockTime`, or `chain_metadata` on indexers
+/// without Hasura's `_meta`), and `__typename` is answered locally.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MetaSelection {
     pub block_number: bool,
+    pub block_timestamp: bool,
     pub typename: bool,
     pub block_typename: bool,
+    /// Response key: the client's alias, or `_meta`.
+    pub key: String,
 }
 
-/// Leaf paths a `_meta` selection may request and still be answered in full.
-const SERVABLE_META_PATHS: [&str; 3] = ["block.number", "__typename", "block.__typename"];
-
-fn convert_meta_query(query: &str) -> Result<(String, MetaSelection), ConversionError> {
-    // Normalize whitespace: collapse all whitespace sequences into single spaces
-    // This handles multiline queries like "_meta {\n    block {\n      number\n    }\n  }"
-    let normalized: String = query.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    let selection = match extract_meta_selection(&normalized) {
-        Some(inner) => inner,
-        None => return Err(ConversionError::InvalidQueryFormat),
-    };
-
-    let requested = selection_leaf_paths(&selection);
+/// Read a `_meta` selection, refusing it whole if any field cannot be served.
+///
+/// Serving the rest would hand back an object that looks complete but silently
+/// omits fields, and a missing `hasIndexingErrors` reads as "no indexing errors".
+/// `block.timestamp` needs Hasura's native `_meta` (`native`); `chain_metadata`
+/// has no block time.
+fn convert_meta_selection(
+    selection: &str,
+    native: bool,
+    key: String,
+) -> Result<MetaSelection, ConversionError> {
+    let requested = selection_leaf_paths(selection);
     if requested.is_empty() {
         return Err(ConversionError::InvalidQueryFormat);
     }
 
-    // Anything we cannot answer fails the whole query. Serving the rest would
-    // hand back an object that looks complete but silently omits fields — and a
-    // missing `hasIndexingErrors` reads as "no indexing errors".
+    let servable = |path: &str| match path {
+        "block.number" | "__typename" | "block.__typename" => true,
+        "block.timestamp" => native,
+        _ => false,
+    };
     let unsupported: Vec<String> = requested
         .iter()
-        .filter(|path| !SERVABLE_META_PATHS.contains(&path.as_str()))
+        .filter(|path| !servable(path))
         .cloned()
         .collect();
     if !unsupported.is_empty() {
         return Err(ConversionError::ComplexMetaQuery(unsupported.join(", ")));
     }
 
-    let meta = MetaSelection {
+    Ok(MetaSelection {
         block_number: requested.iter().any(|p| p == "block.number"),
+        block_timestamp: requested.iter().any(|p| p == "block.timestamp"),
         typename: requested.iter().any(|p| p == "__typename"),
         block_typename: requested.iter().any(|p| p == "block.__typename"),
-    };
-
-    Ok((
-        "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}".to_string(),
-        meta,
-    ))
-}
-
-/// The contents of the `_meta { ... }` selection in a normalized query.
-fn extract_meta_selection(normalized: &str) -> Option<String> {
-    let meta_at = normalized.find("_meta")?;
-    let after: Vec<char> = normalized[meta_at..].chars().collect();
-    let open = after.iter().position(|&c| c == '{')?;
-
-    let mut depth = 0usize;
-    for (i, &c) in after[open..].iter().enumerate() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(after[open + 1..open + i].iter().collect());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+        key,
+    })
 }
 
 /// Dotted leaf paths of a selection set: `block { number } deployment` yields
@@ -3681,45 +3583,49 @@ mod tests {
 
     #[test]
     fn test_meta_query_simple() {
+        init_test_schema_if_needed();
         let payload = create_test_payload("query { _meta { block { number } } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
+            "query": "query {\n  _meta(where: {chainId: {_eq: 1}}) {\n    progressBlock\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
 
     #[test]
     fn test_meta_query_simple_multiline() {
+        init_test_schema_if_needed();
         // Test the multiline version that was failing before
         let payload =
             create_test_payload("query {\n  _meta {\n    block {\n      number\n    }\n  }\n}");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
+            "query": "query {\n  _meta(where: {chainId: {_eq: 1}}) {\n    progressBlock\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
 
     #[test]
     fn test_meta_query_with_tabs_and_mixed_whitespace() {
+        init_test_schema_if_needed();
         // Test with tabs and mixed whitespace
         let payload =
             create_test_payload("query {\n\t_meta {\n\t\tblock {\n\t\t\tnumber\n\t\t}\n\t}\n}");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
+            "query": "query {\n  _meta(where: {chainId: {_eq: 1}}) {\n    progressBlock\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
 
     #[test]
     fn test_meta_query_with_extra_spaces() {
+        init_test_schema_if_needed();
         // Test with extra spaces between tokens
         let payload = create_test_payload("query  {   _meta   {   block   {   number   }   }   }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
+            "query": "query {\n  _meta(where: {chainId: {_eq: 1}}) {\n    progressBlock\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3730,6 +3636,7 @@ mod tests {
     /// object the caller cannot tell from a complete one.
     #[test]
     fn test_meta_query_rejects_any_unservable_field() {
+        init_test_schema_if_needed();
         for (query, expected) in [
             ("query { _meta { block { hash number } } }", "block.hash"),
             (
@@ -3737,8 +3644,8 @@ mod tests {
                 "block.hash",
             ),
             (
-                "query { _meta { block { number timestamp } } }",
-                "block.timestamp",
+                "query { _meta { block { number } hasIndexingErrors } }",
+                "hasIndexingErrors",
             ),
             (
                 "query { _meta { block { number } deployment } }",
@@ -3761,16 +3668,17 @@ mod tests {
         }
     }
 
-    /// Argus `Meta`, verbatim. It asks for two fields Hyperindex cannot answer,
-    /// so it is rejected rather than answered partially.
+    /// Argus `Meta`, verbatim. `hasIndexingErrors` has no Hyperindex source, so
+    /// the query is rejected rather than answered partially.
     #[test]
     fn test_meta_query_argus_verbatim_is_rejected() {
+        init_test_schema_if_needed();
         let payload = create_test_payload(
             "query Meta { _meta { block { number timestamp } hasIndexingErrors } }",
         );
         match convert_subgraph_to_hyperindex(&payload, Some("5042")) {
             Err(ConversionError::ComplexMetaQuery(fields)) => {
-                assert_eq!(fields, "block.timestamp, hasIndexingErrors")
+                assert_eq!(fields, "hasIndexingErrors")
             }
             other => panic!("expected ComplexMetaQuery, got {:?}", other.map(|r| r.query)),
         }
@@ -3779,19 +3687,20 @@ mod tests {
     /// Reducing that query to what Hyperindex can serve makes it work.
     #[test]
     fn test_meta_query_argus_reduced_to_block_number_succeeds() {
+        init_test_schema_if_needed();
         let payload = create_test_payload("query Meta { _meta { block { number } } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("5042")).unwrap();
         assert_eq!(
             result.query["query"].as_str().unwrap(),
-            "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
+            "query Meta {\n  _meta(where: {chainId: {_eq: 5042}}) {\n    progressBlock\n  }\n}"
         );
         assert!(result.meta_selection.is_some());
         assert_eq!(
             result.meta_selection,
             Some(MetaSelection {
                 block_number: true,
-                typename: false,
-                block_typename: false,
+                key: "_meta".to_string(),
+                ..MetaSelection::default()
             })
         );
     }
@@ -3800,6 +3709,7 @@ mod tests {
     /// Clients that inject it automatically keep working.
     #[test]
     fn test_meta_query_allows_typename() {
+        init_test_schema_if_needed();
         let payload =
             create_test_payload("query { _meta { __typename block { number __typename } } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
@@ -3809,6 +3719,8 @@ mod tests {
                 block_number: true,
                 typename: true,
                 block_typename: true,
+                key: "_meta".to_string(),
+                ..MetaSelection::default()
             })
         );
     }
@@ -3827,6 +3739,7 @@ mod tests {
 
     #[test]
     fn test_meta_query_block_number_token_is_not_matched_by_prefix() {
+        init_test_schema_if_needed();
         // `blockNumber` must not be mistaken for `block { number }`; nothing here
         // is servable, so this still fails loudly.
         let payload = create_test_payload("query { _meta { block { blockNumber } } }");
@@ -3842,6 +3755,7 @@ mod tests {
 
     #[test]
     fn test_meta_query_with_deployment() {
+        init_test_schema_if_needed();
         // deployment field should trigger ComplexMetaQuery error
         let payload = create_test_payload("query { _meta { deployment } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
@@ -3854,6 +3768,7 @@ mod tests {
 
     #[test]
     fn test_meta_query_with_has_indexing_errors() {
+        init_test_schema_if_needed();
         // hasIndexingErrors field should trigger ComplexMetaQuery error
         let payload = create_test_payload("query { _meta { hasIndexingErrors } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
@@ -3866,14 +3781,20 @@ mod tests {
 
     #[test]
     fn test_meta_query_with_timestamp_multiline() {
-        // timestamp in multiline format should trigger ComplexMetaQuery error
+        // Hasura's `_meta` carries the processed block's time, so timestamp is
+        // served; `chain_metadata` does not, so without it timestamp is refused.
+        init_test_schema_if_needed();
         let payload =
             create_test_payload("query {\n  _meta {\n    block {\n      timestamp\n    }\n  }\n}");
-        let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
-        assert!(result.is_err());
-        match result {
-            Err(ConversionError::ComplexMetaQuery(_)) => {}
-            _ => panic!("Expected ComplexMetaQuery error"),
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        assert_eq!(
+            result.query["query"].as_str().unwrap(),
+            "query {\n  _meta(where: {chainId: {_eq: 1}}) {\n    progressBlock progressBlockTime\n  }\n}"
+        );
+        assert!(result.meta_selection.unwrap().block_timestamp);
+        match convert_meta_selection("block { timestamp }", false, "_meta".to_string()) {
+            Err(ConversionError::ComplexMetaQuery(fields)) => assert_eq!(fields, "block.timestamp"),
+            other => panic!("expected ComplexMetaQuery, got {:?}", other),
         }
     }
 
@@ -7506,5 +7427,100 @@ mod tests {
             progress_root("_meta", Some("1"), false, false),
             "  _meta: chain_metadata(where: {chain_id: {_eq: 1}}) {\n    latest_processed_block\n  }"
         );
+    }
+
+    // ── _meta ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn meta_block_number_and_timestamp_read_hasura_meta() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { _meta { block { number timestamp } } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(
+            result.query["query"].as_str().unwrap(),
+            "query {\n  _meta {\n    progressBlock progressBlockTime\n  }\n}"
+        );
+        assert_eq!(
+            result.meta_selection,
+            Some(MetaSelection {
+                block_number: true,
+                block_timestamp: true,
+                key: "_meta".to_string(),
+                ..MetaSelection::default()
+            })
+        );
+    }
+
+    #[test]
+    fn meta_without_hasura_meta_falls_back_to_chain_metadata() {
+        assert_eq!(
+            progress_root("_meta", None, false, false),
+            "  _meta: chain_metadata {\n    latest_processed_block\n  }"
+        );
+        let selection = convert_meta_selection("block { number }", false, "_meta".to_string());
+        assert!(selection.unwrap().block_number);
+    }
+
+    #[test]
+    fn meta_still_refuses_fields_without_a_hyperindex_source() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { _meta { deployment block { number hash timestamp } hasIndexingErrors } }",
+        );
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::ComplexMetaQuery(fields)) => {
+                assert_eq!(fields, "deployment, block.hash, hasIndexingErrors")
+            }
+            other => panic!("expected ComplexMetaQuery, got {:?}", other.map(|r| r.query)),
+        }
+    }
+
+    #[test]
+    fn meta_alongside_entity_roots() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { _meta { block { number } } tokens(first: 1) { id symbol } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("  Token(limit: 1) {"), "{query}");
+        assert!(query.contains("  _meta {\n    progressBlock\n  }"), "{query}");
+        assert_eq!(result.meta_selection.unwrap().key, "_meta");
+        assert_eq!(result.field_name_map.get("Token"), Some(&"tokens".to_string()));
+    }
+
+    #[test]
+    fn aliased_meta_is_answered_under_its_alias() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { status: _meta { block { number } } }");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("5031")).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("status: _meta(where: {chainId: {_eq: 5031}}) {"),
+            "{query}"
+        );
+        assert_eq!(result.meta_selection.unwrap().key, "status");
+        assert_eq!(result.field_name_map.get("status"), Some(&"status".to_string()));
+    }
+
+    #[test]
+    fn meta_with_a_number_gte_argument() {
+        init_test_schema_if_needed();
+        let payload =
+            create_test_payload("query { _meta(block: {number_gte: 42}) { block { number } } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("  _meta {\n    progressBlock\n  }"), "{query}");
+        assert!(query.contains("__converter_meta: _meta {"), "{query}");
+        assert_eq!(result.min_block, Some(42));
+    }
+
+    #[test]
+    fn a_root_merely_containing_meta_is_an_entity() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { token_metadatas(first: 1) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert!(result.meta_selection.is_none());
+        assert!(!result.query["query"].as_str().unwrap().contains("progressBlock"));
     }
 }
