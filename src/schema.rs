@@ -288,36 +288,138 @@ pub fn nested_type_of(parent: &str, field: &str) -> Option<String> {
 /// on its lexical fallback.
 pub fn resolve_entity_for_collection_field(field_name: &str) -> Option<String> {
     let cache = SCHEMA_CACHE.clone();
-    let found = cache
-        .iter()
-        .find(|entry| graph_node_plural(entry.key()) == field_name)
-        .map(|entry| entry.key().clone());
-    found
+    let needle = field_name.to_lowercase();
+
+    // Ranked matches, most specific first: exact plural, exact singular, then the
+    // same two case-insensitively. Collected in one pass rather than one pass per
+    // rank, because this runs for every root field of every request and each pass
+    // re-derives and re-allocates every entity's spellings.
+    //
+    // Each rank is still resolved totally rather than first-hit: a rank that
+    // matches two entities is ambiguous, and picking one would depend on DashMap
+    // iteration order, so it resolves to nothing and falls through to the next
+    // rank - and ultimately to the caller's lexical fallback.
+    const RANKS: usize = 4;
+    let mut hits: [Option<String>; RANKS] = Default::default();
+    let mut ambiguous = [false; RANKS];
+
+    for entry in cache.iter() {
+        let entity = entry.key();
+        let mut matched = [false; RANKS];
+        for singular in graph_node_singulars(entity) {
+            let plural = pluralize(&singular);
+            // `||` short-circuits, so the lowercasing is skipped once a rank has
+            // already matched on another spelling.
+            matched[0] = matched[0] || plural == field_name;
+            matched[1] = matched[1] || singular == field_name;
+            matched[2] = matched[2] || plural.to_lowercase() == needle;
+            matched[3] = matched[3] || singular.to_lowercase() == needle;
+        }
+        for rank in 0..RANKS {
+            if !matched[rank] {
+                continue;
+            }
+            if hits[rank].is_some() {
+                ambiguous[rank] = true;
+            } else {
+                hits[rank] = Some(entity.clone());
+            }
+        }
+    }
+
+    for rank in 0..RANKS {
+        if ambiguous[rank] {
+            tracing::debug!(
+                field = field_name,
+                "Root field is ambiguous across entities; leaving it to the lexical fallback"
+            );
+            continue;
+        }
+        if let Some(hit) = hits[rank].take() {
+            return Some(hit);
+        }
+    }
+    None
 }
 
-/// graph-node's plural collection field for an entity: lowercase the first
-/// letter, then apply English pluralization.
-fn graph_node_plural(entity: &str) -> String {
-    let mut chars = entity.chars();
-    let lower_first = match chars.next() {
-        None => return String::new(),
-        Some(f) => f.to_lowercase().collect::<String>() + chars.as_str(),
-    };
+/// Whether `field_name` is one of `entity`'s singular spellings, i.e. a root
+/// field that returns one object rather than a list. `None` when the schema does
+/// not know the entity, so the caller can keep its own lexical guess.
+///
+/// `conversion.rs` used to decide this with `!field.ends_with('s')`, which is
+/// wrong for every entity whose own name ends in `s` (`Address`, `Status`,
+/// `Series`): `address(id: …)` would be served as a list.
+pub fn is_singular_field_for(field_name: &str, entity: &str) -> Option<bool> {
+    let cache = SCHEMA_CACHE.clone();
+    if !cache.contains_key(entity) {
+        return None;
+    }
+    Some(
+        graph_node_singulars(entity)
+            .iter()
+            .any(|singular| singular == field_name || singular.to_lowercase() == field_name.to_lowercase()),
+    )
+}
 
-    let ends_with_any = |suffixes: &[&str]| suffixes.iter().any(|s| lower_first.ends_with(s));
-
-    if lower_first.ends_with('y')
-        && !lower_first.ends_with("ay")
-        && !lower_first.ends_with("ey")
-        && !lower_first.ends_with("iy")
-        && !lower_first.ends_with("oy")
-        && !lower_first.ends_with("uy")
-    {
-        format!("{}ies", &lower_first[..lower_first.len() - 1])
-    } else if ends_with_any(&["s", "x", "z", "ch", "sh"]) {
-        format!("{}es", lower_first)
+/// Every root-field spelling that can refer to `entity`, singular and plural.
+///
+/// graph-node lowercases the *leading run of capitals*, not just the first
+/// letter: `ATokenBalanceHistoryItem` is queried as `atokenBalanceHistoryItems`
+/// and `EModeCategory` as `emodeCategories`. Verified against graph-node, which
+/// rejects `aTokenBalanceHistoryItems` and `eModeCategories` outright. The
+/// lowercase-first-letter form is kept as an accepted alias so queries written
+/// against the Hyperindex schema keep working.
+fn graph_node_singulars(entity: &str) -> Vec<String> {
+    let acronym = lower_leading_acronym(entity);
+    let first = lower_first_char(entity);
+    if acronym == first {
+        vec![acronym]
     } else {
-        format!("{}s", lower_first)
+        vec![acronym, first]
+    }
+}
+
+/// `UserReserve` -> `userReserve`
+fn lower_first_char(entity: &str) -> String {
+    let mut chars = entity.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(f) => f.to_lowercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+/// `ATokenBalanceHistoryItem` -> `atokenBalanceHistoryItem`, `UserReserve` -> `userReserve`.
+fn lower_leading_acronym(entity: &str) -> String {
+    let run = entity
+        .chars()
+        .take_while(|c| c.is_uppercase())
+        .count()
+        .max(1);
+    let split = entity
+        .char_indices()
+        .nth(run)
+        .map(|(i, _)| i)
+        .unwrap_or(entity.len());
+    let (head, tail) = entity.split_at(split);
+    head.to_lowercase() + tail
+}
+
+/// English pluralization, applied to an already-lowercased-head field name.
+fn pluralize(name: &str) -> String {
+    let ends_with_any = |suffixes: &[&str]| suffixes.iter().any(|s| name.ends_with(s));
+
+    if name.ends_with('y')
+        && !name.ends_with("ay")
+        && !name.ends_with("ey")
+        && !name.ends_with("iy")
+        && !name.ends_with("oy")
+        && !name.ends_with("uy")
+    {
+        format!("{}ies", &name[..name.len() - 1])
+    } else if ends_with_any(&["s", "x", "z", "ch", "sh"]) {
+        format!("{}es", name)
+    } else {
+        format!("{}s", name)
     }
 }
 
@@ -787,6 +889,23 @@ pub fn init_test_schema() {
                 ],
             ),
         );
+    }
+
+    // Entities whose names open with a run of capitals. graph-node queries these
+    // as `atokenBalanceHistoryItems` / `emodeCategories`, not `aToken…` / `eMode…`.
+    {
+        let mut id_only = HashMap::new();
+        id_only.insert(
+            "id".to_string(),
+            FieldInfo {
+                is_nested_entity: false,
+                nested_type_name: None,
+                field_type: "String".to_string(),
+                is_list: false,
+            },
+        );
+        cache.insert("ATokenBalanceHistoryItem".to_string(), id_only.clone());
+        cache.insert("EModeCategory".to_string(), id_only);
     }
 
     // Update timestamp
