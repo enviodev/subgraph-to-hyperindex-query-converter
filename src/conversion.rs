@@ -17,6 +17,8 @@ pub enum ConversionError {
     ComplexMetaQuery(String),
     #[error("_meta cannot be combined with other root fields: {0}")]
     MetaWithOtherFields(String),
+    #[error("Nested field `{0}` has arguments that cannot be translated: {1}")]
+    UnsupportedNestedArgument(String, String),
 }
 
 /// Where one half of an `order_by` pair comes from: a GraphQL variable the client
@@ -315,7 +317,7 @@ fn extract_fragments_and_main_query(query: &str) -> Result<(String, String), Con
                             if brace_count == 0 {
                                 // Capture the fragment text [start_idx..=pos]
                                 let fragment_text: String = chars[start_idx..=pos].iter().collect();
-                                let fragment_text = sanitize_fragment_arguments(&fragment_text);
+                                let fragment_text = sanitize_fragment_arguments(&fragment_text)?;
                                 if !fragments.is_empty() {
                                     fragments.push('\n');
                                 }
@@ -1413,7 +1415,7 @@ fn extract_multiple_entities(
             .collect::<String>()
             .trim()
             .to_string();
-        let sanitized = sanitize_selection_set(&raw_selection);
+        let sanitized = sanitize_selection_set(&raw_selection)?;
         let selection_set = format!("{{\n    {}\n  }}", sanitized);
 
         println!("DEBUG: Found entity: {}", entity_name);
@@ -1431,7 +1433,7 @@ fn extract_multiple_entities(
     Ok(entities)
 }
 
-fn sanitize_selection_set(input: &str) -> String {
+fn sanitize_selection_set(input: &str) -> Result<String, ConversionError> {
     let mut output = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     let mut in_string = false;
@@ -1446,8 +1448,7 @@ fn sanitize_selection_set(input: &str) -> String {
         if !in_string && ch == '(' {
             // Capture balanced parentheses and their contents so we can
             // translate subgraph-style nested-field args (first/skip/orderBy/
-            // orderDirection) into Hasura form. Unknown args are dropped,
-            // matching prior behavior.
+            // orderDirection) into Hasura form.
             let mut content = String::new();
             let mut depth: i32 = 1;
             let mut in_args_string = false;
@@ -1469,7 +1470,17 @@ fn sanitize_selection_set(input: &str) -> String {
                 }
                 content.push(nc);
             }
-            let translated = translate_nested_field_args(&content);
+            // The field these arguments belong to, for the error message: it is
+            // the name just written to the output.
+            let field: String = {
+                let reversed: String = output
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                reversed.chars().rev().collect()
+            };
+            let translated = translate_nested_field_args(&field, &content)?;
             if !translated.is_empty() {
                 output.push('(');
                 output.push_str(&translated);
@@ -1481,21 +1492,50 @@ fn sanitize_selection_set(input: &str) -> String {
         output.push(ch);
     }
 
-    output
+    Ok(output)
 }
 
 /// Translate subgraph-style args on a nested selection field into Hasura form.
 ///
-/// Handles `first` → `limit`, `skip` → `offset`, and the
-/// `orderBy`/`orderDirection` pair → `order_by: {field: dir}`. Variables are
-/// preserved for `first`/`skip`; order_by is skipped when either side is a
-/// variable, mirroring the top-level converter (`convert_main_query`). Any
-/// other args (notably `where`) are dropped — they need parent-entity context
-/// to translate correctly and translating them belongs in a follow-up.
-fn translate_nested_field_args(args: &str) -> String {
+/// Handles `first` -> `limit`, `skip` -> `offset`, and the
+/// `orderBy`/`orderDirection` pair -> `order_by`, with the same `id` tie-break
+/// the root path adds, so a nested page is as stable as a root one. Variables
+/// are preserved for `first`/`skip`.
+///
+/// Anything else is rejected rather than dropped. Dropping a nested `where`
+/// returns the first N *unfiltered* rows under a 200, which the caller cannot
+/// tell apart from a filtered answer. Translating one needs the nested field's
+/// own entity type, which this lexical pass does not have.
+fn translate_nested_field_args(field: &str, args: &str) -> Result<String, ConversionError> {
     let mut params: HashMap<String, String> = HashMap::new();
-    if parse_graphql_params(args, &mut params).is_err() {
-        return String::new();
+    if let Err(e) = parse_graphql_params(args, &mut params) {
+        // This used to return an empty string, dropping every argument on the
+        // field without a word anywhere.
+        tracing::warn!(
+            field = field,
+            arguments = args,
+            "Could not parse the arguments of a nested field"
+        );
+        return Err(e);
+    }
+
+    // `parse_single_param` hoists the contents of `where: {...}` into the same
+    // map unprefixed, so a nested `where` arrives as its own filter keys rather
+    // than under a `where` key. Either way it cannot be translated here, and
+    // reporting the keys is better than dropping them silently.
+    const TRANSLATED: [&str; 4] = ["first", "skip", "orderBy", "orderDirection"];
+    let mut untranslatable: Vec<&str> = params
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !TRANSLATED.contains(key))
+        .collect();
+    // `HashMap` order is not stable and this text reaches the client.
+    untranslatable.sort_unstable();
+    if !untranslatable.is_empty() {
+        return Err(ConversionError::UnsupportedNestedArgument(
+            field.to_string(),
+            untranslatable.join(", "),
+        ));
     }
 
     let mut out: Vec<String> = Vec::new();
@@ -1505,27 +1545,48 @@ fn translate_nested_field_args(args: &str) -> String {
     if let Some(skip) = params.get("skip") {
         out.push(format!("offset: {}", skip));
     }
-    if let Some(order_field) = params.get("orderBy") {
-        let order_dir = params
-            .get("orderDirection")
-            .map(|s| s.as_str())
-            .unwrap_or("asc");
-        if !order_field.trim_start().starts_with('$')
-            && !order_dir.trim_start().starts_with('$')
-        {
-            out.push(format!("order_by: {{{}: {}}}", order_field, order_dir));
-        }
+
+    let order_field = params.get("orderBy").map(|s| s.trim());
+    let order_dir = params.get("orderDirection").map(|s| s.trim());
+
+    // A variable on either half of the sort needs its declared type rewritten -
+    // `$d` is a `String` to the client and an `order_by` enum to Hasura - and
+    // needs the declaration removed once it is dead. `plan_order_by` does that
+    // for root fields and has no equivalent here, so reject rather than drop:
+    // dropping leaves the variable declared and unused, and Hasura then fails
+    // the query with an error about the variable rather than about the sort.
+    if let Some(var) = [order_field, order_dir]
+        .into_iter()
+        .flatten()
+        .find(|value| value.starts_with('$'))
+    {
+        return Err(ConversionError::UnsupportedNestedArgument(
+            field.to_string(),
+            format!("a variable sort ({})", var),
+        ));
     }
 
-    out.join(", ")
+    // `orderDirection` without `orderBy` sorts by nothing, exactly as at the root.
+    if let Some(order_field) = order_field {
+        out.push(format!(
+            "order_by: {}",
+            literal_order_by_with_tiebreak(
+                order_field,
+                order_dir.unwrap_or("asc"),
+                id_tiebreak_enabled()
+            )
+        ));
+    }
+
+    Ok(out.join(", "))
 }
 
-fn sanitize_fragment_arguments(fragment_text: &str) -> String {
+fn sanitize_fragment_arguments(fragment_text: &str) -> Result<String, ConversionError> {
     // Only sanitize the selection body after the fragment header
     // Find the first '{' and its matching '}' and strip args in between
     let chars: Vec<char> = fragment_text.chars().collect();
     let Some(open_idx) = chars.iter().position(|c| *c == '{') else {
-        return fragment_text.to_string();
+        return Ok(fragment_text.to_string());
     };
     // Find matching closing brace
     let mut brace_count = 1i32;
@@ -1544,13 +1605,13 @@ fn sanitize_fragment_arguments(fragment_text: &str) -> String {
         pos += 1;
     }
     if pos >= chars.len() {
-        return fragment_text.to_string();
+        return Ok(fragment_text.to_string());
     }
     let header: String = chars[..open_idx + 1].iter().collect();
     let body: String = chars[open_idx + 1..pos].iter().collect();
     let tail: String = chars[pos..].iter().collect();
-    let sanitized_body = sanitize_selection_set(body.trim());
-    format!("{}{}{}", header, sanitized_body, tail)
+    let sanitized_body = sanitize_selection_set(body.trim())?;
+    Ok(format!("{}{}{}", header, sanitized_body, tail))
 }
 
 // Removed unused selection set helpers
@@ -5408,12 +5469,149 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_field_variable_first_and_skip_pass_through() {
+        // `$f`/`$s` keep their declared `Int` type, so they need no rewriting -
+        // unlike a variable sort, which does.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query Q($f: Int, $s: Int) { pools(first: 1) { id poolHourData(first: $f, skip: $s) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(limit: $f, offset: $s)"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_nested_field_args_are_translated_inside_a_fragment() {
+        // Fragment bodies go through the same sanitizer, by way of
+        // `sanitize_fragment_arguments`.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id ...PoolRows } } fragment PoolRows on Pool { poolHourData(first: 3, orderBy: periodStartUnix, orderDirection: desc) { periodStartUnix } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(limit: 3, order_by: [{periodStartUnix: desc}, {id: desc}])"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_aliased_nested_field_keeps_its_alias() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id recent: poolHourData(first: 2, orderBy: periodStartUnix, orderDirection: desc) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("recent: poolHourData(limit: 2, order_by: [{periodStartUnix: desc}, {id: desc}])"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_two_levels_of_nesting_are_translated() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id poolHourData(first: 2) { periodStartUnix swaps(first: 3, orderBy: timestamp) { id } } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("poolHourData(limit: 2)"), "{query}");
+        assert!(
+            query.contains("swaps(limit: 3, order_by: [{timestamp: asc}, {id: asc}])"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_nested_variable_sort_is_rejected() {
+        // Repurposing a client's `$orderBy` means retyping its declaration to
+        // `[Entity_order_by!]` and rebuilding its value, which is what
+        // `plan_order_by` does for a root field. There is no equivalent on this
+        // path, and dropping the sort leaves the variable declared and unused -
+        // Hasura then fails the query with an error about the variable rather
+        // than about the sort.
+        init_test_schema_if_needed();
+        for query in [
+            "query Q($o: String!) { pools(first: 1) { poolHourData(first: 3, orderBy: $o) { id } } }",
+            "query Q($d: OrderDirection!) { pools(first: 1) { poolHourData(first: 3, orderBy: periodStartUnix, orderDirection: $d) { id } } }",
+        ] {
+            let payload = create_test_payload(query);
+            match convert_subgraph_to_hyperindex(&payload, None) {
+                Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                    assert_eq!(field, "poolHourData");
+                    assert!(detail.contains("variable sort"), "{detail}");
+                }
+                other => panic!("expected UnsupportedNestedArgument for {query:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_nested_where_is_rejected_rather_than_dropped() {
+        // Dropping it returned the first N *unfiltered* rows under a 200, which
+        // the caller cannot tell apart from a filtered answer.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id poolHourData(first: 3, where: { volumeUSD_gt: \"5\" }) { periodStartUnix } } }",
+        );
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "poolHourData");
+                // `parse_single_param` hoists the contents of `where`, so the
+                // clause is reported by its filter keys.
+                assert_eq!(detail, "volumeUSD_gt");
+            }
+            other => panic!("expected UnsupportedNestedArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_nested_argument_is_rejected() {
+        // graph-node accepts exactly first/skip/orderBy/orderDirection/where on a
+        // derived field, so anything else is a filter or a mistake. Either way,
+        // dropping it answers a question that was not asked.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id poolHourData(block: { number: 100 }) { periodStartUnix } } }",
+        );
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "poolHourData");
+                assert_eq!(detail, "block.number");
+            }
+            other => panic!("expected UnsupportedNestedArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nested_order_direction_without_order_by_sorts_by_nothing() {
+        // Same as the root path: a direction with nothing to sort by is dropped.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id poolHourData(first: 2, orderDirection: desc) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("poolHourData(limit: 2)"), "{query}");
+        assert!(!query.contains("order_by"), "{query}");
+    }
+
+    #[test]
     fn test_nested_field_first_and_order_by_translated() {
         // Regression: nested-field args (first/orderBy/orderDirection) on
         // sub-selections like `poolHourData(...)` and `poolDayData(...)` were
         // silently stripped by sanitize_selection_set, so the user got
         // unbounded/unordered nested rows. They should now be translated to
-        // Hasura's limit/order_by form.
+        // Hasura's limit/order_by form - with the same `id` tie-break the root
+        // path adds, since a nested page whose sort key repeats is otherwise
+        // just as unstable as a root one.
         init_test_schema_if_needed();
         let payload = create_test_payload(
             "{ pools(first: 1, where: { id: \"0x2a2c512beaa8eb15495726c235472d82effb7a6b\" }) { id poolHourData(first: 3, orderBy: periodStartUnix, orderDirection: desc) { periodStartUnix volumeUSD } poolDayData(first: 3, orderBy: date, orderDirection: desc) { date volumeUSD } } }",
@@ -5421,12 +5619,12 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
         assert!(
-            query.contains("poolHourData(limit: 3, order_by: {periodStartUnix: desc})"),
+            query.contains("poolHourData(limit: 3, order_by: [{periodStartUnix: desc}, {id: desc}])"),
             "poolHourData nested args not translated:\n{}",
             query
         );
         assert!(
-            query.contains("poolDayData(limit: 3, order_by: {date: desc})"),
+            query.contains("poolDayData(limit: 3, order_by: [{date: desc}, {id: desc}])"),
             "poolDayData nested args not translated:\n{}",
             query
         );
@@ -5456,7 +5654,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
         assert!(
-            query.contains("poolHourData(order_by: {periodStartUnix: asc})"),
+            query.contains("poolHourData(order_by: [{periodStartUnix: asc}, {id: asc}])"),
             "nested orderBy without direction should default to asc:\n{}",
             query
         );
