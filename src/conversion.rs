@@ -17,6 +17,10 @@ pub enum ConversionError {
     ComplexMetaQuery(String),
     #[error("_meta cannot be combined with other root fields: {0}")]
     MetaWithOtherFields(String),
+    #[error("Must provide operation name if query contains multiple operations")]
+    MissingOperationName,
+    #[error("Unknown operation named \"{0}\"")]
+    UnknownOperation(String),
 }
 
 /// Where one half of an `order_by` pair comes from: a GraphQL variable the client
@@ -84,6 +88,14 @@ pub fn convert_subgraph_to_hyperindex(
 
     tracing::info!("Converting query: {}", query);
 
+    // A document may hold several operations; `operationName` says which to run.
+    // Hasura is only ever sent that one, with the fragments it uses.
+    let selected = select_operation(
+        query,
+        payload.get("operationName").and_then(|v| v.as_str()),
+    )?;
+    let query = selected.as_ref().map(|s| s.query.as_str()).unwrap_or(query);
+
     // Check if this is an introspection query **only by operation name**.
     // We ONLY bypass conversion when the operation name is `IntrospectionQuery`.
     let trimmed = query.trim_start();
@@ -140,6 +152,11 @@ pub fn convert_subgraph_to_hyperindex(
     // filter JSON working transparently after the query-level rewrite.
     if let Some(variables) = payload.get("variables") {
         let mut variables = variables.clone();
+        // Values for the operations that were not selected would be rejected as
+        // unexpected variables.
+        if let (Some(selected), Value::Object(map)) = (&selected, &mut variables) {
+            map.retain(|name, _| selected.variables.contains(name));
+        }
         if !filter_variable_entities.is_empty() {
             if let Value::Object(map) = &mut variables {
                 for (var_name, entity_name) in &filter_variable_entities {
@@ -212,6 +229,200 @@ pub fn convert_subgraph_to_hyperindex(
         dropped_variables,
         shape_plans,
     })
+}
+
+/// The operation `operationName` picked out of a multi-operation document.
+struct SelectedOperation {
+    /// The operation followed by the fragment definitions it reaches.
+    query: String,
+    /// Variables the operation declares.
+    variables: HashSet<String>,
+}
+
+/// One top-level definition of a GraphQL document, exactly as written.
+struct Definition {
+    text: String,
+    /// The fragment's name, for a fragment definition.
+    fragment: Option<String>,
+    /// The operation's name; `None` for fragments and anonymous operations.
+    operation_name: Option<String>,
+}
+
+/// Reduce a document holding several operations to the one `operation_name`
+/// selects, plus the fragments it uses, as the GraphQL spec's GetOperation does.
+///
+/// Returns `Ok(None)` when there is at most one operation, so there is nothing to
+/// choose, or when the document cannot be split; the caller then carries on with
+/// the document unchanged.
+fn select_operation(
+    query: &str,
+    operation_name: Option<&str>,
+) -> Result<Option<SelectedOperation>, ConversionError> {
+    let definitions = match split_definitions(query) {
+        Some(defs) => defs,
+        None => return Ok(None),
+    };
+    let operations: Vec<&Definition> =
+        definitions.iter().filter(|d| d.fragment.is_none()).collect();
+    if operations.len() < 2 {
+        return Ok(None);
+    }
+
+    let chosen = match operation_name {
+        None => return Err(ConversionError::MissingOperationName),
+        Some(name) => operations
+            .iter()
+            .find(|d| d.operation_name.as_deref() == Some(name))
+            .ok_or_else(|| ConversionError::UnknownOperation(name.to_string()))?,
+    };
+
+    // Fragments the operation reaches, directly or through other fragments. An
+    // unused fragment is a validation error, so the rest are left out.
+    let by_name: HashMap<&str, &Definition> = definitions
+        .iter()
+        .filter_map(|d| d.fragment.as_deref().map(|name| (name, d)))
+        .collect();
+    let mut reached: Vec<&str> = Vec::new();
+    let mut pending = fragment_spreads(&chosen.text);
+    while let Some(name) = pending.pop() {
+        if reached.iter().any(|r| *r == name) {
+            continue;
+        }
+        if let Some((key, def)) = by_name.get_key_value(name.as_str()) {
+            reached.push(key);
+            pending.extend(fragment_spreads(&def.text));
+        }
+    }
+
+    let mut text = chosen.text.clone();
+    for def in definitions.iter().filter(|d| {
+        d.fragment
+            .as_deref()
+            .map(|name| reached.contains(&name))
+            .unwrap_or(false)
+    }) {
+        text.push('\n');
+        text.push_str(&def.text);
+    }
+
+    let header_end = chosen.text.find('{').unwrap_or(chosen.text.len());
+    let variables = parse_variable_declarations(&chosen.text[..header_end])
+        .into_keys()
+        .collect();
+    Ok(Some(SelectedOperation {
+        query: text,
+        variables,
+    }))
+}
+
+/// Split a document into its top-level definitions.
+///
+/// A definition runs until the `}` that closes its selection set brings the
+/// nesting depth back to zero; brackets in the header (variable defaults) and
+/// string literals do not end it. Returns `None` for unbalanced input.
+fn split_definitions(doc: &str) -> Option<Vec<Definition>> {
+    let chars: Vec<char> = doc.chars().collect();
+    let mut definitions = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() || c == ',' {
+            i += 1;
+            continue;
+        }
+        if c == '#' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        let start = i;
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut end = None;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_str {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '"' {
+                    in_str = false;
+                }
+            } else {
+                match c {
+                    '"' => in_str = true,
+                    '#' => {
+                        while i < chars.len() && chars[i] != '\n' {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' => depth -= 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        let end = end?;
+        let text: String = chars[start..=end].iter().collect();
+
+        let words: Vec<String> = text
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .take(2)
+            .map(str::to_string)
+            .collect();
+        let (fragment, operation_name) = match words.first().map(String::as_str) {
+            _ if text.starts_with('{') => (None, None),
+            Some("fragment") => (Some(words.get(1)?.clone()), None),
+            Some("query") | Some("mutation") | Some("subscription") => {
+                // `query {` and `query($a: Int)` are anonymous.
+                let after_keyword = text[words[0].len()..].trim_start();
+                let named = after_keyword
+                    .chars()
+                    .next()
+                    .map(|c| c.is_alphabetic() || c == '_')
+                    .unwrap_or(false);
+                (None, if named { words.get(1).cloned() } else { None })
+            }
+            _ => return None,
+        };
+        definitions.push(Definition {
+            text,
+            fragment,
+            operation_name,
+        });
+    }
+    Some(definitions)
+}
+
+/// Names of the fragments spread (`...Name`) anywhere in `text`. Inline
+/// fragments (`... on Type`, `... @include`) are not spreads.
+fn fragment_spreads(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("...") {
+        rest = &rest[at + 3..];
+        let name: String = rest
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && name != "on" {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// Internal aggregate returned by `convert_query_structure` / `convert_main_query`.
@@ -6205,5 +6416,95 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         assert!(result.shape_plans.contains_key("recent"), "{:?}", result.shape_plans.keys());
         assert!(!result.shape_plans.contains_key("UserTransaction"));
+    }
+
+    // ── operationName ────────────────────────────────────────────────────────
+
+    #[test]
+    fn operation_name_selects_one_of_several_operations() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query A { tokens(first: 1) { id } }\nquery B { streams(first: 2) { id } }",
+            "operationName": "B"
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.starts_with("query B {"), "{query}");
+        assert!(query.contains("Stream(limit: 2)"), "{query}");
+        assert!(!query.contains("Token"), "{query}");
+    }
+
+    #[test]
+    fn several_operations_without_an_operation_name_are_rejected() {
+        let payload = create_test_payload("query A { tokens { id } } query B { streams { id } }");
+        let err = convert_subgraph_to_hyperindex(&payload, None).unwrap_err();
+        assert!(matches!(err, ConversionError::MissingOperationName), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_operation_name_is_rejected() {
+        let payload = json!({
+            "query": "query A { tokens { id } } query B { streams { id } }",
+            "operationName": "C"
+        });
+        let err = convert_subgraph_to_hyperindex(&payload, None).unwrap_err();
+        assert!(matches!(err, ConversionError::UnknownOperation(ref n) if n == "C"), "{err}");
+    }
+
+    #[test]
+    fn only_fragments_the_selected_operation_reaches_are_kept() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query A { tokens(first: 1) { ...TokenFields } }\nquery B { streams(first: 1) { ...StreamFields } }\nfragment TokenFields on Token { id symbol }\nfragment StreamFields on Stream { id ...Nested }\nfragment Nested on Stream { name }",
+            "operationName": "B"
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("fragment StreamFields on Stream"), "{query}");
+        assert!(query.contains("fragment Nested on Stream"), "{query}");
+        assert!(!query.contains("TokenFields"), "{query}");
+    }
+
+    #[test]
+    fn selected_operation_keeps_only_its_own_variables() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query A($n: Int!) { tokens(first: $n) { id } }\nquery B($m: Int!) { streams(first: $m) { id } }",
+            "operationName": "B",
+            "variables": {"n": 1, "m": 2}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("Stream(limit: $m)"), "{query}");
+        assert_eq!(result.query["variables"], json!({"m": 2}));
+    }
+
+    #[test]
+    fn a_single_operation_ignores_operation_name() {
+        init_test_schema_if_needed();
+        let plain = convert_subgraph_to_hyperindex(
+            &create_test_payload("query A { streams(first: 1) { id } }"),
+            None,
+        )
+        .unwrap();
+        let named = convert_subgraph_to_hyperindex(
+            &json!({"query": "query A { streams(first: 1) { id } }", "operationName": "Other"}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(plain.query, named.query);
+    }
+
+    #[test]
+    fn split_definitions_respects_strings_and_header_defaults() {
+        let defs = split_definitions(
+            "query A($w: X = {a: \"}\"}) { a } # trailing } comment\nfragment F on T { b }\n{ c }",
+        )
+        .unwrap();
+        assert_eq!(defs.len(), 3);
+        assert_eq!(defs[0].operation_name.as_deref(), Some("A"));
+        assert_eq!(defs[1].fragment.as_deref(), Some("F"));
+        assert!(defs[2].operation_name.is_none() && defs[2].fragment.is_none());
+        assert_eq!(fragment_spreads("{ ...A ... on T { x } ... @include(if: $y) { z } ...B }"), vec!["A", "B"]);
     }
 }
