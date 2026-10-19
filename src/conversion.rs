@@ -13,6 +13,8 @@ pub enum ConversionError {
     MissingField(String),
     #[error("Unsupported filter: {0}")]
     UnsupportedFilter(String),
+    #[error("Nested field `{0}` has arguments that cannot be translated: {1}")]
+    UnsupportedNestedArgument(String, String),
     #[error("_meta fields with no Hyperindex equivalent: {0}. Only _meta {{ block {{ number }} }} can be served, and a partial answer would look like a complete one to the caller")]
     ComplexMetaQuery(String),
     #[error("_meta cannot be combined with other root fields: {0}")]
@@ -320,7 +322,7 @@ fn extract_fragments_and_main_query(query: &str) -> Result<(String, String), Con
                             if brace_count == 0 {
                                 // Capture the fragment text [start_idx..=pos]
                                 let fragment_text: String = chars[start_idx..=pos].iter().collect();
-                                let fragment_text = sanitize_fragment_arguments(&fragment_text);
+                                let fragment_text = sanitize_fragment_arguments(&fragment_text)?;
                                 if !fragments.is_empty() {
                                     fragments.push('\n');
                                 }
@@ -1450,13 +1452,43 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
             let params_start = current_pos + 1;
             let mut paren_count = 1; // We're already inside the first parenthesis
 
+            // Walk to the matching `)`, ignoring parentheses inside string
+            // literals and `#` comments. A `)` in either closed the argument
+            // list early, and the rest of the query then parsed as stray text:
+            // `streams(first: 1 # note )` collapsed to an empty operation,
+            // which is a 200 with no rows rather than an error.
+            let mut in_string = false;
+            let mut escape = false;
+            let mut in_comment = false;
             while current_pos < query_chars.len() {
                 current_pos += 1;
                 if current_pos >= query_chars.len() {
                     break;
                 }
+                let ch = query_chars[current_pos];
 
-                match query_chars[current_pos] {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                if in_string {
+                    match ch {
+                        '\\' => escape = true,
+                        '"' => in_string = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                if in_comment {
+                    if ch == '\n' || ch == '\r' {
+                        in_comment = false;
+                    }
+                    continue;
+                }
+
+                match ch {
+                    '"' => in_string = true,
+                    '#' => in_comment = true,
                     '(' => paren_count += 1,
                     ')' => {
                         paren_count -= 1;
@@ -1472,9 +1504,9 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
                 break;
             }
 
-            let mut params_str = query_chars[params_start..current_pos]
-                .iter()
-                .collect::<String>();
+            let mut params_str = strip_line_comments(
+                &query_chars[params_start..current_pos].iter().collect::<String>(),
+            );
 
             // Classify from the raw argument text, before `parse_graphql_params`
             // flattens `block: {number: N}` into a `block.number` key that is
@@ -1576,7 +1608,7 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
             .collect::<String>()
             .trim()
             .to_string();
-        let sanitized = sanitize_selection_set(&raw_selection);
+        let sanitized = sanitize_selection_set(&raw_selection)?;
         let selection_set = format!("{{\n    {}\n  }}", sanitized);
 
         println!("DEBUG: Found entity: {}", entity_name);
@@ -1600,7 +1632,7 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
     Ok(entities)
 }
 
-fn sanitize_selection_set(input: &str) -> String {
+fn sanitize_selection_set(input: &str) -> Result<String, ConversionError> {
     let mut output = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     let mut in_string = false;
@@ -1612,13 +1644,48 @@ fn sanitize_selection_set(input: &str) -> String {
             continue;
         }
 
+        // A `#` comment runs to the end of the line and may contain anything -
+        // `(`, `{`, a stray quote. Copy it through without interpreting it,
+        // because an open paren inside a note would otherwise start an argument
+        // scan that swallows the rest of the selection set.
+        if !in_string && ch == '#' {
+            output.push(ch);
+            while let Some(&nc) = chars.peek() {
+                if nc == '\n' || nc == '\r' {
+                    break;
+                }
+                output.push(nc);
+                chars.next();
+            }
+            continue;
+        }
+
         if !in_string && ch == '(' {
-            // Remove balanced parentheses and their contents
+            // Capture balanced parentheses and their contents so we can
+            // translate subgraph-style nested-field args (first/skip/orderBy/
+            // orderDirection) into Hasura form.
+            let mut content = String::new();
             let mut depth: i32 = 1;
             let mut in_args_string = false;
             while let Some(nc) = chars.next() {
+                // Inside an argument list a comment is dropped rather than
+                // copied through: the arguments are re-emitted on a single line,
+                // so a retained `#` would comment out everything after it -
+                // including the remaining arguments and the closing paren. The
+                // line break is kept, since commas are optional and it may be
+                // the only thing separating two arguments.
+                if !in_args_string && nc == '#' {
+                    for cc in chars.by_ref() {
+                        if cc == '\n' || cc == '\r' {
+                            content.push(cc);
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 if nc == '"' {
                     in_args_string = !in_args_string;
+                    content.push(nc);
                     continue;
                 }
                 if !in_args_string {
@@ -1631,23 +1698,143 @@ fn sanitize_selection_set(input: &str) -> String {
                         }
                     }
                 }
+                content.push(nc);
             }
-            // Do not push the parentheses or their content
+            // The field these arguments belong to, for the error message: it is
+            // the name just written to the output.
+            let field: String = {
+                let reversed: String = output
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                reversed.chars().rev().collect()
+            };
+            let translated = translate_nested_field_args(&field, &content)?;
+            if !translated.is_empty() {
+                output.push('(');
+                output.push_str(&translated);
+                output.push(')');
+            }
             continue;
         }
 
         output.push(ch);
     }
 
-    output
+    Ok(output)
 }
 
-fn sanitize_fragment_arguments(fragment_text: &str) -> String {
+/// Translate subgraph-style args on a nested selection field into Hasura form.
+///
+/// Handles `first` -> `limit`, `skip` -> `offset`, and the
+/// `orderBy`/`orderDirection` pair -> `order_by`, with the same `id` tie-break
+/// the root path adds, so a nested page is as stable as a root one. Variables
+/// are preserved for `first`/`skip`.
+///
+/// Anything else is rejected rather than dropped. Dropping a nested `where`
+/// returns the first N *unfiltered* rows under a 200, which the caller cannot
+/// tell apart from a filtered answer. Translating one needs the nested field's
+/// own entity type, which this lexical pass does not have.
+///
+/// The arguments are read with `top_level_arguments` rather than
+/// `parse_graphql_params`, for two reasons. `parse_single_param` hoists the
+/// contents of `where: {...}` into the map unprefixed, so a filter field named
+/// `first` would arrive as pagination and take the real `first` with it, while
+/// the filter itself vanished. And `parse_graphql_params` only splits on commas,
+/// which are optional in GraphQL, so `first: 3 skip: 1` became a `first` of
+/// `"3 skip: 1"` and was emitted as malformed GraphQL.
+fn translate_nested_field_args(field: &str, args: &str) -> Result<String, ConversionError> {
+    let parsed = top_level_arguments(args);
+
+    if parsed.is_empty() {
+        if args.trim().is_empty() {
+            return Ok(String::new());
+        }
+        // Something is there but it is not an argument list. Dropping it would
+        // answer a different question than the one that was asked.
+        tracing::warn!(
+            field = field,
+            arguments = args,
+            "Could not parse the arguments of a nested field"
+        );
+        return Err(ConversionError::UnsupportedNestedArgument(
+            field.to_string(),
+            "unparseable arguments".to_string(),
+        ));
+    }
+
+    const TRANSLATED: [&str; 4] = ["first", "skip", "orderBy", "orderDirection"];
+    let mut untranslatable: Vec<&str> = parsed
+        .iter()
+        .map(|arg| arg.name)
+        .filter(|name| !TRANSLATED.contains(name))
+        .collect();
+    untranslatable.sort_unstable();
+    untranslatable.dedup();
+    if !untranslatable.is_empty() {
+        return Err(ConversionError::UnsupportedNestedArgument(
+            field.to_string(),
+            untranslatable.join(", "),
+        ));
+    }
+
+    let value_of = |name: &str| {
+        parsed
+            .iter()
+            .find(|arg| arg.name == name)
+            .map(|arg| arg.value.trim())
+    };
+
+    let mut out: Vec<String> = Vec::new();
+    if let Some(first) = value_of("first") {
+        out.push(format!("limit: {}", first));
+    }
+    if let Some(skip) = value_of("skip") {
+        out.push(format!("offset: {}", skip));
+    }
+
+    let order_field = value_of("orderBy");
+    let order_dir = value_of("orderDirection");
+
+    // A variable on either half of the sort needs its declared type rewritten -
+    // `$d` is a `String` to the client and an `order_by` enum to Hasura - and
+    // needs the declaration removed once it is dead. `plan_order_by` does that
+    // for root fields and has no equivalent here, so reject rather than drop:
+    // dropping leaves the variable declared and unused, and Hasura then fails
+    // the query with an error about the variable rather than about the sort.
+    if let Some(var) = [order_field, order_dir]
+        .into_iter()
+        .flatten()
+        .find(|value| value.starts_with('$'))
+    {
+        return Err(ConversionError::UnsupportedNestedArgument(
+            field.to_string(),
+            format!("a variable sort ({})", var),
+        ));
+    }
+
+    // `orderDirection` without `orderBy` sorts by nothing, exactly as at the root.
+    if let Some(order_field) = order_field {
+        out.push(format!(
+            "order_by: {}",
+            literal_order_by_with_tiebreak(
+                order_field,
+                order_dir.unwrap_or("asc"),
+                id_tiebreak_enabled()
+            )
+        ));
+    }
+
+    Ok(out.join(", "))
+}
+
+fn sanitize_fragment_arguments(fragment_text: &str) -> Result<String, ConversionError> {
     // Only sanitize the selection body after the fragment header
     // Find the first '{' and its matching '}' and strip args in between
     let chars: Vec<char> = fragment_text.chars().collect();
     let Some(open_idx) = chars.iter().position(|c| *c == '{') else {
-        return fragment_text.to_string();
+        return Ok(fragment_text.to_string());
     };
     // Find matching closing brace
     let mut brace_count = 1i32;
@@ -1666,13 +1853,13 @@ fn sanitize_fragment_arguments(fragment_text: &str) -> String {
         pos += 1;
     }
     if pos >= chars.len() {
-        return fragment_text.to_string();
+        return Ok(fragment_text.to_string());
     }
     let header: String = chars[..open_idx + 1].iter().collect();
     let body: String = chars[open_idx + 1..pos].iter().collect();
     let tail: String = chars[pos..].iter().collect();
-    let sanitized_body = sanitize_selection_set(body.trim());
-    format!("{}{}{}", header, sanitized_body, tail)
+    let sanitized_body = sanitize_selection_set(body.trim())?;
+    Ok(format!("{}{}{}", header, sanitized_body, tail))
 }
 
 // Removed unused selection set helpers
@@ -2884,6 +3071,57 @@ fn parse_single_param(
 
 // Removed unused brace matching helper
 
+/// Strip `#` comments out of an argument list, keeping the line breaks.
+///
+/// GraphQL allows a comment anywhere whitespace is allowed, including between
+/// arguments, and it runs to the end of the line. The converter re-emits
+/// arguments on a single line, so a comment left in place comments out
+/// everything after it - the remaining arguments and the closing paren
+/// included. It also makes `block:` appear in a note look like a real
+/// time-travel argument. A `#` inside a string literal is not a comment.
+fn strip_line_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    let mut in_string = false;
+    let mut escape = false;
+
+    while let Some(ch) = chars.next() {
+        if escape {
+            out.push(ch);
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            out.push(ch);
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
+            '#' => {
+                // Keep the line break. Commas are optional in GraphQL, so it can
+                // be the only thing separating this argument from the next.
+                for cc in chars.by_ref() {
+                    if cc == '\n' || cc == '\r' {
+                        out.push(cc);
+                        break;
+                    }
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    out
+}
+
 /// One top-level `name: value` pair from an argument list, as raw text.
 struct TopLevelArg<'a> {
     /// Byte range of the whole pair, for excising it from the argument text.
@@ -3919,6 +4157,73 @@ mod tests {
             Err(ConversionError::BlockArgument(field)) => assert_eq!(field, "streams"),
             other => panic!("expected BlockArgument, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn comments_in_a_root_argument_list_are_stripped() {
+        init_test_schema_if_needed();
+        // A comment runs to the end of the line, and the arguments are re-emitted
+        // on one line, so a comment left in place commented out the rest of them
+        // and the closing paren with it. A `)` inside one was worse: it closed the
+        // argument list early and the whole operation came out empty - a 200 with
+        // no rows rather than an error.
+        for query in [
+            "{\n  streams(\n    first: 1   # a plain note\n  ) { id }\n}",
+            "{\n  streams(first: 1 # trailing ) note\n  ) { id }\n}",
+            "{\n  streams(\n    first: 1   # note with ( and \" inside\n    skip: 2\n  ) { id }\n}",
+        ] {
+            let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None)
+                .unwrap_or_else(|e| panic!("expected {query:?} to convert, got {e:?}"));
+            let converted = result.query["query"].as_str().unwrap();
+            assert!(converted.contains("Stream(limit: 1"), "{converted}");
+            assert!(converted.contains("id"), "selection set lost: {converted}");
+            assert!(!converted.contains('#'), "comment survived: {converted}");
+        }
+    }
+
+    #[test]
+    fn a_block_argument_mentioned_in_a_comment_is_not_time_travel() {
+        init_test_schema_if_needed();
+        // The guard reads the raw argument text, so without comment stripping a
+        // note mentioning `block:` got a valid query rejected.
+        let query = "{\n  streams(\n    first: 1   # block: 5 is the cutoff\n  ) { id }\n}";
+        let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("Stream(limit: 1)"), "{converted}");
+    }
+
+    #[test]
+    fn a_paren_or_hash_inside_a_string_argument_is_not_syntax() {
+        init_test_schema_if_needed();
+        // Neither ends the argument list: one used to close it early, the other
+        // would start a comment that swallowed the rest.
+        let result = convert_subgraph_to_hyperindex(
+            &create_test_payload("{ streams(where: { name: \"a)b#c\" }) { id } }"),
+            None,
+        )
+        .unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(
+            converted.contains("where: {name: {_eq: \"a)b#c\"}}"),
+            "{converted}"
+        );
+    }
+
+    #[test]
+    fn strip_line_comments_keeps_strings_and_separators() {
+        assert_eq!(
+            strip_line_comments("first: 1 # note\n  skip: 2"),
+            "first: 1 \n  skip: 2"
+        );
+        assert_eq!(strip_line_comments("name: \"a#b\""), "name: \"a#b\"");
+        // An escaped quote does not end the string, so the `#` after it is still
+        // inside one.
+        assert_eq!(
+            strip_line_comments("name: \"a\\\"#b\""),
+            "name: \"a\\\"#b\""
+        );
+        // A comment with no trailing newline runs to the end.
+        assert_eq!(strip_line_comments("first: 1 # the end"), "first: 1 ");
     }
 
     #[test]
@@ -6112,6 +6417,314 @@ mod tests {
         assert!(
             query.contains("$op: orderaction!"),
             "Enum override regression, got: {}",
+            query
+        );
+    }
+
+    #[test]
+    fn test_a_where_field_named_like_pagination_does_not_become_pagination() {
+        // `parse_single_param` hoists the contents of `where: {...}` into the
+        // argument map unprefixed, and `first` is a legal input-field name. The
+        // filter then arrived as pagination: `where: {first: 2}` silently became
+        // `limit: 2`, taking the real `first: 3` with it and dropping the filter.
+        // Reading the raw argument text keeps the two apart.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "{ pools(first: 1) { id poolHourData(first: 3, where: { first: 2 }) { id } } }",
+        );
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "poolHourData");
+                assert_eq!(detail, "where");
+            }
+            other => panic!("expected UnsupportedNestedArgument naming where, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nested_arguments_without_commas_are_split() {
+        // Commas are optional in GraphQL. `parse_graphql_params` only splits on
+        // them, so `first: 3 skip: 1` arrived as a single `first` of "3 skip: 1"
+        // and was emitted verbatim as `limit: 3 skip: 1` - malformed GraphQL,
+        // forwarded upstream.
+        init_test_schema_if_needed();
+        for (query, expected) in [
+            (
+                "{ pools(first: 1) { id poolHourData(first: 3 skip: 1) { id } } }",
+                "poolHourData(limit: 3, offset: 1)",
+            ),
+            (
+                "{ pools(first: 1) { id poolHourData(first: 3 orderBy: periodStartUnix) { id } } }",
+                "poolHourData(limit: 3, order_by: [{periodStartUnix: asc}, {id: asc}])",
+            ),
+            (
+                "{ pools(first: 1) { id poolHourData(\n  first: 3\n  skip: 1\n) { id } } }",
+                "poolHourData(limit: 3, offset: 1)",
+            ),
+        ] {
+            let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None)
+                .unwrap_or_else(|e| panic!("expected {query:?} to convert, got {e:?}"));
+            let converted = result.query["query"].as_str().unwrap();
+            assert!(converted.contains(expected), "{converted}");
+        }
+    }
+
+    #[test]
+    fn test_unparseable_nested_arguments_are_rejected() {
+        // An argument list that yields nothing is not an empty one. Dropping it
+        // answers a different question than the one that was asked.
+        init_test_schema_if_needed();
+        let payload =
+            create_test_payload("{ pools(first: 1) { id poolHourData(garbage) { id } } }");
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "poolHourData");
+                assert_eq!(detail, "unparseable arguments");
+            }
+            other => panic!("expected UnsupportedNestedArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_comment_inside_nested_arguments_is_dropped() {
+        // A `#` comment runs to end of line and can hold a `)`, which closed the
+        // argument list early and forwarded malformed GraphQL. Keeping the
+        // comment is no better: the arguments are re-emitted on one line, so it
+        // would comment out the rest of them and the closing paren with it.
+        init_test_schema_if_needed();
+        for query in [
+            "{\n  pools(first: 1) {\n    poolHourData(\n      first: 3   # only three (for now)\n      skip: 1\n    ) { id }\n  }\n}",
+            "{\n  pools(first: 1) {\n    poolHourData(\n      first: 3   # keep ) three\n      skip: 1\n    ) { id }\n  }\n}",
+            "{\n  pools(first: 1) {\n    poolHourData(first: 3, # a note\n      skip: 1) { id }\n  }\n}",
+        ] {
+            let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None)
+                .unwrap_or_else(|e| panic!("expected {query:?} to convert, got {e:?}"));
+            let converted = result.query["query"].as_str().unwrap();
+            assert!(
+                converted.contains("poolHourData(limit: 3, offset: 1)"),
+                "{converted}"
+            );
+            assert!(!converted.contains('#'), "comment survived: {converted}");
+        }
+    }
+
+    #[test]
+    fn test_comment_in_a_selection_set_is_left_alone() {
+        // An open paren in a note used to start an argument scan that ate the
+        // rest of the selection set - silently before nested args were
+        // translated, and as a bogus `UnsupportedNestedArgument` after.
+        init_test_schema_if_needed();
+        let query = "{\n  pools(first: 1) {\n    id   # a note with ( an open paren\n    poolHourData(first: 3) { id }\n  }\n}";
+        let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("poolHourData(limit: 3)"), "{converted}");
+        assert!(
+            converted.contains("# a note with ( an open paren"),
+            "the comment itself should survive: {converted}"
+        );
+    }
+
+    #[test]
+    fn test_a_hash_inside_a_string_argument_is_not_a_comment() {
+        // `#` only opens a comment outside a string. If it were treated as one
+        // here the scan would end inside the quotes and the argument name would
+        // be lost, so the error naming `foo` is the proof that it did not.
+        let sanitized = sanitize_selection_set("b(first: 3, foo: \"#)(\") { id }");
+        match sanitized {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "b");
+                assert_eq!(detail, "foo");
+            }
+            other => panic!("expected UnsupportedNestedArgument naming foo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nested_field_variable_first_and_skip_pass_through() {
+        // `$f`/`$s` keep their declared `Int` type, so they need no rewriting -
+        // unlike a variable sort, which does.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query Q($f: Int, $s: Int) { pools(first: 1) { id poolHourData(first: $f, skip: $s) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(limit: $f, offset: $s)"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_nested_field_args_are_translated_inside_a_fragment() {
+        // Fragment bodies go through the same sanitizer, by way of
+        // `sanitize_fragment_arguments`.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id ...PoolRows } } fragment PoolRows on Pool { poolHourData(first: 3, orderBy: periodStartUnix, orderDirection: desc) { periodStartUnix } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(limit: 3, order_by: [{periodStartUnix: desc}, {id: desc}])"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_aliased_nested_field_keeps_its_alias() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id recent: poolHourData(first: 2, orderBy: periodStartUnix, orderDirection: desc) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("recent: poolHourData(limit: 2, order_by: [{periodStartUnix: desc}, {id: desc}])"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_two_levels_of_nesting_are_translated() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id poolHourData(first: 2) { periodStartUnix swaps(first: 3, orderBy: timestamp) { id } } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("poolHourData(limit: 2)"), "{query}");
+        assert!(
+            query.contains("swaps(limit: 3, order_by: [{timestamp: asc}, {id: asc}])"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_nested_variable_sort_is_rejected() {
+        // Repurposing a client's `$orderBy` means retyping its declaration to
+        // `[Entity_order_by!]` and rebuilding its value, which is what
+        // `plan_order_by` does for a root field. There is no equivalent on this
+        // path, and dropping the sort leaves the variable declared and unused -
+        // Hasura then fails the query with an error about the variable rather
+        // than about the sort.
+        init_test_schema_if_needed();
+        for query in [
+            "query Q($o: String!) { pools(first: 1) { poolHourData(first: 3, orderBy: $o) { id } } }",
+            "query Q($d: OrderDirection!) { pools(first: 1) { poolHourData(first: 3, orderBy: periodStartUnix, orderDirection: $d) { id } } }",
+        ] {
+            let payload = create_test_payload(query);
+            match convert_subgraph_to_hyperindex(&payload, None) {
+                Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                    assert_eq!(field, "poolHourData");
+                    assert!(detail.contains("variable sort"), "{detail}");
+                }
+                other => panic!("expected UnsupportedNestedArgument for {query:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_nested_where_is_rejected_rather_than_dropped() {
+        // Dropping it returned the first N *unfiltered* rows under a 200, which
+        // the caller cannot tell apart from a filtered answer.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id poolHourData(first: 3, where: { volumeUSD_gt: \"5\" }) { periodStartUnix } } }",
+        );
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "poolHourData");
+                assert_eq!(detail, "where");
+            }
+            other => panic!("expected UnsupportedNestedArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_nested_argument_is_rejected() {
+        // graph-node accepts exactly first/skip/orderBy/orderDirection/where on a
+        // derived field, so anything else is a filter or a mistake. Either way,
+        // dropping it answers a question that was not asked.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id poolHourData(block: { number: 100 }) { periodStartUnix } } }",
+        );
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "poolHourData");
+                assert_eq!(detail, "block");
+            }
+            other => panic!("expected UnsupportedNestedArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nested_order_direction_without_order_by_sorts_by_nothing() {
+        // Same as the root path: a direction with nothing to sort by is dropped.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id poolHourData(first: 2, orderDirection: desc) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("poolHourData(limit: 2)"), "{query}");
+        assert!(!query.contains("order_by"), "{query}");
+    }
+
+    #[test]
+    fn test_nested_field_first_and_order_by_translated() {
+        // Regression: nested-field args (first/orderBy/orderDirection) on
+        // sub-selections like `poolHourData(...)` and `poolDayData(...)` were
+        // silently stripped by sanitize_selection_set, so the user got
+        // unbounded/unordered nested rows. They should now be translated to
+        // Hasura's limit/order_by form - with the same `id` tie-break the root
+        // path adds, since a nested page whose sort key repeats is otherwise
+        // just as unstable as a root one.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "{ pools(first: 1, where: { id: \"0x2a2c512beaa8eb15495726c235472d82effb7a6b\" }) { id poolHourData(first: 3, orderBy: periodStartUnix, orderDirection: desc) { periodStartUnix volumeUSD } poolDayData(first: 3, orderBy: date, orderDirection: desc) { date volumeUSD } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(limit: 3, order_by: [{periodStartUnix: desc}, {id: desc}])"),
+            "poolHourData nested args not translated:\n{}",
+            query
+        );
+        assert!(
+            query.contains("poolDayData(limit: 3, order_by: [{date: desc}, {id: desc}])"),
+            "poolDayData nested args not translated:\n{}",
+            query
+        );
+    }
+
+    #[test]
+    fn test_nested_field_skip_translated() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "{ pools(first: 1) { id poolHourData(first: 5, skip: 10) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(limit: 5, offset: 10)"),
+            "nested skip not translated to offset:\n{}",
+            query
+        );
+    }
+
+    #[test]
+    fn test_nested_field_orderby_default_direction() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "{ pools(first: 1) { id poolHourData(orderBy: periodStartUnix) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(order_by: [{periodStartUnix: asc}, {id: asc}])"),
+            "nested orderBy without direction should default to asc:\n{}",
             query
         );
     }
