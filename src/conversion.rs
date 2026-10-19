@@ -850,6 +850,7 @@ fn convert_main_query(
             .as_deref()
             .map(parse_variable_declarations)
             .unwrap_or_default(),
+        defaults: graph_node_defaults(),
         ..ArgContext::default()
     };
 
@@ -1184,6 +1185,8 @@ struct ArgContext {
     dead_candidates: Vec<String>,
     order_var_owner: HashMap<String, String>,
     synth_counter: usize,
+    /// graph-node's page size and sort for collections that omit them.
+    defaults: GraphNodeDefaults,
 }
 
 /// The Hyperindex entity a root field reads, and whether it is a primary-key
@@ -1265,6 +1268,27 @@ fn convert_collection_args(
     // Merge variable type overrides
     ctx.variable_type_overrides.extend(entity_var_overrides);
 
+    // Map orderBy/orderDirection to Hasura order_by
+    let order_arg = plan_order_by(
+        params,
+        entity_cap,
+        &ctx.header_var_types,
+        &mut ctx.order_by_retypes,
+        &mut ctx.order_by_specs,
+        &mut ctx.dead_candidates,
+        &mut ctx.order_var_owner,
+        &mut ctx.synth_counter,
+    );
+    let defaults = ctx.defaults;
+    // `first: null` is graph-node's default page too.
+    let limit = limit.filter(|l| l.trim() != "null");
+    let limit = limit.or_else(|| defaults.first.map(|n| n.to_string()));
+    let order_arg = order_arg.or_else(|| {
+        defaults
+            .order_by_id
+            .then(|| format!("order_by: {}", literal_order_by("id", "asc")))
+    });
+
     let mut params_vec = Vec::new();
     if let Some(l) = limit.as_ref() {
         // Include limit whether it's a literal or a variable (e.g., $first)
@@ -1274,17 +1298,7 @@ fn convert_collection_args(
         // Include offset whether it's a literal or a variable (e.g., $skip)
         params_vec.push(format!("offset: {}", o));
     }
-    // Map orderBy/orderDirection to Hasura order_by
-    if let Some(order_arg) = plan_order_by(
-        params,
-        entity_cap,
-        &ctx.header_var_types,
-        &mut ctx.order_by_retypes,
-        &mut ctx.order_by_specs,
-        &mut ctx.dead_candidates,
-        &mut ctx.order_var_owner,
-        &mut ctx.synth_counter,
-    ) {
+    if let Some(order_arg) = order_arg {
         params_vec.push(order_arg);
     }
     if !where_clause.is_empty() {
@@ -1292,6 +1306,57 @@ fn convert_collection_args(
         params_vec.push(where_clause);
     }
     Ok(params_vec)
+}
+
+/// What graph-node does for a collection that omits `first` or `orderBy`: it
+/// returns 100 rows, sorted by `id` ascending (any lone `orderDirection` is
+/// ignored). Hasura would return every row, in no particular order, so a client
+/// paging with `skip` and no `orderBy` could repeat or miss rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GraphNodeDefaults {
+    /// Page size when `first` is absent; `None` leaves it unlimited.
+    first: Option<u64>,
+    /// Sort by `id` ascending when `orderBy` is absent.
+    order_by_id: bool,
+}
+
+impl Default for GraphNodeDefaults {
+    fn default() -> Self {
+        Self::GRAPH_NODE
+    }
+}
+
+impl GraphNodeDefaults {
+    const GRAPH_NODE: GraphNodeDefaults = GraphNodeDefaults {
+        first: Some(100),
+        order_by_id: true,
+    };
+
+    /// `CONVERTER_DEFAULT_FIRST` sets the page size (`off`/`0` for none) and
+    /// `CONVERTER_DEFAULT_ORDER_ID=off` drops the default sort, e.g. if sorting a
+    /// very large table by `id` proves slow.
+    fn from_env(var: impl Fn(&str) -> Option<String>) -> Self {
+        let off = |v: &str| matches!(v, "0" | "false" | "off" | "no");
+        let first = match var("CONVERTER_DEFAULT_FIRST").map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if off(&v) => None,
+            Some(v) => v.parse().ok().or(Self::GRAPH_NODE.first),
+            None => Self::GRAPH_NODE.first,
+        };
+        let order_by_id = !var("CONVERTER_DEFAULT_ORDER_ID")
+            .map(|v| off(&v.trim().to_ascii_lowercase()))
+            .unwrap_or(false);
+        GraphNodeDefaults { first, order_by_id }
+    }
+}
+
+/// The defaults in force. Tests always see graph-node's, so their expectations
+/// do not depend on the environment they run in.
+fn graph_node_defaults() -> GraphNodeDefaults {
+    if cfg!(test) {
+        GraphNodeDefaults::GRAPH_NODE
+    } else {
+        GraphNodeDefaults::from_env(|name| std::env::var(name).ok())
+    }
 }
 
 /// Build a literal `order_by` object, expanding subgraph's `parent__child` nested
@@ -3451,7 +3516,7 @@ mod tests {
         let payload = create_test_payload("query { streams(first: 10, skip: 0) { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(limit: 10, offset: 0, where: {chainId: {_eq: \"1\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 10, offset: 0, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3706,7 +3771,7 @@ mod tests {
         let payload = create_test_payload("query { streams(name: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_eq: \"test\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, name: {_eq: \"test\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3716,7 +3781,7 @@ mod tests {
         let payload = create_test_payload("query { streams(name_not: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_neq: \"test\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, name: {_neq: \"test\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3726,7 +3791,7 @@ mod tests {
         let payload = create_test_payload("query { streams(amount_gt: 100) { id amount } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, amount: {_gt: 100}}) {\n    id amount\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, amount: {_gt: 100}}) {\n    id amount\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3736,7 +3801,7 @@ mod tests {
         let payload = create_test_payload("query { streams(amount_gte: 100) { id amount } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, amount: {_gte: 100}}) {\n    id amount\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, amount: {_gte: 100}}) {\n    id amount\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3746,7 +3811,7 @@ mod tests {
         let payload = create_test_payload("query { streams(amount_lt: 100) { id amount } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, amount: {_lt: 100}}) {\n    id amount\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, amount: {_lt: 100}}) {\n    id amount\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3756,7 +3821,7 @@ mod tests {
         let payload = create_test_payload("query { streams(amount_lte: 100) { id amount } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, amount: {_lte: 100}}) {\n    id amount\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, amount: {_lte: 100}}) {\n    id amount\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3767,7 +3832,7 @@ mod tests {
             create_test_payload("query { streams(id_in: [\"1\", \"2\", \"3\"]) { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, id: {_in: [\"1\", \"2\", \"3\"]}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, id: {_in: [\"1\", \"2\", \"3\"]}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3778,7 +3843,7 @@ mod tests {
             create_test_payload("query { streams(id_not_in: [\"1\", \"2\", \"3\"]) { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, id: {_nin: [\"1\", \"2\", \"3\"]}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, id: {_nin: [\"1\", \"2\", \"3\"]}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3788,7 +3853,7 @@ mod tests {
         let payload = create_test_payload("query { streams(name_contains: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_like: \"%test%\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, name: {_like: \"%test%\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3799,7 +3864,7 @@ mod tests {
             create_test_payload("query { streams(name_not_contains: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_like: \"%test%\"}}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _not: {name: {_like: \"%test%\"}}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3810,7 +3875,7 @@ mod tests {
             create_test_payload("query { streams(name_starts_with: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_like: \"test%\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, name: {_like: \"test%\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3821,7 +3886,7 @@ mod tests {
             create_test_payload("query { streams(name_ends_with: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_like: \"%test\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, name: {_like: \"%test\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3832,7 +3897,7 @@ mod tests {
             create_test_payload("query { streams(name_not_starts_with: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_like: \"test%\"}}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _not: {name: {_like: \"test%\"}}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3843,7 +3908,7 @@ mod tests {
             create_test_payload("query { streams(name_not_ends_with: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_like: \"%test\"}}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _not: {name: {_like: \"%test\"}}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3854,7 +3919,7 @@ mod tests {
             create_test_payload("query { streams(name_contains_nocase: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"%test%\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, name: {_ilike: \"%test%\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3866,7 +3931,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"%test%\"}}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"%test%\"}}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3877,7 +3942,7 @@ mod tests {
             create_test_payload("query { streams(name_starts_with_nocase: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"test%\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, name: {_ilike: \"test%\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3888,7 +3953,7 @@ mod tests {
             create_test_payload("query { streams(name_ends_with_nocase: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, name: {_ilike: \"%test\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, name: {_ilike: \"%test\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3900,7 +3965,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"test%\"}}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"test%\"}}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3912,7 +3977,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"%test\"}}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _not: {name: {_ilike: \"%test\"}}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3970,7 +4035,7 @@ mod tests {
         let payload = create_test_payload("query { users(name_contains: \"john\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  User(where: {chainId: {_eq: \"1\"}, name: {_like: \"%john%\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  User(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, name: {_like: \"%john%\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3980,7 +4045,7 @@ mod tests {
         let payload = create_test_payload("query { streams(first: 5, skip: 10) { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(limit: 5, offset: 10, where: {chainId: {_eq: \"1\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 5, offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -3992,7 +4057,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(order_by: [{name: desc}, {id: desc}], where: {chainId: {_eq: \"1\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: [{name: desc}, {id: desc}], where: {chainId: {_eq: \"1\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -4004,7 +4069,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(offset: 10, order_by: [{alias: asc}, {id: asc}], where: {chainId: {_eq: \"1\"}, alias: {_like: \"%113%\"}}) {\n    alias asset { address }\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, offset: 10, order_by: [{alias: asc}, {id: asc}], where: {chainId: {_eq: \"1\"}, alias: {_like: \"%113%\"}}) {\n    alias asset { address }\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -4015,7 +4080,7 @@ mod tests {
             create_test_payload("query { streams { id name amount status { id name } } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"1\"}}) {\n    id name amount status { id name }\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    id name amount status { id name }\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -4061,7 +4126,7 @@ mod tests {
         let payload = create_test_payload("query { streams(first: 10, skip: 0) { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(limit: 10, offset: 0) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 10, offset: 0, order_by: {id: asc}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -4081,7 +4146,7 @@ mod tests {
         let payload = create_test_payload("query { streams(name: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {name: {_eq: \"test\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {name: {_eq: \"test\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -4091,7 +4156,7 @@ mod tests {
         let payload = create_test_payload("query { users(name_contains: \"john\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let expected = json!({
-            "query": "query {\n  User(where: {name: {_like: \"%john%\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  User(limit: 100, order_by: {id: asc}, where: {name: {_like: \"%john%\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -4101,7 +4166,7 @@ mod tests {
         let payload = create_test_payload("query { streams(name: \"test\") { id name } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("5")).unwrap();
         let expected = json!({
-            "query": "query {\n  Stream(where: {chainId: {_eq: \"5\"}, name: {_eq: \"test\"}}) {\n    id name\n  }\n}"
+            "query": "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"5\"}, name: {_eq: \"test\"}}) {\n    id name\n  }\n}"
         });
         assert_eq!(result.query, expected);
     }
@@ -6239,7 +6304,8 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(!query.contains("order_by"), "{}", query);
+        // graph-node ignores a lone `orderDirection` and sorts by `id` ascending.
+        assert!(query.contains("Swap(limit: 100, order_by: {id: asc})"), "{}", query);
         assert!(!query.contains("$direction"), "{}", query);
         // The whole definition list is gone, so the parens must go with it.
         assert!(query.starts_with("query Q {"), "{}", query);
@@ -6555,7 +6621,7 @@ mod tests {
             let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
             let query = result.query["query"].as_str().unwrap();
             assert!(
-                query.contains(&format!("{}(limit: 1)", entity)),
+                query.contains(&format!("{}(limit: 1, order_by: {{id: asc}})", entity)),
                 "{} should convert to {}: {}",
                 field,
                 entity,
@@ -6634,7 +6700,7 @@ mod tests {
         let query = result.query["query"].as_str().unwrap();
         assert_eq!(
             query,
-            "query {\n  UserTransaction(limit: 5) {\n    id supply { amount }\n  }\n}"
+            "query {\n  UserTransaction(limit: 5, order_by: {id: asc}) {\n    id supply { amount }\n  }\n}"
         );
     }
 
@@ -6777,8 +6843,8 @@ mod tests {
             create_test_payload("query { tokens(first: 1) { id } top: tokens(first: 5) { id } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("  Token(limit: 1)"), "{query}");
-        assert!(query.contains("top: Token(limit: 5)"), "{query}");
+        assert!(query.contains("  Token(limit: 1, order_by: {id: asc})"), "{query}");
+        assert!(query.contains("top: Token(limit: 5, order_by: {id: asc})"), "{query}");
         assert_eq!(result.field_name_map.get("Token"), Some(&"tokens".to_string()));
         assert_eq!(result.field_name_map.get("top"), Some(&"top".to_string()));
     }
@@ -6806,7 +6872,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
         assert!(query.starts_with("query B {"), "{query}");
-        assert!(query.contains("Stream(limit: 2)"), "{query}");
+        assert!(query.contains("Stream(limit: 2, order_by: {id: asc})"), "{query}");
         assert!(!query.contains("Token"), "{query}");
     }
 
@@ -6851,7 +6917,7 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("Stream(limit: $m)"), "{query}");
+        assert!(query.contains("Stream(limit: $m, order_by: {id: asc})"), "{query}");
         assert_eq!(result.query["variables"], json!({"m": 2}));
     }
 
@@ -6900,7 +6966,10 @@ mod tests {
             ),
             "{query}"
         );
-        assert!(query.contains("SwapUser(where: {id: {_eq: \"0x2f62\"}})"), "{query}");
+        assert!(
+            query.contains("SwapUser(limit: 100, order_by: {id: asc}, where: {id: {_eq: \"0x2f62\"}})"),
+            "{query}"
+        );
     }
 
     #[test]
@@ -6912,7 +6981,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
         assert!(
-            query.contains("swap(where: {fee: {_gt: \"0\"}, tokenIn: {id: {_eq: \"0xt\"}}})"),
+            query.contains("swap(limit: 100, order_by: {id: asc}, where: {fee: {_gt: \"0\"}, tokenIn: {id: {_eq: \"0xt\"}}})"),
             "{query}"
         );
     }
@@ -6924,7 +6993,7 @@ mod tests {
             create_test_payload("query { swapUsers(first: 1) { swap(first: 2) { id } } }");
         let result = convert_subgraph_to_hyperindex(&payload, Some("5031")).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("swap(limit: 2)"), "{query}");
+        assert!(query.contains("swap(limit: 2, order_by: {id: asc})"), "{query}");
         assert_eq!(query.matches("chainId").count(), 1, "{query}");
     }
 
@@ -6937,7 +7006,7 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("swap(limit: $first, offset: $skip)"), "{query}");
+        assert!(query.contains("swap(limit: $first, offset: $skip, order_by: {id: asc})"), "{query}");
         assert!(query.starts_with("query Q($first: Int!, $skip: Int!)"), "{query}");
         assert_eq!(result.query["variables"], json!({"first": 5, "skip": 10}));
     }
@@ -6951,7 +7020,8 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("swap(order_by: $ob)"), "{query}");
+        // The page size defaults; the variable order replaces the default sort.
+        assert!(query.contains("swap(limit: 100, order_by: $ob)"), "{query}");
         assert!(query.contains("$ob: [Swap_order_by!]"), "{query}");
         assert!(!query.contains("$dir"), "{query}");
         assert_eq!(
@@ -6968,7 +7038,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("swap(limit: 1) { sender { swap(limit: 3, order_by: [{fee: asc}, {id: asc}])"), "{query}");
+        assert!(query.contains("swap(limit: 1, order_by: {id: asc}) { sender { swap(limit: 3, order_by: [{fee: asc}, {id: asc}])"), "{query}");
     }
 
     #[test]
@@ -7008,7 +7078,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
         // An inline fragment on the field's own type is flattened into it.
-        assert!(query.contains("swap(limit: 2) {"), "{query}");
+        assert!(query.contains("swap(limit: 2, order_by: {id: asc}) {"), "{query}");
     }
 
     #[test]
@@ -7034,7 +7104,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("swap(where: {id: {_eq: \"a(b)c\"}}) { id }"), "{query}");
+        assert!(query.contains("swap(limit: 100, order_by: {id: asc}, where: {id: {_eq: \"a(b)c\"}}) { id }"), "{query}");
     }
 
     #[test]
@@ -7085,7 +7155,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
         assert!(
-            query.contains("Token(where: {_or: [{symbol: {_eq: \"USDT\"}}, {symbol: {_eq: \"USDC.e\"}}]})"),
+            query.contains("Token(limit: 100, order_by: {id: asc}, where: {_or: [{symbol: {_eq: \"USDT\"}}, {symbol: {_eq: \"USDC.e\"}}]})"),
             "{query}"
         );
     }
@@ -7099,8 +7169,8 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
         // Two conditions on one field come out in either order.
-        let gt_first = "Swap(where: {_and: [{_and: [{fee: {_gt: 1}}, {fee: {_lt: 5}}]}, {trader: {_eq: \"0xa\"}}]})";
-        let lt_first = "Swap(where: {_and: [{_and: [{fee: {_lt: 5}}, {fee: {_gt: 1}}]}, {trader: {_eq: \"0xa\"}}]})";
+        let gt_first = "Swap(limit: 100, order_by: {id: asc}, where: {_and: [{_and: [{fee: {_gt: 1}}, {fee: {_lt: 5}}]}, {trader: {_eq: \"0xa\"}}]})";
+        let lt_first = "Swap(limit: 100, order_by: {id: asc}, where: {_and: [{_and: [{fee: {_lt: 5}}, {fee: {_gt: 1}}]}, {trader: {_eq: \"0xa\"}}]})";
         assert!(query.contains(gt_first) || query.contains(lt_first), "{query}");
     }
 
@@ -7201,7 +7271,10 @@ mod tests {
         let payload = create_test_payload("query { statuses(where: {id: \"1\"}) { id } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("  Status(where: {id: {_eq: \"1\"}})"), "{query}");
+        assert!(
+            query.contains("  Status(limit: 100, order_by: {id: asc}, where: {id: {_eq: \"1\"}})"),
+            "{query}"
+        );
     }
 
     #[test]
@@ -7210,7 +7283,10 @@ mod tests {
         let payload = create_test_payload("query { swapUsers(where: {id: \"0xa\"}) { id } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("  SwapUser(where: {id: {_eq: \"0xa\"}})"), "{query}");
+        assert!(
+            query.contains("  SwapUser(limit: 100, order_by: {id: asc}, where: {id: {_eq: \"0xa\"}})"),
+            "{query}"
+        );
     }
 
     #[test]
@@ -7221,7 +7297,7 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("Stream_by_pk(id: \"1\")"), "{query}");
-        assert!(query.contains("  Stream(limit: 1)"), "{query}");
+        assert!(query.contains("  Stream(limit: 1, order_by: {id: asc})"), "{query}");
     }
 
     #[test]
@@ -7243,7 +7319,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("  Swap(limit: 2) {"), "{query}");
+        assert!(query.contains("  Swap(limit: 2, order_by: {id: asc}) {"), "{query}");
         assert!(!query.contains("block:") && !query.contains("where"), "{query}");
         assert!(query.contains("__converter_meta: "), "{query}");
         assert_eq!(result.min_block, Some(123));
@@ -7311,7 +7387,7 @@ mod tests {
             create_test_payload("query { swaps(first: 1, subgraphError: allow) { id } }");
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("  Swap(limit: 1) {"), "{query}");
+        assert!(query.contains("  Swap(limit: 1, order_by: {id: asc}) {"), "{query}");
         assert!(!query.contains("subgraphError"), "{query}");
         assert_eq!(result.min_block, None);
     }
@@ -7386,7 +7462,7 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("  Token(limit: 1) {"), "{query}");
+        assert!(query.contains("  Token(limit: 1, order_by: {id: asc}) {"), "{query}");
         assert!(query.contains("  _meta {\n    progressBlock\n  }"), "{query}");
         assert_eq!(result.meta_selection.unwrap().key, "_meta");
         assert_eq!(result.field_name_map.get("Token"), Some(&"tokens".to_string()));
@@ -7489,5 +7565,126 @@ mod tests {
         assert_eq!(field, "name");
         assert!(!filter.negated && filter.operator == "_like");
         assert!(string_match_filter("name_in").is_none());
+    }
+
+    // ── graph-node defaults: first 100, id asc ───────────────────────────────
+
+    #[test]
+    fn collection_without_first_or_order_by_gets_graph_node_defaults() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { tokens { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(
+            result.query["query"].as_str().unwrap(),
+            "query {\n  Token(limit: 100, order_by: {id: asc}) {\n    id\n  }\n}"
+        );
+    }
+
+    #[test]
+    fn nested_list_without_arguments_gets_graph_node_defaults() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { swapUsers(first: 1) { id swap { id } } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("id swap(limit: 100, order_by: {id: asc}) { id }"), "{query}");
+    }
+
+    #[test]
+    fn single_objects_get_no_defaults() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { token(id: \"0xa\") { id } swaps(first: 1, orderBy: fee) { tokenIn { id } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("Token_by_pk(id: \"0xa\") {"), "{query}");
+        assert!(query.contains("tokenIn { id }"), "{query}");
+    }
+
+    #[test]
+    fn explicit_first_and_order_by_replace_the_defaults() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($n: Int!, $ob: Swap_orderBy!) { swaps(first: $n, orderBy: $ob) { id } tokens(orderBy: symbol) { id } }",
+            "variables": {"n": 3, "ob": "fee"}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("Swap(limit: $n, order_by: $ob)"), "{query}");
+        assert!(
+            query.contains("Token(limit: 100, order_by: [{symbol: asc}, {id: asc}])"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn first_null_is_the_default_page() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { tokens(first: null, orderBy: id) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("Token(limit: 100, order_by: {id: asc})"), "{query}");
+    }
+
+    #[test]
+    fn defaults_switched_off_leave_the_arguments_as_before() {
+        init_test_schema_if_needed();
+        let mut ctx = ArgContext {
+            defaults: GraphNodeDefaults {
+                first: None,
+                order_by_id: false,
+            },
+            ..ArgContext::default()
+        };
+        let mut params = HashMap::new();
+        params.insert("skip".to_string(), "5".to_string());
+        assert_eq!(
+            convert_collection_args(&params, "Token", None, &mut ctx).unwrap(),
+            vec!["offset: 5".to_string()]
+        );
+        let mut ctx = ArgContext::default();
+        assert_eq!(
+            convert_collection_args(&params, "Token", None, &mut ctx).unwrap(),
+            vec![
+                "limit: 100".to_string(),
+                "offset: 5".to_string(),
+                "order_by: {id: asc}".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn default_switches_read_from_the_environment() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(GraphNodeDefaults::from_env(env(&[])), GraphNodeDefaults::GRAPH_NODE);
+        assert_eq!(
+            GraphNodeDefaults::from_env(env(&[
+                ("CONVERTER_DEFAULT_FIRST", "off"),
+                ("CONVERTER_DEFAULT_ORDER_ID", "OFF")
+            ])),
+            GraphNodeDefaults {
+                first: None,
+                order_by_id: false
+            }
+        );
+        assert_eq!(
+            GraphNodeDefaults::from_env(env(&[("CONVERTER_DEFAULT_FIRST", "0")])).first,
+            None
+        );
+        assert_eq!(
+            GraphNodeDefaults::from_env(env(&[("CONVERTER_DEFAULT_FIRST", "250")])).first,
+            Some(250)
+        );
+        assert_eq!(
+            GraphNodeDefaults::from_env(env(&[("CONVERTER_DEFAULT_FIRST", "lots")])).first,
+            Some(100)
+        );
     }
 }
