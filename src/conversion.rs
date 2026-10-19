@@ -526,7 +526,6 @@ fn extract_fragments_and_main_query(query: &str) -> Result<(String, String), Con
                             if brace_count == 0 {
                                 // Capture the fragment text [start_idx..=pos]
                                 let fragment_text: String = chars[start_idx..=pos].iter().collect();
-                                let fragment_text = sanitize_fragment_arguments(&fragment_text);
                                 if !fragments.is_empty() {
                                     fragments.push('\n');
                                 }
@@ -816,10 +815,24 @@ fn convert_main_query(
         .iter()
         .map(|root| classify_root_field(&root.name, &root.params))
         .collect();
-    let selections: Vec<String> = roots
-        .iter()
-        .map(|root| format!("{{\n    {}\n  }}", sanitize_selection_set(&root.selection)))
-        .collect();
+    // Arguments inside the selections, and inside named fragments, are converted
+    // first: the interface rewrite below parses them.
+    let mut selections: Vec<String> = Vec::with_capacity(roots.len());
+    for (root, (entity_cap, _)) in roots.iter().zip(&classified) {
+        let converted = convert_selection_arguments(&root.selection, Some(entity_cap), &mut ctx)?;
+        selections.push(format!("{{\n    {}\n  }}", converted));
+    }
+    let converted_fragments = match split_definitions(fragments_text) {
+        Some(definitions) => {
+            let mut converted = Vec::with_capacity(definitions.len());
+            for definition in definitions {
+                converted.push(convert_fragment_arguments(&definition.text, &mut ctx)?);
+            }
+            converted.join("\n")
+        }
+        None => fragments_text.to_string(),
+    };
+    let fragments_text = converted_fragments.as_str();
 
     // Type-conditioned fragments (`... on Supply { }`) on an interface stand-in are
     // rewritten to its link fields before anything below sees the selection.
@@ -831,7 +844,9 @@ fn convert_main_query(
             .collect();
         fragments::rewrite_all(fragments_text, &root_pairs)
     };
-    let fragments_override = rewrites.fragments;
+    let fragments_override = rewrites
+        .fragments
+        .or_else(|| (!fragments_text.is_empty()).then(|| fragments_text.to_string()));
     let mut root_rewrites = rewrites.roots.into_iter();
     let mut shape_plans: HashMap<String, ShapePlan> = HashMap::new();
 
@@ -1411,10 +1426,9 @@ fn match_paren(chars: &[char], open: usize) -> Option<usize> {
 
 /// Every `$name` token referenced in the converted operation body.
 ///
-/// Selection sets have already had their argument lists stripped by
-/// `sanitize_selection_set`, so the only variable references left in the body are
-/// the root-field arguments this module emits — which makes this scan a complete
-/// answer to "is this declaration still used?".
+/// The scan covers the whole body, root and nested arguments and directive
+/// arguments alike, which makes it a complete answer to "is this declaration
+/// still used?".
 fn referenced_variables(body: &str) -> HashSet<String> {
     let mut out = HashSet::new();
     let chars: Vec<char> = body.chars().collect();
@@ -1742,54 +1756,211 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
     Ok(entities)
 }
 
-fn sanitize_selection_set(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    let mut in_string = false;
-
-    while let Some(ch) = chars.next() {
-        if ch == '"' {
-            in_string = !in_string;
-            output.push(ch);
-            continue;
-        }
-
-        if !in_string && ch == '(' {
-            // Remove balanced parentheses and their contents
-            let mut depth: i32 = 1;
-            let mut in_args_string = false;
-            while let Some(nc) = chars.next() {
-                if nc == '"' {
-                    in_args_string = !in_args_string;
-                    continue;
-                }
-                if !in_args_string {
-                    if nc == '(' {
-                        depth += 1;
-                    } else if nc == ')' {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                }
-            }
-            // Do not push the parentheses or their content
-            continue;
-        }
-
-        output.push(ch);
-    }
-
-    output
+/// The most recent field in a selection walk whose arguments or sub-selection
+/// may still follow.
+struct PendingField {
+    name: String,
+    /// The field as the schema knows it, when the enclosing type is known.
+    info: Option<schema::FieldInfo>,
+    /// Output position just past the field name, where default arguments go.
+    insert_at: usize,
+    had_args: bool,
 }
 
-fn sanitize_fragment_arguments(fragment_text: &str) -> String {
-    // Only sanitize the selection body after the fragment header
-    // Find the first '{' and its matching '}' and strip args in between
+impl PendingField {
+    /// The entity the field's arguments filter and order.
+    fn entity(&self) -> String {
+        self.info
+            .as_ref()
+            .and_then(|info| info.nested_type_name.clone())
+            .unwrap_or_else(|| singularize_and_capitalize(&self.name))
+    }
+}
+
+/// Convert the arguments inside a selection set: a nested collection's `first`,
+/// `skip`, `orderBy`/`orderDirection` and filters become Hasura's `limit`,
+/// `offset`, `order_by` and `where`, exactly as on a root field, and directive
+/// arguments (`@include(if: $x)`) are kept as written. Everything else is copied
+/// through untouched.
+///
+/// `parent` is the type the selection belongs to. The walk tracks the type of
+/// every nested selection through the schema, so a nested `where` is converted
+/// against the right entity. Arguments on a field of unknown type are still
+/// converted, against an entity named after the field.
+fn convert_selection_arguments(
+    selection: &str,
+    parent: Option<&str>,
+    ctx: &mut ArgContext,
+) -> Result<String, ConversionError> {
+    let chars: Vec<char> = selection.chars().collect();
+    let mut out = String::with_capacity(selection.len());
+    // Type of each open selection set, innermost last.
+    let mut types: Vec<Option<String>> = vec![parent.map(str::to_string)];
+    let mut field: Option<PendingField> = None;
+    // Set by `...`; the next identifier is `on` or a fragment name.
+    let mut after_spread = false;
+    // The type an inline fragment's `{` opens, once `...` has been seen.
+    let mut fragment_type: Option<Option<String>> = None;
+    // The last identifier was a directive name, so a `(` holds its arguments.
+    let mut after_directive = false;
+
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+
+        if c == '"' {
+            let start = i;
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            let end = i.min(chars.len() - 1);
+            out.extend(&chars[start..=end]);
+            i = end + 1;
+            continue;
+        }
+
+        if c == '.' && chars[i..].starts_with(&['.', '.', '.']) {
+            out.push_str("...");
+            i += 3;
+            after_spread = true;
+            after_directive = false;
+            field = None;
+            // `... {` and `... @include(if: $x) {` stay on the enclosing type.
+            fragment_type = Some(types.last().cloned().flatten());
+            continue;
+        }
+
+        if c.is_alphabetic() || c == '_' || c == '@' {
+            let start = i;
+            i += 1;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            out.push_str(&word);
+
+            if c == '@' {
+                after_directive = true;
+                continue;
+            }
+            after_directive = false;
+
+            if after_spread {
+                after_spread = false;
+                if word == "on" {
+                    while i < chars.len() && chars[i].is_whitespace() {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                    let type_start = i;
+                    while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                        i += 1;
+                    }
+                    let type_name: String = chars[type_start..i].iter().collect();
+                    out.push_str(&type_name);
+                    fragment_type = Some(Some(type_name));
+                } else {
+                    // `...Name` spreads a named fragment; there is no `{` to type.
+                    fragment_type = None;
+                }
+                continue;
+            }
+
+            // An alias label: the field it names comes after the colon.
+            let mut j = i;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == ':' {
+                out.extend(&chars[i..=j]);
+                i = j + 1;
+                continue;
+            }
+
+            let info = types
+                .last()
+                .cloned()
+                .flatten()
+                .and_then(|ty| schema::get_field_info(&ty, &word));
+            field = Some(PendingField {
+                name: word,
+                info,
+                insert_at: out.len(),
+                had_args: false,
+            });
+            fragment_type = None;
+            continue;
+        }
+
+        if c == '(' {
+            let close = match_paren(&chars, i).unwrap_or(chars.len() - 1);
+            if after_directive {
+                out.extend(&chars[i..=close]);
+                after_directive = false;
+            } else if let Some(pending) = field.as_mut() {
+                let inner: String = chars[i + 1..close].iter().collect();
+                let mut params = HashMap::new();
+                parse_graphql_params(&inner, &mut params)?;
+                let args = convert_collection_args(&params, &pending.entity(), None, ctx)?;
+                if !args.is_empty() {
+                    out.push_str(&format!("({})", args.join(", ")));
+                }
+                pending.had_args = true;
+            }
+            i = close + 1;
+            continue;
+        }
+
+        if c == '{' {
+            let opened = if let Some(ty) = fragment_type.take() {
+                ty
+            } else if let Some(pending) = field.take() {
+                let is_list = pending.info.as_ref().map(|info| info.is_list).unwrap_or(false);
+                if is_list && !pending.had_args {
+                    // A list with no arguments still gets graph-node's defaults.
+                    let args =
+                        convert_collection_args(&HashMap::new(), &pending.entity(), None, ctx)?;
+                    if !args.is_empty() {
+                        out.insert_str(pending.insert_at, &format!("({})", args.join(", ")));
+                    }
+                }
+                pending.info.and_then(|info| info.nested_type_name)
+            } else {
+                None
+            };
+            types.push(opened);
+            out.push('{');
+            after_directive = false;
+            i += 1;
+            continue;
+        }
+
+        if c == '}' {
+            types.pop();
+            field = None;
+            fragment_type = None;
+            after_directive = false;
+        }
+        out.push(c);
+        i += 1;
+    }
+
+    Ok(out)
+}
+
+/// `convert_selection_arguments` for a named fragment definition, whose type
+/// condition (`fragment F on Swap`) is the selection's type.
+fn convert_fragment_arguments(
+    fragment_text: &str,
+    ctx: &mut ArgContext,
+) -> Result<String, ConversionError> {
     let chars: Vec<char> = fragment_text.chars().collect();
     let Some(open_idx) = chars.iter().position(|c| *c == '{') else {
-        return fragment_text.to_string();
+        return Ok(fragment_text.to_string());
     };
     // Find matching closing brace
     let mut brace_count = 1i32;
@@ -1808,13 +1979,18 @@ fn sanitize_fragment_arguments(fragment_text: &str) -> String {
         pos += 1;
     }
     if pos >= chars.len() {
-        return fragment_text.to_string();
+        return Ok(fragment_text.to_string());
     }
     let header: String = chars[..open_idx + 1].iter().collect();
     let body: String = chars[open_idx + 1..pos].iter().collect();
     let tail: String = chars[pos..].iter().collect();
-    let sanitized_body = sanitize_selection_set(body.trim());
-    format!("{}{}{}", header, sanitized_body, tail)
+    let type_condition = header
+        .split_whitespace()
+        .skip_while(|word| *word != "on")
+        .nth(1)
+        .map(|ty| ty.trim_end_matches('{').to_string());
+    let converted = convert_selection_arguments(body.trim(), type_condition.as_deref(), ctx)?;
+    Ok(format!("{}{}{}", header, converted, tail))
 }
 
 // Removed unused selection set helpers
@@ -2918,6 +3094,25 @@ fn parse_graphql_params(
                         current_param.push(ch);
                     }
                 }
+                // GraphQL separates arguments with any whitespace, so a space
+                // or tab ends the current argument too, once it has a value
+                // (`first: 100 skip: 0`).
+                ' ' | '\t'
+                    if brace_count == 0
+                        && bracket_count == 0
+                        && current_param
+                            .split_once(':')
+                            .map(|(_, value)| !value.trim().is_empty())
+                            .unwrap_or(false) =>
+                {
+                    let next_byte_idx = byte_idx + ch.len_utf8();
+                    if starts_with_argument_name(&params_str[next_byte_idx..]) {
+                        parse_single_param(&current_param, params)?;
+                        current_param.clear();
+                    } else {
+                        current_param.push(ch);
+                    }
+                }
                 '\n' | '\r' => {
                     // Handle newlines as parameter separators when at top level
                     if brace_count == 0 && bracket_count == 0 {
@@ -2979,6 +3174,20 @@ fn parse_graphql_params(
     }
 
     Ok(())
+}
+
+/// Whether `text`, after leading whitespace, begins with `name:`, the start of
+/// another argument.
+fn starts_with_argument_name(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(first) if first.is_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    let rest: String = chars.collect();
+    let after_name = rest.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_');
+    after_name.trim_start().starts_with(':')
 }
 
 fn parse_single_param(
@@ -6506,5 +6715,195 @@ mod tests {
         assert_eq!(defs[1].fragment.as_deref(), Some("F"));
         assert!(defs[2].operation_name.is_none() && defs[2].fragment.is_none());
         assert_eq!(fragment_spreads("{ ...A ... on T { x } ... @include(if: $y) { z } ...B }"), vec!["A", "B"]);
+    }
+
+    // ── Nested-field and directive arguments ─────────────────────────────────
+
+    #[test]
+    fn termini_history_query_keeps_nested_sorting_and_paging() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query historyQuery { swapUsers(where: { id: \"0x2f62\" }) { id count swap(first: 100 skip: 0 orderBy: swapUserIndex orderDirection: desc) { id swapUserIndex tokenIn { id symbol } } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains(
+                "swap(limit: 100, offset: 0, order_by: [{swapUserIndex: desc}, {id: desc}]) { id swapUserIndex tokenIn { id symbol } }"
+            ),
+            "{query}"
+        );
+        assert!(query.contains("SwapUser(where: {id: {_eq: \"0x2f62\"}})"), "{query}");
+    }
+
+    #[test]
+    fn nested_where_is_converted_against_the_child_entity() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swapUsers(first: 1) { swap(where: { fee_gt: \"0\", tokenIn: \"0xt\" }) { id } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("swap(where: {fee: {_gt: \"0\"}, tokenIn: {id: {_eq: \"0xt\"}}})"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn nested_where_on_the_chain_route_gets_no_chain_filter() {
+        init_test_schema_if_needed();
+        let payload =
+            create_test_payload("query { swapUsers(first: 1) { swap(first: 2) { id } } }");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("5031")).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("swap(limit: 2)"), "{query}");
+        assert_eq!(query.matches("chainId").count(), 1, "{query}");
+    }
+
+    #[test]
+    fn nested_paging_variables_are_kept_and_stay_declared() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($first: Int!, $skip: Int!) { swapUsers(first: 1) { swap(first: $first, skip: $skip) { id } } }",
+            "variables": {"first": 5, "skip": 10}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("swap(limit: $first, offset: $skip)"), "{query}");
+        assert!(query.starts_with("query Q($first: Int!, $skip: Int!)"), "{query}");
+        assert_eq!(result.query["variables"], json!({"first": 5, "skip": 10}));
+    }
+
+    #[test]
+    fn nested_order_by_variable_is_rebuilt_for_the_child_entity() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($ob: Swap_orderBy!, $dir: OrderDirection!) { swapUsers(first: 1) { swap(orderBy: $ob, orderDirection: $dir) { id } } }",
+            "variables": {"ob": "swapUserIndex", "dir": "desc"}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("swap(order_by: $ob)"), "{query}");
+        assert!(query.contains("$ob: [Swap_order_by!]"), "{query}");
+        assert!(!query.contains("$dir"), "{query}");
+        assert_eq!(
+            result.query["variables"]["ob"],
+            json!([{"swapUserIndex": "desc"}, {"id": "desc"}])
+        );
+    }
+
+    #[test]
+    fn arguments_two_levels_down_are_converted() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swapUsers(first: 1) { swap(first: 1) { sender { swap(first: 3, orderBy: fee) { id } } } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("swap(limit: 1) { sender { swap(limit: 3, order_by: [{fee: asc}, {id: asc}])"), "{query}");
+    }
+
+    #[test]
+    fn arguments_inside_an_aliased_nested_field_are_converted() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swapUsers(first: 1) { latest: swap(first: 1, orderBy: swapUserIndex, orderDirection: desc) { id } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("latest: swap(limit: 1, order_by: [{swapUserIndex: desc}, {id: desc}])"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn arguments_inside_a_named_fragment_are_converted() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swapUsers(first: 1) { ...UserFields } } fragment UserFields on SwapUser { id swap(first: 2, orderBy: swapUserIndex, orderDirection: desc) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("fragment UserFields on SwapUser {id swap(limit: 2, order_by: [{swapUserIndex: desc}, {id: desc}]) { id }}"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn arguments_inside_an_inline_fragment_are_converted() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swapUsers(first: 1) { id ... on SwapUser { swap(first: 2) { id } } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        // An inline fragment on the field's own type is flattened into it.
+        assert!(query.contains("swap(limit: 2) {"), "{query}");
+    }
+
+    #[test]
+    fn directive_arguments_are_kept() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($x: Boolean!) { swaps(first: 1) { id fee @include(if: $x) tokenIn @skip(if: true) { id } } }",
+            "variables": {"x": false}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("fee @include(if: $x)"), "{query}");
+        assert!(query.contains("tokenIn @skip(if: true) { id }"), "{query}");
+        assert!(query.starts_with("query Q($x: Boolean!)"), "{query}");
+        assert_eq!(result.query["variables"], json!({"x": false}));
+    }
+
+    #[test]
+    fn a_parenthesis_inside_a_string_argument_is_not_mangled() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swapUsers(first: 1) { swap(where: { id: \"a(b)c\" }) { id } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("swap(where: {id: {_eq: \"a(b)c\"}}) { id }"), "{query}");
+    }
+
+    #[test]
+    fn nested_arguments_on_a_field_of_unknown_type_are_still_converted() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { streams(first: 1) { actions(first: 5, orderBy: timestamp, orderDirection: desc) { id } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("actions(limit: 5, order_by: [{timestamp: desc}, {id: desc}]) { id }"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn root_arguments_separated_only_by_spaces() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { streams(first: 2 skip: 4 orderBy: name orderDirection: desc where: { name: \"a b\" }) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("Stream(limit: 2, offset: 4, order_by: [{name: desc}, {id: desc}], where: {name: {_eq: \"a b\"}})"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn starts_with_argument_name_detects_the_next_argument() {
+        assert!(starts_with_argument_name(" skip: 0"));
+        assert!(starts_with_argument_name("orderDirection : desc"));
+        assert!(!starts_with_argument_name(" 100"));
+        assert!(!starts_with_argument_name(" desc"));
+        assert!(!starts_with_argument_name(" {a: 1}"));
     }
 }

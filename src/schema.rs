@@ -787,6 +787,20 @@ pub fn init_test_schema() {
                 ],
             ),
         );
+
+        // A user with a list of their swaps, which nested `first`/`orderBy`
+        // arguments page and sort (the Termini history query).
+        cache.insert(
+            "SwapUser".to_string(),
+            build(&[("id", "String"), ("count", "numeric")], &[("swap", "Swap", true)]),
+        );
+        if let Some(mut swap) = cache.get_mut("Swap") {
+            for (name, ty) in [("swapUserIndex", "numeric"), ("fee", "numeric")] {
+                swap.insert(name.to_string(), scalar(ty));
+            }
+            swap.insert("tokenIn".to_string(), object("Token", false));
+            swap.insert("sender".to_string(), object("SwapUser", false));
+        }
     }
 
     // Update timestamp
