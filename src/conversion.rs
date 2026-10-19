@@ -1736,31 +1736,42 @@ fn sanitize_selection_set(input: &str) -> Result<String, ConversionError> {
 /// returns the first N *unfiltered* rows under a 200, which the caller cannot
 /// tell apart from a filtered answer. Translating one needs the nested field's
 /// own entity type, which this lexical pass does not have.
+///
+/// The arguments are read with `top_level_arguments` rather than
+/// `parse_graphql_params`, for two reasons. `parse_single_param` hoists the
+/// contents of `where: {...}` into the map unprefixed, so a filter field named
+/// `first` would arrive as pagination and take the real `first` with it, while
+/// the filter itself vanished. And `parse_graphql_params` only splits on commas,
+/// which are optional in GraphQL, so `first: 3 skip: 1` became a `first` of
+/// `"3 skip: 1"` and was emitted as malformed GraphQL.
 fn translate_nested_field_args(field: &str, args: &str) -> Result<String, ConversionError> {
-    let mut params: HashMap<String, String> = HashMap::new();
-    if let Err(e) = parse_graphql_params(args, &mut params) {
-        // This used to return an empty string, dropping every argument on the
-        // field without a word anywhere.
+    let parsed = top_level_arguments(args);
+
+    if parsed.is_empty() {
+        if args.trim().is_empty() {
+            return Ok(String::new());
+        }
+        // Something is there but it is not an argument list. Dropping it would
+        // answer a different question than the one that was asked.
         tracing::warn!(
             field = field,
             arguments = args,
             "Could not parse the arguments of a nested field"
         );
-        return Err(e);
+        return Err(ConversionError::UnsupportedNestedArgument(
+            field.to_string(),
+            "unparseable arguments".to_string(),
+        ));
     }
 
-    // `parse_single_param` hoists the contents of `where: {...}` into the same
-    // map unprefixed, so a nested `where` arrives as its own filter keys rather
-    // than under a `where` key. Either way it cannot be translated here, and
-    // reporting the keys is better than dropping them silently.
     const TRANSLATED: [&str; 4] = ["first", "skip", "orderBy", "orderDirection"];
-    let mut untranslatable: Vec<&str> = params
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !TRANSLATED.contains(key))
+    let mut untranslatable: Vec<&str> = parsed
+        .iter()
+        .map(|arg| arg.name)
+        .filter(|name| !TRANSLATED.contains(name))
         .collect();
-    // `HashMap` order is not stable and this text reaches the client.
     untranslatable.sort_unstable();
+    untranslatable.dedup();
     if !untranslatable.is_empty() {
         return Err(ConversionError::UnsupportedNestedArgument(
             field.to_string(),
@@ -1768,16 +1779,23 @@ fn translate_nested_field_args(field: &str, args: &str) -> Result<String, Conver
         ));
     }
 
+    let value_of = |name: &str| {
+        parsed
+            .iter()
+            .find(|arg| arg.name == name)
+            .map(|arg| arg.value.trim())
+    };
+
     let mut out: Vec<String> = Vec::new();
-    if let Some(first) = params.get("first") {
+    if let Some(first) = value_of("first") {
         out.push(format!("limit: {}", first));
     }
-    if let Some(skip) = params.get("skip") {
+    if let Some(skip) = value_of("skip") {
         out.push(format!("offset: {}", skip));
     }
 
-    let order_field = params.get("orderBy").map(|s| s.trim());
-    let order_dir = params.get("orderDirection").map(|s| s.trim());
+    let order_field = value_of("orderBy");
+    let order_dir = value_of("orderDirection");
 
     // A variable on either half of the sort needs its declared type rewritten -
     // `$d` is a `String` to the client and an `order_by` enum to Hasura - and
@@ -6404,6 +6422,70 @@ mod tests {
     }
 
     #[test]
+    fn test_a_where_field_named_like_pagination_does_not_become_pagination() {
+        // `parse_single_param` hoists the contents of `where: {...}` into the
+        // argument map unprefixed, and `first` is a legal input-field name. The
+        // filter then arrived as pagination: `where: {first: 2}` silently became
+        // `limit: 2`, taking the real `first: 3` with it and dropping the filter.
+        // Reading the raw argument text keeps the two apart.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "{ pools(first: 1) { id poolHourData(first: 3, where: { first: 2 }) { id } } }",
+        );
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "poolHourData");
+                assert_eq!(detail, "where");
+            }
+            other => panic!("expected UnsupportedNestedArgument naming where, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nested_arguments_without_commas_are_split() {
+        // Commas are optional in GraphQL. `parse_graphql_params` only splits on
+        // them, so `first: 3 skip: 1` arrived as a single `first` of "3 skip: 1"
+        // and was emitted verbatim as `limit: 3 skip: 1` - malformed GraphQL,
+        // forwarded upstream.
+        init_test_schema_if_needed();
+        for (query, expected) in [
+            (
+                "{ pools(first: 1) { id poolHourData(first: 3 skip: 1) { id } } }",
+                "poolHourData(limit: 3, offset: 1)",
+            ),
+            (
+                "{ pools(first: 1) { id poolHourData(first: 3 orderBy: periodStartUnix) { id } } }",
+                "poolHourData(limit: 3, order_by: [{periodStartUnix: asc}, {id: asc}])",
+            ),
+            (
+                "{ pools(first: 1) { id poolHourData(\n  first: 3\n  skip: 1\n) { id } } }",
+                "poolHourData(limit: 3, offset: 1)",
+            ),
+        ] {
+            let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None)
+                .unwrap_or_else(|e| panic!("expected {query:?} to convert, got {e:?}"));
+            let converted = result.query["query"].as_str().unwrap();
+            assert!(converted.contains(expected), "{converted}");
+        }
+    }
+
+    #[test]
+    fn test_unparseable_nested_arguments_are_rejected() {
+        // An argument list that yields nothing is not an empty one. Dropping it
+        // answers a different question than the one that was asked.
+        init_test_schema_if_needed();
+        let payload =
+            create_test_payload("{ pools(first: 1) { id poolHourData(garbage) { id } } }");
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "poolHourData");
+                assert_eq!(detail, "unparseable arguments");
+            }
+            other => panic!("expected UnsupportedNestedArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_comment_inside_nested_arguments_is_dropped() {
         // A `#` comment runs to end of line and can hold a `)`, which closed the
         // argument list early and forwarded malformed GraphQL. Keeping the
@@ -6553,9 +6635,7 @@ mod tests {
         match convert_subgraph_to_hyperindex(&payload, None) {
             Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
                 assert_eq!(field, "poolHourData");
-                // `parse_single_param` hoists the contents of `where`, so the
-                // clause is reported by its filter keys.
-                assert_eq!(detail, "volumeUSD_gt");
+                assert_eq!(detail, "where");
             }
             other => panic!("expected UnsupportedNestedArgument, got {other:?}"),
         }
@@ -6573,7 +6653,7 @@ mod tests {
         match convert_subgraph_to_hyperindex(&payload, None) {
             Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
                 assert_eq!(field, "poolHourData");
-                assert_eq!(detail, "block.number");
+                assert_eq!(detail, "block");
             }
             other => panic!("expected UnsupportedNestedArgument, got {other:?}"),
         }
