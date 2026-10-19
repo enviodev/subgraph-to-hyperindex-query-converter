@@ -1794,14 +1794,12 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
     let query_chars: Vec<char> = query.chars().collect();
     let mut current_pos = 0;
 
-    println!("DEBUG: Parsing query: {}", query);
 
     // Skip opening brace if present
     while current_pos < query_chars.len() && query_chars[current_pos].is_whitespace() {
         current_pos += 1;
     }
     if current_pos < query_chars.len() && query_chars[current_pos] == '{' {
-        println!("DEBUG: Found opening brace at position {}", current_pos);
         current_pos += 1;
     }
 
@@ -1815,10 +1813,6 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
             break;
         }
 
-        println!(
-            "DEBUG: Looking for entity at position {}, char: '{}'",
-            current_pos, query_chars[current_pos]
-        );
 
         // Look for entity name (word characters) - only at top level.
         // Identifier chars are alphanumerics plus underscore, so prefixed
@@ -1866,7 +1860,6 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
         } else {
             entity_name
         };
-        println!("DEBUG: Found potential entity name: '{}'", entity_name);
 
         // Skip if this is not a valid entity name (too short or common words)
         if entity_name.len() < 2
@@ -1877,10 +1870,6 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
             ]
             .contains(&entity_name.as_str())
         {
-            println!(
-                "DEBUG: Skipping '{}' as it's not a valid entity name",
-                entity_name
-            );
             current_pos += 1;
             continue;
         }
@@ -1893,7 +1882,6 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
         let mut params = HashMap::new();
 
         if current_pos < query_chars.len() && query_chars[current_pos] == '(' {
-            println!("DEBUG: Found entity definition for '{}'", entity_name);
 
             // Found an entity definition with parameters, extract parameters
             let params_start = current_pos + 1;
@@ -1929,16 +1917,8 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
             // Advance past the closing parenthesis
             current_pos += 1;
         } else if current_pos < query_chars.len() && query_chars[current_pos] == '{' {
-            println!(
-                "DEBUG: Found entity definition for '{}' (no parameters)",
-                entity_name
-            );
             // Entity without parameters, continue to selection set
         } else {
-            println!(
-                "DEBUG: No opening parenthesis or brace after '{}', skipping",
-                entity_name
-            );
             // This is not an entity definition, skip
             current_pos += 1;
             continue;
@@ -1949,30 +1929,13 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
             current_pos += 1;
         }
 
-        println!(
-            "DEBUG: After params, at position {}, char: '{}'",
-            current_pos,
-            if current_pos < query_chars.len() {
-                query_chars[current_pos]
-            } else {
-                '?'
-            }
-        );
 
         if current_pos >= query_chars.len() || query_chars[current_pos] != '{' {
-            println!(
-                "DEBUG: No opening brace for selection set after '{}', skipping",
-                entity_name
-            );
             // No selection set, skip this entity
             current_pos += 1;
             continue;
         }
 
-        println!(
-            "DEBUG: Found opening brace for selection set at position {}",
-            current_pos
-        );
 
         // Extract selection set
         let selection_start = current_pos + 1;
@@ -2006,9 +1969,6 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
             .trim()
             .to_string();
 
-        println!("DEBUG: Found entity: {}", entity_name);
-        println!("DEBUG: Params for {}: {:?}", entity_name, params);
-        println!("DEBUG: Selection for {}: {}", entity_name, raw_selection);
 
         entities.push(RootField {
             alias,
@@ -2018,8 +1978,8 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
         });
     }
 
-    println!(
-        "DEBUG: Found {} entities: {:?}",
+    tracing::debug!(
+        "Found {} root fields: {:?}",
         entities.len(),
         entities.iter().map(|root| &root.name).collect::<Vec<_>>()
     );
