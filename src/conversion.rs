@@ -1400,13 +1400,16 @@ fn order_by_json(field: &str, direction: &str) -> Value {
 /// Appending `id` makes the order total and identical.
 ///
 /// Set `CONVERTER_ORDER_ID_TIEBREAK=off` to emit the sort key alone, e.g. if the extra
-/// sort column proves slow on a very large table.
+/// sort column proves slow on a very large table. Tests always run with it on; the
+/// off form is covered through `literal_order_by_with_tiebreak`.
 fn id_tiebreak_enabled() -> bool {
+    cfg!(test) || tiebreak_setting(std::env::var("CONVERTER_ORDER_ID_TIEBREAK").ok().as_deref())
+}
+
+fn tiebreak_setting(value: Option<&str>) -> bool {
     !matches!(
-        std::env::var("CONVERTER_ORDER_ID_TIEBREAK")
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref(),
-        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
     )
 }
 
@@ -7756,6 +7759,17 @@ mod tests {
                 "_and": [{"amount": {"_lt": 9}}, {"name": {"_eq": "x"}}]
             })
         );
+    }
+
+
+    #[test]
+    fn tiebreak_switch_values() {
+        assert!(tiebreak_setting(None));
+        assert!(tiebreak_setting(Some("on")));
+        assert!(tiebreak_setting(Some("garbage")));
+        for off in ["off", "OFF", " 0 ", "false", "no"] {
+            assert!(!tiebreak_setting(Some(off)), "{off}");
+        }
     }
 
 }
