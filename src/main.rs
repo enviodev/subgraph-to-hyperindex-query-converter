@@ -116,6 +116,8 @@ async fn execute_query_with_retry(
                     "The document holds several operations. Set operationName to the one to run.",
                 conversion::ConversionError::UnknownOperation(_) =>
                     "operationName does not match any operation in the document.",
+                conversion::ConversionError::UnsupportedBlockConstraint(_) =>
+                    "Only block: { number_gte: N } can be served: it answers from the latest state once block N is indexed. Reads pinned to a past block (number or hash) need historical state, which Hyperindex does not keep.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -136,6 +138,7 @@ async fn execute_query_with_retry(
     };
 
     let converted_query = conversion_result.query;
+    let min_block = conversion_result.min_block;
     let field_name_map = conversion_result.field_name_map;
     let meta_selection = conversion_result.meta_selection;
     let shape_plans = conversion_result.shape_plans;
@@ -218,6 +221,9 @@ async fn execute_query_with_retry(
         }
     };
 
+    let mut response = response;
+    enforce_min_block(&mut response, min_block);
+
     // Check for GraphQL errors
     if let Some(errors) = response.get("errors") {
         // Return GraphQL errors normally (no schema refresh retry)
@@ -250,7 +256,6 @@ async fn execute_query_with_retry(
 
     // Success - no errors
     let transform_start = Instant::now();
-    let mut response = response;
     apply_shape_plans(&mut response, &shape_plans);
     let transformed =
         transform_response_to_subgraph_shape(response, &field_name_map, meta_selection.as_ref());
@@ -318,6 +323,8 @@ async fn handle_debug(Json(payload): Json<Value>) -> impl IntoResponse {
                     "The document holds several operations. Set operationName to the one to run.",
                 conversion::ConversionError::UnknownOperation(_) =>
                     "operationName does not match any operation in the document.",
+                conversion::ConversionError::UnsupportedBlockConstraint(_) =>
+                    "Only block: { number_gte: N } can be served: it answers from the latest state once block N is indexed. Reads pinned to a past block (number or hash) need historical state, which Hyperindex does not keep.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -382,6 +389,8 @@ async fn handle_chain_debug(
                     "The document holds several operations. Set operationName to the one to run.",
                 conversion::ConversionError::UnknownOperation(_) =>
                     "operationName does not match any operation in the document.",
+                conversion::ConversionError::UnsupportedBlockConstraint(_) =>
+                    "Only block: { number_gte: N } can be served: it answers from the latest state once block N is indexed. Reads pinned to a past block (number or hash) need historical state, which Hyperindex does not keep.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -416,6 +425,53 @@ async fn forward_to_hyperindex(
 
     let response_json: Value = response.json().await?;
     Ok(response_json)
+}
+
+/// Answer `block: {number_gte: N}` as graph-node does: with the latest data once
+/// block N is indexed, and with an error before then.
+///
+/// The converted query carries the indexer's progress under
+/// `conversion::BLOCK_CHECK_KEY`, one row per chain; the lowest is the block
+/// every chain has reached. The key is always removed, so the caller never sees
+/// it.
+fn enforce_min_block(response: &mut Value, min_block: Option<u64>) {
+    let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(progress) = data.remove(conversion::BLOCK_CHECK_KEY) else {
+        return;
+    };
+    let Some(required) = min_block else {
+        return;
+    };
+    let indexed = lowest_progress_block(&progress);
+    if indexed.map(|n| n >= required).unwrap_or(false) {
+        return;
+    }
+    let indexed = indexed
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "no".to_string());
+    *response = serde_json::json!({
+        "errors": [{
+            "message": format!(
+                "The indexer has only indexed up to block number {} and data for block number {} is therefore not yet available",
+                indexed, required
+            )
+        }]
+    });
+}
+
+/// The lowest processed block among indexing-progress rows, from Hasura's native
+/// `_meta` (`progressBlock`) or `chain_metadata` (`latest_processed_block`).
+fn lowest_progress_block(rows: &Value) -> Option<u64> {
+    rows.as_array()?
+        .iter()
+        .filter_map(|row| {
+            row.get("progressBlock")
+                .or_else(|| row.get("latest_processed_block"))
+                .and_then(Value::as_u64)
+        })
+        .min()
 }
 
 /// Merge rewritten interface-link fields back into their rows (see `fragments`).
@@ -853,6 +909,65 @@ mod response_shape_tests {
             out,
             json!({"data": {"Recent": [{"id": "s1"}], "top": [{"id": "t1"}]}})
         );
+    }
+
+    #[test]
+    fn number_gte_passes_once_every_chain_has_reached_the_block() {
+        let mut resp = json!({"data": {
+            "Token": [{"id": "t"}],
+            "__converter_meta": [{"progressBlock": 120}, {"progressBlock": 100}]
+        }});
+        enforce_min_block(&mut resp, Some(100));
+        assert_eq!(resp, json!({"data": {"Token": [{"id": "t"}]}}));
+    }
+
+    #[test]
+    fn number_gte_fails_while_any_chain_is_behind() {
+        let mut resp = json!({"data": {
+            "Token": [{"id": "t"}],
+            "__converter_meta": [{"progressBlock": 120}, {"progressBlock": 99}]
+        }});
+        enforce_min_block(&mut resp, Some(100));
+        assert!(resp.get("data").is_none(), "{resp}");
+        let message = resp["errors"][0]["message"].as_str().unwrap();
+        assert!(message.contains("only indexed up to block number 99"), "{message}");
+        assert!(message.contains("data for block number 100"), "{message}");
+    }
+
+    #[test]
+    fn number_gte_reads_the_chain_metadata_fallback() {
+        let mut resp = json!({"data": {
+            "Token": [],
+            "__converter_meta": [{"latest_processed_block": 50}]
+        }});
+        enforce_min_block(&mut resp, Some(60));
+        assert!(resp["errors"][0]["message"].as_str().unwrap().contains("block number 50"));
+    }
+
+    #[test]
+    fn progress_key_is_removed_even_without_a_requirement() {
+        let mut resp = json!({"data": {"Token": [], "__converter_meta": [{"progressBlock": 1}]}});
+        enforce_min_block(&mut resp, None);
+        assert_eq!(resp, json!({"data": {"Token": []}}));
+    }
+
+    #[test]
+    fn number_gte_end_to_end_strips_the_progress_root() {
+        crate::schema::init_test_schema_once();
+        let payload = json!({"query": "{ tokens(first: 1, block: {number_gte: 10}) { id } }"});
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(converted.min_block, Some(10));
+        let mut hasura = json!({"data": {
+            "Token": [{"id": "t"}],
+            "__converter_meta": [{"progressBlock": 10}]
+        }});
+        enforce_min_block(&mut hasura, converted.min_block);
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            converted.meta_selection.as_ref(),
+        );
+        assert_eq!(out, json!({"data": {"tokens": [{"id": "t"}]}}));
     }
 
     #[test]

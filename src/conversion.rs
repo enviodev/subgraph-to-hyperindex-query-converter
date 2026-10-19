@@ -21,6 +21,8 @@ pub enum ConversionError {
     MissingOperationName,
     #[error("Unknown operation named \"{0}\"")]
     UnknownOperation(String),
+    #[error("Historical queries are not supported: {0}. Hyperindex serves only the latest indexed state, so a query pinned to a past block cannot be answered")]
+    UnsupportedBlockConstraint(String),
 }
 
 /// Where one half of an `order_by` pair comes from: a GraphQL variable the client
@@ -73,6 +75,24 @@ pub struct ConversionResult {
     /// Per root response key (the Hyperindex field name), how to merge rewritten
     /// interface-link fields back into subgraph-shaped rows. See `crate::fragments`.
     pub shape_plans: HashMap<String, ShapePlan>,
+    /// The block a `block: {number_gte: N}` argument requires to be indexed. The
+    /// converted query carries the indexer's progress under `BLOCK_CHECK_KEY`,
+    /// for the caller to compare against this before answering.
+    pub min_block: Option<u64>,
+}
+
+/// Response key of the hidden `_meta` root that reports indexing progress for a
+/// `block: {number_gte: N}` check. Removed from the response before it is returned.
+pub const BLOCK_CHECK_KEY: &str = "__converter_meta";
+
+/// Where the `N` of a `block: {number_gte: N}` argument comes from.
+#[derive(Debug, Clone, PartialEq)]
+enum MinBlockSource {
+    Literal(u64),
+    /// `block: {number_gte: $n}`
+    NumberVariable(String),
+    /// `block: $b`, a whole `Block_height` value.
+    BlockVariable(String),
 }
 
 pub fn convert_subgraph_to_hyperindex(
@@ -124,6 +144,7 @@ pub fn convert_subgraph_to_hyperindex(
             order_by_variables: Vec::new(),
             dropped_variables: Vec::new(),
             shape_plans: HashMap::new(),
+            min_block: None,
         });
     }
 
@@ -138,7 +159,12 @@ pub fn convert_subgraph_to_hyperindex(
         meta_selection,
         shape_plans,
         fragments_override: _,
+        min_blocks,
     } = convert_query_structure(query, chain_id)?;
+
+    // Variables are read before any are dropped from the forwarded payload: a
+    // `$n` that only fed `number_gte` has no place left in the query.
+    let min_block = resolve_min_block(&min_blocks, payload.get("variables"))?;
 
     // Build the result with query and optionally variables
     let mut result = serde_json::json!({
@@ -228,7 +254,51 @@ pub fn convert_subgraph_to_hyperindex(
         order_by_variables,
         dropped_variables,
         shape_plans,
+        min_block,
     })
+}
+
+/// The highest block any `block: {number_gte: N}` argument requires, with
+/// variables taken from the request. An unset variable sets no requirement.
+fn resolve_min_block(
+    sources: &[MinBlockSource],
+    variables: Option<&Value>,
+) -> Result<Option<u64>, ConversionError> {
+    let variable = |name: &str| variables.and_then(|vars| vars.get(name)).filter(|v| !v.is_null());
+    let as_block = |value: &Value| match value {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    };
+    let mut required: Option<u64> = None;
+    for source in sources {
+        let block = match source {
+            MinBlockSource::Literal(n) => Some(*n),
+            MinBlockSource::NumberVariable(name) => variable(name).and_then(as_block),
+            MinBlockSource::BlockVariable(name) => match variable(name) {
+                None => None,
+                Some(Value::Object(fields)) => {
+                    if let Some(key) = fields.keys().find(|k| k.as_str() != "number_gte") {
+                        return Err(ConversionError::UnsupportedBlockConstraint(format!(
+                            "block: {{ {}: ... }}",
+                            key
+                        )));
+                    }
+                    fields.get("number_gte").and_then(as_block)
+                }
+                Some(other) => {
+                    return Err(ConversionError::UnsupportedBlockConstraint(format!(
+                        "block: {}",
+                        other
+                    )))
+                }
+            },
+        };
+        if let Some(block) = block {
+            required = Some(required.map_or(block, |r: u64| r.max(block)));
+        }
+    }
+    Ok(required)
 }
 
 /// The operation `operationName` picked out of a multi-operation document.
@@ -441,6 +511,8 @@ struct MainConversion {
     shape_plans: HashMap<String, ShapePlan>,
     /// Replacement named-fragment definitions, when rewriting changed any of them.
     fragments_override: Option<String>,
+    /// `block: {number_gte: N}` requirements found on root fields.
+    min_blocks: Vec<MinBlockSource>,
 }
 
 fn convert_query_structure(
@@ -475,6 +547,7 @@ fn convert_query_structure(
             meta_selection: Some(meta_selection),
             shape_plans: HashMap::new(),
             fragments_override: None,
+            min_blocks: Vec::new(),
         });
     }
 
@@ -499,6 +572,7 @@ fn convert_query_structure(
         meta_selection: None,
         shape_plans: main.shape_plans,
         fragments_override: None,
+        min_blocks: main.min_blocks,
     })
 }
 
@@ -796,7 +870,7 @@ fn convert_main_query(
     };
 
     // Extract multiple entities from the main query body
-    let roots = extract_multiple_entities(&stripped_query)?;
+    let mut roots = extract_multiple_entities(&stripped_query)?;
 
     let mut converted_entities = Vec::new();
     // Build mapping from Hyperindex field names to original query field names
@@ -809,6 +883,13 @@ fn convert_main_query(
             .unwrap_or_default(),
         ..ArgContext::default()
     };
+
+    // graph-node-only arguments are taken off before anything reads the rest as
+    // filters, or `block` would become a `where` on a column that does not exist.
+    let mut min_blocks = Vec::new();
+    for root in roots.iter_mut() {
+        min_blocks.extend(take_block_arguments(&mut root.params, &mut ctx)?);
+    }
 
     // Each root's Hyperindex entity, and whether it is a primary-key lookup.
     let classified: Vec<(String, bool)> = roots
@@ -916,6 +997,15 @@ fn convert_main_query(
         converted_entities.push(converted_entity);
     }
 
+    if !min_blocks.is_empty() {
+        converted_entities.push(progress_root(
+            BLOCK_CHECK_KEY,
+            chain_id,
+            native_meta_available(),
+            false,
+        ));
+    }
+
     // Build the body first: whether a declaration is still referenced can only be
     // answered against the emitted arguments.
     let body = converted_entities.join("\n");
@@ -965,7 +1055,116 @@ fn convert_main_query(
         meta_selection: None,
         shape_plans,
         fragments_override,
+        min_blocks,
     })
+}
+
+/// Take graph-node's `block` and `subgraphError` arguments off a root field.
+///
+/// `block: {number_gte: N}` means "answer from the latest state, provided block N
+/// is indexed"; the requirement is returned so the response can be checked.
+/// `block: {number: N}` and `block: {hash: ..}` ask for the state at a past block,
+/// which Hyperindex does not keep, so they are refused rather than answered from
+/// the latest state. `subgraphError` chooses whether a failed subgraph may still
+/// serve data; a Hyperindex indexer stops on a handler error instead, so there is
+/// nothing to choose and the argument is dropped.
+fn take_block_arguments(
+    params: &mut HashMap<String, String>,
+    ctx: &mut ArgContext,
+) -> Result<Vec<MinBlockSource>, ConversionError> {
+    let mut sources = Vec::new();
+    if let Some(value) = params.remove("subgraphError") {
+        if let Some(var) = value.trim().strip_prefix('$') {
+            ctx.dead_candidates.push(var.to_string());
+        }
+    }
+    if let Some(value) = params.remove("block") {
+        match value.trim().strip_prefix('$') {
+            Some(var) => {
+                ctx.dead_candidates.push(var.to_string());
+                sources.push(MinBlockSource::BlockVariable(var.to_string()));
+            }
+            None => {
+                return Err(ConversionError::UnsupportedBlockConstraint(format!(
+                    "block: {}",
+                    value.trim()
+                )))
+            }
+        }
+    }
+    let mut keys: Vec<String> = params
+        .keys()
+        .filter(|k| k.starts_with("block."))
+        .cloned()
+        .collect();
+    keys.sort();
+    for key in keys {
+        let value = params.remove(&key).unwrap_or_default();
+        let value = value.trim();
+        match key.as_str() {
+            "block.number_gte" => match value.strip_prefix('$') {
+                Some(var) => {
+                    ctx.dead_candidates.push(var.to_string());
+                    sources.push(MinBlockSource::NumberVariable(var.to_string()));
+                }
+                None => match value.trim_matches('"').parse::<u64>() {
+                    Ok(n) => sources.push(MinBlockSource::Literal(n)),
+                    Err(_) => {
+                        return Err(ConversionError::UnsupportedBlockConstraint(format!(
+                            "block: {{ number_gte: {} }}",
+                            value
+                        )))
+                    }
+                },
+            },
+            _ => {
+                return Err(ConversionError::UnsupportedBlockConstraint(format!(
+                    "block: {{ {}: {} }}",
+                    key.trim_start_matches("block."),
+                    value
+                )))
+            }
+        }
+    }
+    Ok(sources)
+}
+
+/// Whether the indexer exposes Hasura's native `_meta` root (newer Hyperindex
+/// versions). Older ones only have `chain_metadata`.
+fn native_meta_available() -> bool {
+    schema::get_field_info("_meta", "progressBlock").is_some()
+}
+
+/// A root field reporting indexing progress, aliased to `key`: the processed
+/// block and, with `with_time`, that block's timestamp. On the chain route it is
+/// limited to that chain; otherwise it lists every chain the indexer covers.
+fn progress_root(key: &str, chain_id: Option<&str>, native: bool, with_time: bool) -> String {
+    let chain_value = |id: &str| {
+        if id.chars().all(|c| c.is_ascii_digit()) {
+            id.to_string()
+        } else {
+            format!("\"{}\"", id)
+        }
+    };
+    let (source, chain_column, fields) = if native {
+        let fields = if with_time {
+            "progressBlock progressBlockTime"
+        } else {
+            "progressBlock"
+        };
+        ("_meta", "chainId", fields)
+    } else {
+        ("chain_metadata", "chain_id", "latest_processed_block")
+    };
+    let filter = chain_id
+        .map(|id| format!("(where: {{{}: {{_eq: {}}}}})", chain_column, chain_value(id)))
+        .unwrap_or_default();
+    let alias = if key == source {
+        String::new()
+    } else {
+        format!("{}: ", key)
+    };
+    format!("  {}{}{} {{\n    {}\n  }}", alias, source, filter, fields)
 }
 
 /// Per-operation state that argument conversion builds up across every root and
@@ -7208,5 +7407,104 @@ mod tests {
         assert_eq!(schema::entity_for_single_field("status"), Some("Status".to_string()));
         assert_eq!(schema::entity_for_single_field("query_root"), None);
         assert_eq!(schema::entity_for_single_field("nonexistent"), None);
+    }
+
+    // ── block / subgraphError arguments ──────────────────────────────────────
+
+    #[test]
+    fn number_gte_adds_a_progress_root_and_no_where() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { swaps(first: 2, block: {number_gte: 123}) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("  Swap(limit: 2) {"), "{query}");
+        assert!(!query.contains("block:") && !query.contains("where"), "{query}");
+        assert!(query.contains("__converter_meta: "), "{query}");
+        assert_eq!(result.min_block, Some(123));
+    }
+
+    #[test]
+    fn number_gte_on_a_primary_key_lookup_keeps_the_lookup() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { token(id: \"0xa\", block: {number_gte: 5}) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("Token_by_pk(id: \"0xa\")"), "{query}");
+        assert_eq!(result.min_block, Some(5));
+    }
+
+    #[test]
+    fn number_gte_variables_are_resolved_and_dropped() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($n: Int!, $b: Block_height) { swaps(first: 1, block: {number_gte: $n}) { id } tokens(first: 1, block: $b) { id } }",
+            "variables": {"n": 7, "b": {"number_gte": 9}}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.starts_with("query Q {"), "{query}");
+        assert_eq!(result.min_block, Some(9));
+        assert_eq!(result.query["variables"], json!({}));
+    }
+
+    #[test]
+    fn an_unset_block_variable_sets_no_requirement() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($b: Block_height) { swaps(first: 1, block: $b) { id } }",
+            "variables": {}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(result.min_block, None);
+    }
+
+    #[test]
+    fn historical_block_arguments_are_refused() {
+        init_test_schema_if_needed();
+        for query in [
+            "query { swaps(block: {number: 100}) { id } }",
+            "query { swaps(block: {hash: \"0xabc\"}) { id } }",
+        ] {
+            let err = convert_subgraph_to_hyperindex(&create_test_payload(query), None).unwrap_err();
+            assert!(matches!(err, ConversionError::UnsupportedBlockConstraint(_)), "{query}: {err}");
+        }
+        let payload = json!({
+            "query": "query Q($b: Block_height) { swaps(block: $b) { id } }",
+            "variables": {"b": {"number": 100}}
+        });
+        let err = convert_subgraph_to_hyperindex(&payload, None).unwrap_err();
+        assert!(matches!(err, ConversionError::UnsupportedBlockConstraint(_)), "{err}");
+    }
+
+    #[test]
+    fn subgraph_error_argument_is_dropped() {
+        init_test_schema_if_needed();
+        let payload =
+            create_test_payload("query { swaps(first: 1, subgraphError: allow) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("  Swap(limit: 1) {"), "{query}");
+        assert!(!query.contains("subgraphError"), "{query}");
+        assert_eq!(result.min_block, None);
+    }
+
+    #[test]
+    fn progress_root_shapes() {
+        assert_eq!(
+            progress_root("__converter_meta", Some("5031"), true, false),
+            "  __converter_meta: _meta(where: {chainId: {_eq: 5031}}) {\n    progressBlock\n  }"
+        );
+        assert_eq!(
+            progress_root("_meta", None, true, true),
+            "  _meta {\n    progressBlock progressBlockTime\n  }"
+        );
+        assert_eq!(
+            progress_root("_meta", Some("1"), false, false),
+            "  _meta: chain_metadata(where: {chain_id: {_eq: 1}}) {\n    latest_processed_block\n  }"
+        );
     }
 }
