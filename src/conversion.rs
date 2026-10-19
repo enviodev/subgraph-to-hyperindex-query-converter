@@ -647,7 +647,7 @@ fn convert_main_query(
         alias,
         name: entity,
         params,
-        has_block_argument,
+        pinned_to_block,
         selection,
     } in entities
     {
@@ -656,7 +656,7 @@ fn convert_main_query(
         // `where: {block: {number: {_eq: N}}}` - a 200 with the wrong rows
         // instead of an error. Read from the raw arguments, so a legitimate
         // `where: { block: ... }` filter is untouched.
-        if has_block_argument {
+        if pinned_to_block {
             return Err(ConversionError::BlockArgument(entity));
         }
         let entity_cap = singularize_and_capitalize(&entity);
@@ -1323,14 +1323,16 @@ struct RootField {
     alias: Option<String>,
     name: String,
     params: HashMap<String, String>,
-    /// A literal top-level `block:` argument, i.e. subgraph time travel.
+    /// A top-level `block:` argument that pins the query to one past block, i.e.
+    /// subgraph time travel. A `block: {number_gte: N}` freshness guard does not
+    /// count; see `BlockArgument`.
     ///
     /// Recorded here rather than inferred from `params`, because
     /// `parse_single_param` deliberately hoists the contents of `where: {...}`
     /// into the same map unprefixed. By then a `block` key is ambiguous: it is
     /// equally a time-travel argument and a filter on an entity that has a
     /// `block` field.
-    has_block_argument: bool,
+    pinned_to_block: bool,
     selection: String,
 }
 
@@ -1439,7 +1441,7 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
         }
 
         let mut params = HashMap::new();
-        let mut has_block_argument = false;
+        let mut pinned_to_block = false;
 
         if current_pos < query_chars.len() && query_chars[current_pos] == '(' {
             println!("DEBUG: Found entity definition for '{}'", entity_name);
@@ -1470,10 +1472,23 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
                 break;
             }
 
-            let params_str = query_chars[params_start..current_pos]
+            let mut params_str = query_chars[params_start..current_pos]
                 .iter()
                 .collect::<String>();
-            has_block_argument = has_top_level_argument(&params_str, "block");
+
+            // Classify from the raw argument text, before `parse_graphql_params`
+            // flattens `block: {number: N}` into a `block.number` key that is
+            // indistinguishable from a `where` filter on a `block` field.
+            match classify_block_argument(&params_str) {
+                Some((BlockArgument::PinnedToBlock, _)) => pinned_to_block = true,
+                // A `number_gte` guard is served at the latest block, so the
+                // argument has to go. Excise the text rather than dropping the
+                // parsed keys: a `where: {block: {...}}` filter hoists to the very
+                // same key, so removing by key could take a real filter with it.
+                Some((BlockArgument::MinimumBlock, span)) => params_str.replace_range(span, ""),
+                None => {}
+            }
+
             parse_graphql_params(&params_str, &mut params)?;
 
             // Advance past the closing parenthesis
@@ -1572,7 +1587,7 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
             alias,
             name: entity_name,
             params,
-            has_block_argument,
+            pinned_to_block,
             selection: selection_set,
         });
     }
@@ -1784,7 +1799,7 @@ fn convert_meta_query(query: &str) -> Result<(String, MetaSelection), Conversion
         block_number: requested.iter().any(|p| p == "block.number"),
         typename: requested.iter().any(|p| p == "__typename"),
         block_typename: requested.iter().any(|p| p == "block.__typename"),
-            alias: None,
+        alias: None,
     };
 
     Ok((
@@ -2869,79 +2884,193 @@ fn parse_single_param(
 
 // Removed unused brace matching helper
 
-/// Whether `params_str` has `name` as a *top-level* argument.
+/// One top-level `name: value` pair from an argument list, as raw text.
+struct TopLevelArg<'a> {
+    /// Byte range of the whole pair, for excising it from the argument text.
+    span: std::ops::Range<usize>,
+    name: &'a str,
+    value: &'a str,
+}
+
+/// Split an argument list into its *top-level* pairs, leaving values as raw text.
 ///
 /// `parse_single_param` hoists `where: {...}` contents into the same map without
 /// a prefix, so by the time arguments are parsed a key like `block` is
-/// ambiguous. This reads the raw argument text instead, where nesting is still
-/// visible.
-fn has_top_level_argument(params_str: &str, name: &str) -> bool {
-    let (mut brace, mut bracket, mut paren) = (0usize, 0usize, 0usize);
-    let mut in_string = false;
-    let mut escape = false;
-    let mut ident = String::new();
+/// ambiguous: it is equally a time-travel argument and a filter on an entity
+/// that has a `block` field. This reads the raw argument text, where the nesting
+/// is still visible.
+///
+/// Commas are insignificant in GraphQL, so `first: 1 block: {…}` is the same
+/// list as `first: 1, block: {…}` - and the comma-less form is how prettier
+/// prints a multi-line query. An unexpected token is skipped rather than ending
+/// the scan, so one malformed argument cannot hide the arguments after it.
+fn top_level_arguments(params_str: &str) -> Vec<TopLevelArg<'_>> {
+    let bytes = params_str.as_bytes();
+    let mut args = Vec::new();
+    let mut i = 0usize;
 
-    for ch in params_str.chars() {
-        if escape {
-            escape = false;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() || bytes[i] == b',' {
+            i += 1;
             continue;
         }
-        if in_string {
-            match ch {
-                '\\' => escape = true,
-                '"' => in_string = false,
-                _ => {}
-            }
+
+        // A GraphQL name: /[_A-Za-z][_0-9A-Za-z]*/.
+        let name_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i == name_start {
+            i += 1; // Not a name at all; resynchronize.
             continue;
         }
-        let top = brace == 0 && bracket == 0 && paren == 0;
-        match ch {
-            '"' => {
-                in_string = true;
-                ident.clear();
-            }
-            '{' => {
-                brace += 1;
-                ident.clear();
-            }
-            '}' => {
-                brace = brace.saturating_sub(1);
-                ident.clear();
-            }
-            '[' => {
-                bracket += 1;
-                ident.clear();
-            }
-            ']' => {
-                bracket = bracket.saturating_sub(1);
-                ident.clear();
-            }
-            '(' => {
-                paren += 1;
-                ident.clear();
-            }
-            ')' => {
-                paren = paren.saturating_sub(1);
-                ident.clear();
-            }
-            ':' if top => {
-                if ident == name {
-                    return true;
-                }
-                ident.clear();
-            }
-            c if c.is_alphanumeric() || c == '_' => {
-                if top {
-                    ident.push(c);
-                }
-            }
-            // Whitespace between the name and its colon is allowed; anything
-            // else ends the candidate.
-            c if c.is_whitespace() => {}
-            _ => ident.clear(),
+        let name_end = i;
+
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
         }
+        if i >= bytes.len() || bytes[i] != b':' {
+            continue; // Not an argument. The name was consumed, so this advances.
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        let value_start = i;
+        let value_end = value_end_at(bytes, value_start);
+        if value_end == value_start {
+            continue; // No value to take. The name was consumed, so this advances.
+        }
+        i = value_end;
+
+        args.push(TopLevelArg {
+            span: name_start..value_end,
+            name: params_str.get(name_start..name_end).unwrap_or_default(),
+            value: params_str.get(value_start..value_end).unwrap_or_default(),
+        });
     }
-    false
+
+    args
+}
+
+/// Where the single GraphQL value starting at `from` ends.
+///
+/// Objects and lists are followed to their matching close, counting both kinds
+/// together so a list of objects (or an object holding a list) ends in the right
+/// place. Everything else - a number, an enum, `$variable`, `true` - runs to the
+/// next separator.
+fn value_end_at(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    match bytes.get(i) {
+        Some(b'{') | Some(b'[') => {
+            let mut depth = 0usize;
+            let mut in_string = false;
+            let mut escape = false;
+            while i < bytes.len() {
+                let c = bytes[i];
+                i += 1;
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                if in_string {
+                    match c {
+                        b'\\' => escape = true,
+                        b'"' => in_string = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                match c {
+                    b'"' => in_string = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return i;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i
+        }
+        Some(b'"') => {
+            i += 1;
+            let mut escape = false;
+            while i < bytes.len() {
+                let c = bytes[i];
+                i += 1;
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                match c {
+                    b'\\' => escape = true,
+                    b'"' => return i,
+                    _ => {}
+                }
+            }
+            i
+        }
+        Some(_) => {
+            while i < bytes.len()
+                && !bytes[i].is_ascii_whitespace()
+                && !matches!(bytes[i], b',' | b')' | b'}' | b']')
+            {
+                i += 1;
+            }
+            i
+        }
+        None => i,
+    }
+}
+
+/// What a top-level `block:` argument is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockArgument {
+    /// `block: { number: N }` or `block: { hash: "0x…" }`: the query is pinned to
+    /// one past block. Hyperindex keeps current state, not per-block history, so
+    /// there is nothing to answer with.
+    PinnedToBlock,
+    /// `block: { number_gte: N }`: graph-node's freshness guard, "answer at a
+    /// block at least N", which clients send for read-after-write. The latest
+    /// block satisfies it whenever the indexer has reached N, so the argument is
+    /// dropped and the query is served as usual.
+    ///
+    /// The guarantee is therefore weaker than graph-node's: if the indexer is
+    /// *behind* N it answers from where it is rather than erroring, so a client
+    /// polling for its own write sees stale rows instead of a retryable error.
+    /// Checking the head before serving would need the chain's metadata on this
+    /// path, which it does not have today.
+    MinimumBlock,
+}
+
+/// Classify the top-level `block:` argument in `params_str`, if there is one.
+///
+/// Anything other than a `number_gte`-only object is treated as pinning: an
+/// unrecognized key could be a stricter constraint than it looks, and answering
+/// at the latest block would be indistinguishable from honouring it.
+fn classify_block_argument(params_str: &str) -> Option<(BlockArgument, std::ops::Range<usize>)> {
+    let arg = top_level_arguments(params_str)
+        .into_iter()
+        .find(|arg| arg.name == "block")?;
+
+    let inner = arg.value.trim();
+    let fields = inner
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .map(top_level_arguments)
+        .unwrap_or_default();
+
+    let minimum_only = !fields.is_empty() && fields.iter().all(|f| f.name == "number_gte");
+    let kind = if minimum_only {
+        BlockArgument::MinimumBlock
+    } else {
+        BlockArgument::PinnedToBlock
+    };
+    Some((kind, arg.span))
 }
 
 fn singularize_and_capitalize(s: &str) -> String {
@@ -3790,6 +3919,201 @@ mod tests {
             Err(ConversionError::BlockArgument(field)) => assert_eq!(field, "streams"),
             other => panic!("expected BlockArgument, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn block_argument_is_rejected_when_the_arguments_have_no_commas() {
+        init_test_schema_if_needed();
+        // Commas are insignificant in GraphQL, and leaving them out of a
+        // multi-line argument list is how prettier prints a query. The scanner
+        // this replaced accumulated identifier characters across the whitespace,
+        // so the candidate reaching the colon was "1block" and the guard never
+        // fired - the exact silent wrong-filter case it exists to stop.
+        for query in [
+            "query { streams(first: 1\n    block: { number: 100 }) { id } }",
+            "query { streams(first: 1 block: { number: 100 }) { id } }",
+            "query {\n  streams(\n    first: 1\n    block: { number: 100 }\n  ) { id }\n}",
+        ] {
+            let payload = create_test_payload(query);
+            match convert_subgraph_to_hyperindex(&payload, None) {
+                Err(ConversionError::BlockArgument(field)) => assert_eq!(field, "streams"),
+                other => panic!("expected BlockArgument for {query:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn block_argument_is_rejected_when_it_follows_a_variable() {
+        init_test_schema_if_needed();
+        // `$f` is not an identifier character, so the old scanner restarted on
+        // `f` and compared "fblock".
+        let payload = create_test_payload(
+            "query ($f: Int) { streams(first: $f\n    block: { number: 100 }) { id } }",
+        );
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::BlockArgument(field)) => assert_eq!(field, "streams"),
+            other => panic!("expected BlockArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_hash_is_rejected_like_block_number() {
+        init_test_schema_if_needed();
+        for query in [
+            "query { streams(block: { hash: \"0xabc\" }) { id } }",
+            // Mixed with a freshness guard it is still pinned to one block.
+            "query { streams(block: { number: 100, number_gte: 5 }) { id } }",
+            // An unrecognized key could be a stricter constraint than it looks.
+            "query { streams(block: { number_lte: 100 }) { id } }",
+            "query { streams(block: {}) { id } }",
+        ] {
+            let payload = create_test_payload(query);
+            match convert_subgraph_to_hyperindex(&payload, None) {
+                Err(ConversionError::BlockArgument(field)) => assert_eq!(field, "streams"),
+                other => panic!("expected BlockArgument for {query:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn block_number_gte_is_served_at_the_latest_block() {
+        init_test_schema_if_needed();
+        // `number_gte` is graph-node's "answer at a block at least N" freshness
+        // guard, which clients send for read-after-write - not time travel. The
+        // latest block satisfies it whenever the indexer has reached N, so the
+        // argument is dropped rather than the query rejected.
+        for query in [
+            "query { streams(first: 1, block: { number_gte: 100 }) { id } }",
+            "query { streams(block: { number_gte: 100 }, first: 1) { id } }",
+            "query { streams(first: 1\n    block: { number_gte: 100 }) { id } }",
+        ] {
+            let payload = create_test_payload(query);
+            let result = convert_subgraph_to_hyperindex(&payload, None)
+                .unwrap_or_else(|e| panic!("expected {query:?} to convert, got {e:?}"));
+            let converted = result.query["query"].as_str().unwrap();
+            assert!(converted.contains("Stream(limit: 1)"), "{converted}");
+            // The argument must not survive as a filter on a `block` column.
+            assert!(!converted.contains("block"), "{converted}");
+        }
+    }
+
+    #[test]
+    fn a_where_filter_on_a_block_field_is_left_alone() {
+        init_test_schema_if_needed();
+        // `where: {block: {...}}` is a filter on the entity's own `block` field,
+        // not time travel. `parse_single_param` hoists it to the same
+        // `block.number` key the time-travel argument produces, which is why the
+        // guard reads the raw argument text and why a dropped `number_gte` is
+        // excised by span rather than by key.
+        let payload =
+            create_test_payload("query { streams(where: { block: { number: 100 } }) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(
+            converted.contains("where: {block: {number: {_eq: 100}}}"),
+            "{converted}"
+        );
+
+        // Both at once: the guard goes, the filter stays.
+        let payload = create_test_payload(
+            "query { streams(block: { number_gte: 7 }\n  where: { block: { number: 100 } }) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(
+            converted.contains("where: {block: {number: {_eq: 100}}}"),
+            "{converted}"
+        );
+    }
+
+    #[test]
+    fn top_level_arguments_reads_one_value_at_a_time() {
+        // A value has to be consumed whole, or the scan resumes inside it and a
+        // later argument name is read out of a nested object.
+        let args = top_level_arguments(
+            "first: 10 where: { or: [{ a: [1, 2] }, { b: \"}, block: 1)\" }] } block: { number: 3 }",
+        );
+        let names: Vec<&str> = args.iter().map(|a| a.name).collect();
+        assert_eq!(names, vec!["first", "where", "block"]);
+        assert_eq!(args[0].value, "10");
+        assert_eq!(args[2].value, "{ number: 3 }");
+
+        // A string value can hold anything, including an unbalanced brace.
+        let args = top_level_arguments("id: \"a: {b\" block: { number: 1 }");
+        assert_eq!(
+            args.iter().map(|a| a.name).collect::<Vec<_>>(),
+            vec!["id", "block"]
+        );
+
+        // Escaped quotes do not end the string early.
+        let args = top_level_arguments("id: \"a\\\"b\" first: 2");
+        assert_eq!(
+            args.iter().map(|a| a.name).collect::<Vec<_>>(),
+            vec!["id", "first"]
+        );
+
+        // An unexpected token is skipped, not treated as the end of the list.
+        let args = top_level_arguments("@ 7 block: { number: 1 }");
+        assert_eq!(args.iter().map(|a| a.name).collect::<Vec<_>>(), vec!["block"]);
+
+        // A truncated value cannot loop forever.
+        assert_eq!(
+            top_level_arguments("block: { number: 1")
+                .iter()
+                .map(|a| a.name)
+                .collect::<Vec<_>>(),
+            vec!["block"]
+        );
+    }
+
+    #[test]
+    fn block_in_a_nested_object_is_not_a_top_level_argument() {
+        // The whole point of reading raw text: `block` nested inside another
+        // argument's value is not time travel.
+        assert_eq!(classify_block_argument("first: 1"), None);
+        assert_eq!(classify_block_argument("where: { block: { number: 1 } }"), None);
+        assert_eq!(
+            classify_block_argument("where: { block_gt: 1 } blocking: true"),
+            None
+        );
+        assert!(matches!(
+            classify_block_argument("block: { number: 1 }"),
+            Some((BlockArgument::PinnedToBlock, _))
+        ));
+        assert!(matches!(
+            classify_block_argument("block: { number_gte: 1 }"),
+            Some((BlockArgument::MinimumBlock, _))
+        ));
+    }
+
+    #[test]
+    fn entity_resolution_prefers_the_most_specific_spelling() {
+        // The four ranks the single pass collects, in order: exact plural, exact
+        // singular, then both case-insensitively. graph-node lowercases the whole
+        // leading run of capitals, so `ATokenBalanceHistoryItem` is queried as
+        // `atokenBalanceHistoryItems`.
+        init_test_schema_if_needed();
+        for (field, entity) in [
+            ("reserves", "Reserve"),
+            ("reserve", "Reserve"),
+            ("Reserves", "Reserve"),
+            ("RESERVE", "Reserve"),
+            ("atokenBalanceHistoryItems", "ATokenBalanceHistoryItem"),
+            ("atokenBalanceHistoryItem", "ATokenBalanceHistoryItem"),
+            ("emodeCategories", "EModeCategory"),
+            ("userTransactions", "UserTransaction"),
+        ] {
+            assert_eq!(
+                schema::resolve_entity_for_collection_field(field).as_deref(),
+                Some(entity),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            schema::resolve_entity_for_collection_field("widgets"),
+            None,
+            "an unknown field must fall through to the lexical fallback"
+        );
     }
 
     #[test]

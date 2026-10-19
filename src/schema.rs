@@ -288,47 +288,55 @@ pub fn nested_type_of(parent: &str, field: &str) -> Option<String> {
 /// on its lexical fallback.
 pub fn resolve_entity_for_collection_field(field_name: &str) -> Option<String> {
     let cache = SCHEMA_CACHE.clone();
-
-    // Ordered passes, most specific first. Each pass is total rather than
-    // first-hit: a pass that matches two entities is ambiguous, and picking one
-    // would depend on DashMap iteration order, so it resolves to nothing and
-    // leaves the caller on its lexical fallback.
-    let passes: [(bool, bool); 4] = [
-        // (plural, case_sensitive)
-        (true, true),
-        (false, true),
-        (true, false),
-        (false, false),
-    ];
     let needle = field_name.to_lowercase();
 
-    for (plural, case_sensitive) in passes {
-        let mut hit: Option<String> = None;
-        for entry in cache.iter() {
-            let entity = entry.key();
-            let matches = graph_node_singulars(entity).into_iter().any(|singular| {
-                let candidate = if plural { pluralize(&singular) } else { singular };
-                if case_sensitive {
-                    candidate == field_name
-                } else {
-                    candidate.to_lowercase() == needle
-                }
-            });
-            if !matches {
+    // Ranked matches, most specific first: exact plural, exact singular, then the
+    // same two case-insensitively. Collected in one pass rather than one pass per
+    // rank, because this runs for every root field of every request and each pass
+    // re-derives and re-allocates every entity's spellings.
+    //
+    // Each rank is still resolved totally rather than first-hit: a rank that
+    // matches two entities is ambiguous, and picking one would depend on DashMap
+    // iteration order, so it resolves to nothing and falls through to the next
+    // rank - and ultimately to the caller's lexical fallback.
+    const RANKS: usize = 4;
+    let mut hits: [Option<String>; RANKS] = Default::default();
+    let mut ambiguous = [false; RANKS];
+
+    for entry in cache.iter() {
+        let entity = entry.key();
+        let mut matched = [false; RANKS];
+        for singular in graph_node_singulars(entity) {
+            let plural = pluralize(&singular);
+            // `||` short-circuits, so the lowercasing is skipped once a rank has
+            // already matched on another spelling.
+            matched[0] = matched[0] || plural == field_name;
+            matched[1] = matched[1] || singular == field_name;
+            matched[2] = matched[2] || plural.to_lowercase() == needle;
+            matched[3] = matched[3] || singular.to_lowercase() == needle;
+        }
+        for rank in 0..RANKS {
+            if !matched[rank] {
                 continue;
             }
-            if hit.is_some() {
-                tracing::debug!(
-                    field = field_name,
-                    "Root field is ambiguous across entities; leaving it to the lexical fallback"
-                );
-                hit = None;
-                break;
+            if hits[rank].is_some() {
+                ambiguous[rank] = true;
+            } else {
+                hits[rank] = Some(entity.clone());
             }
-            hit = Some(entity.clone());
         }
-        if hit.is_some() {
-            return hit;
+    }
+
+    for rank in 0..RANKS {
+        if ambiguous[rank] {
+            tracing::debug!(
+                field = field_name,
+                "Root field is ambiguous across entities; leaving it to the lexical fallback"
+            );
+            continue;
+        }
+        if let Some(hit) = hits[rank].take() {
+            return Some(hit);
         }
     }
     None
