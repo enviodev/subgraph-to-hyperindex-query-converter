@@ -1450,13 +1450,43 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
             let params_start = current_pos + 1;
             let mut paren_count = 1; // We're already inside the first parenthesis
 
+            // Walk to the matching `)`, ignoring parentheses inside string
+            // literals and `#` comments. A `)` in either closed the argument
+            // list early, and the rest of the query then parsed as stray text:
+            // `streams(first: 1 # note )` collapsed to an empty operation,
+            // which is a 200 with no rows rather than an error.
+            let mut in_string = false;
+            let mut escape = false;
+            let mut in_comment = false;
             while current_pos < query_chars.len() {
                 current_pos += 1;
                 if current_pos >= query_chars.len() {
                     break;
                 }
+                let ch = query_chars[current_pos];
 
-                match query_chars[current_pos] {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                if in_string {
+                    match ch {
+                        '\\' => escape = true,
+                        '"' => in_string = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                if in_comment {
+                    if ch == '\n' || ch == '\r' {
+                        in_comment = false;
+                    }
+                    continue;
+                }
+
+                match ch {
+                    '"' => in_string = true,
+                    '#' => in_comment = true,
                     '(' => paren_count += 1,
                     ')' => {
                         paren_count -= 1;
@@ -1472,9 +1502,9 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
                 break;
             }
 
-            let mut params_str = query_chars[params_start..current_pos]
-                .iter()
-                .collect::<String>();
+            let mut params_str = strip_line_comments(
+                &query_chars[params_start..current_pos].iter().collect::<String>(),
+            );
 
             // Classify from the raw argument text, before `parse_graphql_params`
             // flattens `block: {number: N}` into a `block.number` key that is
@@ -2884,6 +2914,57 @@ fn parse_single_param(
 
 // Removed unused brace matching helper
 
+/// Strip `#` comments out of an argument list, keeping the line breaks.
+///
+/// GraphQL allows a comment anywhere whitespace is allowed, including between
+/// arguments, and it runs to the end of the line. The converter re-emits
+/// arguments on a single line, so a comment left in place comments out
+/// everything after it - the remaining arguments and the closing paren
+/// included. It also makes `block:` appear in a note look like a real
+/// time-travel argument. A `#` inside a string literal is not a comment.
+fn strip_line_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    let mut in_string = false;
+    let mut escape = false;
+
+    while let Some(ch) = chars.next() {
+        if escape {
+            out.push(ch);
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            out.push(ch);
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
+            '#' => {
+                // Keep the line break. Commas are optional in GraphQL, so it can
+                // be the only thing separating this argument from the next.
+                for cc in chars.by_ref() {
+                    if cc == '\n' || cc == '\r' {
+                        out.push(cc);
+                        break;
+                    }
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    out
+}
+
 /// One top-level `name: value` pair from an argument list, as raw text.
 struct TopLevelArg<'a> {
     /// Byte range of the whole pair, for excising it from the argument text.
@@ -3919,6 +4000,73 @@ mod tests {
             Err(ConversionError::BlockArgument(field)) => assert_eq!(field, "streams"),
             other => panic!("expected BlockArgument, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn comments_in_a_root_argument_list_are_stripped() {
+        init_test_schema_if_needed();
+        // A comment runs to the end of the line, and the arguments are re-emitted
+        // on one line, so a comment left in place commented out the rest of them
+        // and the closing paren with it. A `)` inside one was worse: it closed the
+        // argument list early and the whole operation came out empty - a 200 with
+        // no rows rather than an error.
+        for query in [
+            "{\n  streams(\n    first: 1   # a plain note\n  ) { id }\n}",
+            "{\n  streams(first: 1 # trailing ) note\n  ) { id }\n}",
+            "{\n  streams(\n    first: 1   # note with ( and \" inside\n    skip: 2\n  ) { id }\n}",
+        ] {
+            let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None)
+                .unwrap_or_else(|e| panic!("expected {query:?} to convert, got {e:?}"));
+            let converted = result.query["query"].as_str().unwrap();
+            assert!(converted.contains("Stream(limit: 1"), "{converted}");
+            assert!(converted.contains("id"), "selection set lost: {converted}");
+            assert!(!converted.contains('#'), "comment survived: {converted}");
+        }
+    }
+
+    #[test]
+    fn a_block_argument_mentioned_in_a_comment_is_not_time_travel() {
+        init_test_schema_if_needed();
+        // The guard reads the raw argument text, so without comment stripping a
+        // note mentioning `block:` got a valid query rejected.
+        let query = "{\n  streams(\n    first: 1   # block: 5 is the cutoff\n  ) { id }\n}";
+        let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("Stream(limit: 1)"), "{converted}");
+    }
+
+    #[test]
+    fn a_paren_or_hash_inside_a_string_argument_is_not_syntax() {
+        init_test_schema_if_needed();
+        // Neither ends the argument list: one used to close it early, the other
+        // would start a comment that swallowed the rest.
+        let result = convert_subgraph_to_hyperindex(
+            &create_test_payload("{ streams(where: { name: \"a)b#c\" }) { id } }"),
+            None,
+        )
+        .unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(
+            converted.contains("where: {name: {_eq: \"a)b#c\"}}"),
+            "{converted}"
+        );
+    }
+
+    #[test]
+    fn strip_line_comments_keeps_strings_and_separators() {
+        assert_eq!(
+            strip_line_comments("first: 1 # note\n  skip: 2"),
+            "first: 1 \n  skip: 2"
+        );
+        assert_eq!(strip_line_comments("name: \"a#b\""), "name: \"a#b\"");
+        // An escaped quote does not end the string, so the `#` after it is still
+        // inside one.
+        assert_eq!(
+            strip_line_comments("name: \"a\\\"#b\""),
+            "name: \"a\\\"#b\""
+        );
+        // A comment with no trailing newline runs to the end.
+        assert_eq!(strip_line_comments("first: 1 # the end"), "first: 1 ");
     }
 
     #[test]
