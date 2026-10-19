@@ -32,7 +32,7 @@ Teams migrating from The Graph to HyperIndex who want to keep their existing fro
 | Endpoint | Description |
 |---|---|
 | `POST /` | Convert and forward to HyperIndex (no chain filter) |
-| `POST /chainId/{id}` | Convert and forward, auto-adds `chainId` filter |
+| `POST /chainId/{id}` | Convert and forward, auto-adds `chainId` filter (also to a `where: $var` value, and to single-entity lookups) |
 | `POST /debug` | Return converted query without forwarding |
 | `GET /metrics` | Prometheus metrics |
 
@@ -136,6 +136,8 @@ query {
 
 The plain string forms are case-sensitive, as in graph-node; only `_nocase` ignores case. Patterns are built exactly as graph-node builds them: `%` and `_` in a value are not escaped, so they act as wildcards, and `_contains` leaves a value that already starts or ends with `%` as it is.
 
+A string filter given a variable (`name_contains: $q`) reads a pattern variable, `$q__contains`, whose value is built from `$q`'s at request time; `$q` is dropped if nothing else uses it. Several conditions on one field (`amount_gt` and `amount_lt`) are all kept, inline or in a `where` variable, and each `_not_*` filter negates only its own condition.
+
 Filters, `first`/`skip` and `orderBy`/`orderDirection` are converted the same way on nested collections (`user { swaps(first: 10, orderBy: timestamp, orderDirection: desc) { id } }`) as on root fields. Arguments may be separated by commas or by whitespace alone.
 
 See the full filter table and known limitations in the source code.
@@ -173,7 +175,7 @@ graph-node orders rows that tie on the sort key by `id`, in the same direction (
 
 Set `CONVERTER_ORDER_ID_TIEBREAK=off` to emit the sort key alone, for example if the extra sort column is slow on a very large table.
 
-A collection with no `orderBy` is sorted by `id` ascending, and one with no `first` returns 100 rows, as graph-node does (a lone `orderDirection` is ignored, as there). This applies to root collections and to nested lists alike, so paging with `skip` and no `orderBy` is repeatable. Set `CONVERTER_DEFAULT_ORDER_ID=off` to leave such queries unordered, for example if sorting by `id` pushes the planner onto the primary key for a selective filter, and `CONVERTER_DEFAULT_FIRST` to change or remove (`off`) the page size.
+A collection with no `orderBy` is sorted by `id` ascending, and one with no `first` returns 100 rows, as graph-node does (a lone `orderDirection` is ignored, as there). This applies to root collections and to nested lists alike, so paging with `skip` and no `orderBy` is repeatable. Set `CONVERTER_DEFAULT_ORDER_ID=off` to leave such queries unordered, for example if sorting by `id` pushes the planner onto the primary key for a selective filter, and `CONVERTER_DEFAULT_FIRST` to change or remove (`off`) the page size. The same defaults apply when a `$first` or `$orderBy` variable is sent as null; a `$first` left out gets 100 too unless it is declared non-null or with a default.
 
 One thing this does not do:
 
