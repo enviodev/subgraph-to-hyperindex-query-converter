@@ -53,7 +53,7 @@ async fn main() {
     // Initialize schema on startup (schema doesn't change once deployed, so we only fetch once)
     if let Err(e) = schema::initialize_schema().await {
         metrics::SCHEMA_REFRESH_ERRORS.inc();
-        tracing::warn!("Failed to initialize schema: {}. Will retry on first request.", e);
+        tracing::warn!("Failed to initialize schema: {}. Will retry on first request.", redact_upstream_url(&e));
     }
 
     let port = std::env::var("PORT")
@@ -78,13 +78,13 @@ async fn execute_query_with_retry(
 
     // Ensure schema is initialized (lazy initialization)
     if let Err(e) = schema::ensure_schema_initialized().await {
-        tracing::error!("Failed to ensure schema is initialized: {}", e);
+        tracing::error!("Failed to ensure schema is initialized: {}", redact_upstream_url(&e));
         metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": "Schema initialization failed",
-                "details": client_safe_upstream_error(&e)
+                "details": redact_upstream_url(&e)
             })),
         );
     }
@@ -189,14 +189,14 @@ async fn execute_query_with_retry(
             metrics::QUERY_RESPONSE_WAIT_DURATION.observe(query_start.elapsed().as_secs_f64() * 1000.0);
             metrics::QUERY_EXECUTION_ERRORS.inc();
             metrics::TOTAL_ERRORS.inc();
-            tracing::error!("Hyperindex request error: {}", e);
-            let details = client_safe_upstream_error(&e);
+            let details = redact_upstream_url(&e);
+            tracing::error!("Hyperindex request error: {}", details);
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
             tracing::error!(
                 original_query = original_query,
                 converted_query = converted_query_str,
                 hyperindex_url = %loggable_upstream(&hyperindex_url),
-                error = %e,
+                error = %details,
                 "Error forwarding converted query to Hyperindex"
             );
             metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
@@ -284,12 +284,12 @@ async fn handle_debug(Json(payload): Json<Value>) -> impl IntoResponse {
 
     // Ensure schema is initialized (lazy initialization)
     if let Err(e) = schema::ensure_schema_initialized().await {
-        tracing::error!("Failed to ensure schema is initialized: {}", e);
+        tracing::error!("Failed to ensure schema is initialized: {}", redact_upstream_url(&e));
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": "Schema initialization failed",
-                "details": client_safe_upstream_error(&e)
+                "details": redact_upstream_url(&e)
             })),
         );
     }
@@ -346,12 +346,12 @@ async fn handle_chain_debug(
 
     // Ensure schema is initialized (lazy initialization)
     if let Err(e) = schema::ensure_schema_initialized().await {
-        tracing::error!("Failed to ensure schema is initialized: {}", e);
+        tracing::error!("Failed to ensure schema is initialized: {}", redact_upstream_url(&e));
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": "Schema initialization failed",
-                "details": client_safe_upstream_error(&e)
+                "details": redact_upstream_url(&e)
             })),
         );
     }
@@ -449,13 +449,18 @@ fn loggable_upstream(url: &str) -> String {
     }
 }
 
-/// An upstream failure, with the upstream address stripped out, for the caller.
+/// An upstream failure with the request URL stripped out.
 ///
-/// `reqwest::Error`'s `Display` embeds the request URL - "error sending request
-/// for url (http://internal-host:8080/v1/graphql)" - so returning it verbatim
-/// put an internal cluster address in a response body. The full error still goes
-/// to the logs.
-fn client_safe_upstream_error(e: &impl std::fmt::Display) -> String {
+/// `reqwest::Error`'s `Display` embeds the URL it was given - "error sending
+/// request for url (http://internal-host:8080/v1/graphql?key=…)" - so it reaches
+/// both response bodies and logs. `HYPERINDEX_URL` is operator-supplied and can
+/// carry credentials in its userinfo or query string, so neither destination
+/// should see it; `loggable_upstream` reports a sanitized address instead.
+///
+/// `reqwest::Error::without_url` would be the direct route, but the error is
+/// boxed as `Box<dyn Error>` before it reaches here, so the text is redacted
+/// instead.
+fn redact_upstream_url(e: &impl std::fmt::Display) -> String {
     let text = e.to_string();
     match (text.find("for url ("), text.rfind(')')) {
         (Some(start), Some(end)) if end > start => {
@@ -646,7 +651,7 @@ async fn refresh_schema_endpoint() -> impl IntoResponse {
         Err(e) => {
             let err_msg = e.to_string();
             metrics::SCHEMA_REFRESH_ERRORS.inc();
-            tracing::error!("Failed to refresh schema: {}", e);
+            tracing::error!("Failed to refresh schema: {}", redact_upstream_url(&e));
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
@@ -741,6 +746,42 @@ async fn maybe_fetch_subgraph_debug(payload: Value) -> Option<Value> {
 
 #[cfg(test)]
 mod response_shape_tests {
+
+    /// An operator-supplied `HYPERINDEX_URL` can carry credentials, and
+    /// `reqwest::Error`'s `Display` repeats it verbatim.
+    #[test]
+    fn upstream_errors_do_not_carry_the_request_url() {
+        let raw = "error sending request for url (http://user:pass@internal-host:8080/v1/graphql?api_key=secret)";
+        let redacted = super::redact_upstream_url(&raw);
+        assert!(!redacted.contains("internal-host"), "{redacted}");
+        assert!(!redacted.contains("secret"), "{redacted}");
+        assert!(!redacted.contains("user:pass"), "{redacted}");
+        assert!(redacted.contains("error sending request"), "{redacted}");
+    }
+
+    #[test]
+    fn an_error_without_a_url_is_left_alone() {
+        let raw = "operation timed out";
+        assert_eq!(super::redact_upstream_url(&raw), "operation timed out");
+    }
+
+    #[test]
+    fn the_logged_upstream_address_keeps_the_path_but_drops_secrets() {
+        let logged = super::loggable_upstream("http://user:pass@host:8080/v1/graphql?api_key=secret");
+        assert!(logged.contains("host:8080"), "{logged}");
+        assert!(logged.contains("/v1/graphql"), "{logged}");
+        assert!(!logged.contains("secret"), "{logged}");
+        assert!(!logged.contains("user"), "{logged}");
+        assert!(!logged.contains("pass"), "{logged}");
+    }
+
+    #[test]
+    fn an_unparseable_upstream_address_is_not_echoed() {
+        assert_eq!(
+            super::loggable_upstream("not a url"),
+            "<unparseable HYPERINDEX_URL>"
+        );
+    }
     use super::*;
     use serde_json::json;
 
