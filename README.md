@@ -24,7 +24,8 @@ Teams migrating from The Graph to HyperIndex who want to keep their existing fro
 - **Chain-specific endpoint**: Automatically adds `chainId` filters via `/chainId/{chain_id}`
 - **Debug endpoint**: Inspect converted queries without forwarding (`/debug`)
 - **Prometheus metrics**: Request latency, error rates, conversion timing
-- **Filter mapping**: Translates all common subgraph filter operators (`_gt`, `_in`, `_contains`, etc.) to Hasura equivalents
+- **Filter mapping**: Translates all common subgraph filter operators (`_gt`, `_in`, `_contains`, `and`/`or`, etc.) to Hasura equivalents, on root and nested collections
+- **graph-node semantics**: Default page size and order, aliases, `operationName`, `_meta` block number and timestamp, `block: { number_gte }`
 
 ## API Endpoints
 
@@ -66,6 +67,10 @@ PORT=3000
 HTTP_TIMEOUT_SECS=30
 # Set to off/false/0 to stop appending `id` to every `orderBy` (see "Ordering")
 CONVERTER_ORDER_ID_TIEBREAK=on
+# Page size for collections without `first` (graph-node's default); off/0 for unlimited
+CONVERTER_DEFAULT_FIRST=100
+# Set to off/false/0 to stop sorting collections without `orderBy` by `id` (see "Ordering")
+CONVERTER_DEFAULT_ORDER_ID=on
 ```
 
 ### Run with Docker
@@ -91,7 +96,7 @@ query {
 **HyperIndex output (at `/`):**
 ```graphql
 query {
-  Stream(limit: 2, offset: 10) {
+  Stream(limit: 2, offset: 10, order_by: {id: asc}) {
     category
     cliff
     chainId
@@ -102,7 +107,7 @@ query {
 **HyperIndex output (at `/chainId/1`):**
 ```graphql
 query {
-  Stream(limit: 2, offset: 10, where: { chainId: { _eq: "1" } }) {
+  Stream(limit: 2, offset: 10, order_by: {id: asc}, where: { chainId: { _eq: "1" } }) {
     category
     cliff
     chainId
@@ -122,9 +127,16 @@ query {
 | `field_lte: val` | `field: { _lte: val }` |
 | `field_in: [...]` | `field: { _in: [...] }` |
 | `field_not_in: [...]` | `field: { _nin: [...] }` |
-| `field_contains: val` | `field: { _ilike: "%val%" }` |
-| `field_starts_with: val` | `field: { _ilike: "val%" }` |
-| `field_ends_with: val` | `field: { _ilike: "%val" }` |
+| `field_contains: val` | `field: { _like: "%val%" }` |
+| `field_starts_with: val` | `field: { _like: "val%" }` |
+| `field_ends_with: val` | `field: { _like: "%val" }` |
+| `field_contains_nocase: val` (and the other `_nocase` forms) | `field: { _ilike: "%val%" }` |
+| `field_not_contains: val` (and the other `_not_` forms) | `_not: { field: { _like: "%val%" } }` |
+| `and: [{...}, {...}]` / `or: [...]` | `_and: [...]` / `_or: [...]` |
+
+The plain string forms are case-sensitive, as in graph-node; only `_nocase` ignores case. Patterns are built exactly as graph-node builds them: `%` and `_` in a value are not escaped, so they act as wildcards, and `_contains` leaves a value that already starts or ends with `%` as it is.
+
+Filters, `first`/`skip` and `orderBy`/`orderDirection` are converted the same way on nested collections (`user { swaps(first: 10, orderBy: timestamp, orderDirection: desc) { id } }`) as on root fields. Arguments may be separated by commas or by whitespace alone.
 
 See the full filter table and known limitations in the source code.
 
@@ -141,23 +153,38 @@ The converter now handles this itself, with no per-interface configuration:
 
 A fragment is left untouched, as before, when the surrounding type is unknown, no field links to the fragment's type, or several do. A warning is logged. When a row matches a fragment and `__typename` is selected, it reports the implementing type (`Supply`), as the subgraph does; a row that matches no requested fragment keeps the entity's own name. Fragments on an interface a type *implements* (`supplies { ... on UserTransaction { id } }`) are not resolved, because the schema carries no interface information.
 
+## `_meta`
+
+`_meta { block { number timestamp } }` is answered from Hyperindex's indexing progress: Hasura's `_meta.progressBlock` and `progressBlockTime` (as unix seconds), or `chain_metadata.latest_processed_block` on indexers that predate Hasura's `_meta` (those cannot serve `timestamp`). `__typename` is answered locally. On `/chainId/{id}` the progress of that chain is reported; otherwise the lowest chain's, the block every chain has reached.
+
+`_meta` can be aliased and combined with entity root fields in one operation.
+
+`deployment`, `block.hash` and `hasIndexingErrors` have no Hyperindex source, so a selection containing any of them is rejected whole rather than answered partially: a response missing `hasIndexingErrors` would read as "no indexing errors".
+
+## Block constraints
+
+`block: { number_gte: N }` (on any root field, or on `_meta`) is answered from the latest state once every chain has indexed block N, and with graph-node's "only indexed up to block" error before then. Literal, `$n` and `$block: Block_height` forms work.
+
+`block: { number: N }` and `block: { hash: ... }` ask for the state at a past block. Hyperindex does not keep historical state, so these are rejected rather than answered from the latest state. `subgraphError` is accepted and ignored: a Hyperindex indexer stops on a handler error, so there is no failed-but-serving state to choose.
+
 ## Ordering
 
 graph-node orders rows that tie on the sort key by `id`, in the same direction (`ORDER BY timestamp DESC, id DESC`). Hasura leaves ties unordered, so with `first`/`skip` a page boundary inside a run of equal keys could repeat or skip rows. Every explicit `orderBy` now also sorts by `id` in the same direction (`order_by: [{timestamp: desc}, {id: desc}]`), for both literal and variable `orderBy`. Sorting by `id` itself adds nothing. This gives a total, repeatable order, so paging is consistent.
 
 Set `CONVERTER_ORDER_ID_TIEBREAK=off` to emit the sort key alone, for example if the extra sort column is slow on a very large table.
 
-Two things this does not do:
+A collection with no `orderBy` is sorted by `id` ascending, and one with no `first` returns 100 rows, as graph-node does (a lone `orderDirection` is ignored, as there). This applies to root collections and to nested lists alike, so paging with `skip` and no `orderBy` is repeatable. Set `CONVERTER_DEFAULT_ORDER_ID=off` to leave such queries unordered, for example if sorting by `id` pushes the planner onto the primary key for a selective filter, and `CONVERTER_DEFAULT_FIRST` to change or remove (`off`) the page size.
 
-- A query with no `orderBy` is still unordered. graph-node defaults to `id` ascending, but forcing that here could push the planner onto the primary key for selective filters.
+One thing this does not do:
+
 - Ties follow the database's string collation. graph-node compares `id` bytewise (C collation), while Postgres usually uses a locale collation that ignores punctuation, so ids that differ only around a `:` boundary (`1:` versus `15:`) can order differently inside a single block. The order is still stable and repeatable. It just may not match the subgraph's within-block order exactly.
 
 ## Known Limitations
 
-- Uses string parsing rather than a full GraphQL parser. Selection sets have their `(...)` argument lists stripped, so a directive on a fragment loses its arguments (`@include(if: $x)` becomes `@include`)
-- `orderBy` and `orderDirection` with variables are not supported (Hasura limitation)
-- Block/time-travel queries are not supported
-- `_meta` queries only return latest block number
+- Uses string parsing rather than a full GraphQL parser
+- Historical (time-travel) queries, `block: { number }` and `block: { hash }`, are rejected; see "Block constraints"
+- `_meta` cannot serve `deployment`, `block.hash` or `hasIndexingErrors`
+- `first` above 1000 and `skip` above 5000 are passed through, where graph-node would reject them
 - Default limit should not exceed 1000 unless HyperIndex is configured for higher limits
 
 ## Documentation
