@@ -7075,10 +7075,10 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(
-            query.contains("Swap(where: {_and: [{_and: [{fee: {_gt: 1}}, {fee: {_lt: 5}}]}, {trader: {_eq: \"0xa\"}}]})"),
-            "{query}"
-        );
+        // Two conditions on one field come out in either order.
+        let gt_first = "Swap(where: {_and: [{_and: [{fee: {_gt: 1}}, {fee: {_lt: 5}}]}, {trader: {_eq: \"0xa\"}}]})";
+        let lt_first = "Swap(where: {_and: [{_and: [{fee: {_lt: 5}}, {fee: {_gt: 1}}]}, {trader: {_eq: \"0xa\"}}]})";
+        assert!(query.contains(gt_first) || query.contains(lt_first), "{query}");
     }
 
     #[test]
