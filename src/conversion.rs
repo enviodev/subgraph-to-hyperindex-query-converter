@@ -166,7 +166,9 @@ pub fn convert_subgraph_to_hyperindex(
         like_variables,
         chain_filter_variables,
         single_row_keys,
+        limit_variables,
     } = convert_query_structure(query, chain_id)?;
+    let defaults = graph_node_defaults();
 
     // Variables are read before any are dropped from the forwarded payload: a
     // `$n` that only fed `number_gte` has no place left in the query.
@@ -188,7 +190,9 @@ pub fn convert_subgraph_to_hyperindex(
         .get("variables")
         .cloned()
         .or_else(|| {
-            (!like_variables.is_empty() || !chain_filter_variables.is_empty())
+            (!like_variables.is_empty()
+                || !chain_filter_variables.is_empty()
+                || !limit_variables.is_empty())
                 .then(|| serde_json::json!({}))
         });
     if let Some(mut variables) = variables {
@@ -204,6 +208,19 @@ pub fn convert_subgraph_to_hyperindex(
                         let translated = translate_subgraph_filter_value(&v, entity_name);
                         map.insert(var_name.clone(), translated);
                     }
+                }
+            }
+        }
+        // graph-node reads `first: null` as its default page; Hasura as no limit.
+        if let (Value::Object(map), Some(first)) = (&mut variables, defaults.first) {
+            for var in &limit_variables {
+                let value = match map.get(&var.name) {
+                    Some(value) => Some(value),
+                    None if var.non_null => continue,
+                    None => var.default.as_ref(),
+                };
+                if value.map_or(true, Value::is_null) {
+                    map.insert(var.name.clone(), Value::from(first));
                 }
             }
         }
@@ -227,9 +244,16 @@ pub fn convert_subgraph_to_hyperindex(
                     };
                     let field = match field.filter(|f| !f.trim().is_empty()) {
                         Some(f) => f,
-                        // Nothing to order by. Leave the variable unset so Hasura
-                        // receives null and simply doesn't order, rather than
-                        // failing the request outright.
+                        // Nothing to order by: graph-node's default `id` order,
+                        // whatever the direction says. With that default off,
+                        // the variable is left unset and Hasura doesn't order.
+                        None if defaults.order_by_id => {
+                            map.insert(
+                                spec.target_var.clone(),
+                                Value::Array(vec![order_by_json("id", "asc")]),
+                            );
+                            continue;
+                        }
                         None => continue,
                     };
                     let direction = match &spec.direction_source {
@@ -560,6 +584,20 @@ struct MainConversion {
     chain_filter_variables: HashMap<String, String>,
     /// Response keys of lookups read as one-row lists; see `ConversionResult`.
     single_row_keys: Vec<String>,
+    /// `first: $var` variables to give graph-node's page size when null.
+    limit_variables: Vec<LimitVariable>,
+}
+
+/// A `first: $var` variable, which gets graph-node's default page size when the
+/// request leaves it null (Hasura would return every row).
+#[derive(Debug, Clone)]
+struct LimitVariable {
+    name: String,
+    /// The declared default, which Hasura applies itself when the variable is
+    /// left out.
+    default: Option<Value>,
+    /// A non-null variable left out is the client's error, as in graph-node.
+    non_null: bool,
 }
 
 fn convert_query_structure(
@@ -594,6 +632,7 @@ fn convert_query_structure(
         like_variables: main.like_variables,
         chain_filter_variables: main.chain_filter_variables,
         single_row_keys: main.single_row_keys,
+        limit_variables: main.limit_variables,
     })
 }
 
@@ -1106,6 +1145,19 @@ fn convert_main_query(
         .collect();
     let mut dropped_variables: Vec<String> = removals.iter().cloned().collect();
     dropped_variables.sort();
+    let mut limit_variables: Vec<LimitVariable> = ctx
+        .limit_variables
+        .iter()
+        .filter_map(|name| {
+            let declared = ctx.header_var_types.get(name)?;
+            Some(LimitVariable {
+                name: name.clone(),
+                default: declared_default(declared),
+                non_null: declared.split('=').next().unwrap_or_default().trim().ends_with('!'),
+            })
+        })
+        .collect();
+    limit_variables.sort_by(|a, b| a.name.cmp(&b.name));
 
     // Reconstruct the query with preserved header (including variable definitions)
     // Convert ID and Bytes types to String in variable definitions
@@ -1149,6 +1201,7 @@ fn convert_main_query(
         like_variables,
         chain_filter_variables: ctx.chain_filter_variables,
         single_row_keys,
+        limit_variables,
     })
 }
 
@@ -1276,6 +1329,9 @@ struct ArgContext {
     /// `where: $var` variables on the `/chainId/{id}` route, by that chain id. The
     /// chain condition is added to their value at request time.
     chain_filter_variables: HashMap<String, String>,
+    /// `first: $var` variables, which get graph-node's page size when the request
+    /// leaves them null.
+    limit_variables: HashSet<String>,
     /// Unconditional header retypes, for order arguments and pattern variables.
     /// A name the client never declared gets a declaration of its own. Kept
     /// separate from `variable_type_overrides`, which only ever replaces a
@@ -1390,6 +1446,12 @@ fn convert_collection_args(
     let defaults = ctx.defaults;
     // `first: null` is graph-node's default page too.
     let limit = limit.filter(|l| l.trim() != "null");
+    if let (Some(var), Some(_)) = (
+        limit.as_deref().and_then(|l| l.trim().strip_prefix('$')),
+        defaults.first,
+    ) {
+        ctx.limit_variables.insert(var.to_string());
+    }
     let limit = limit.or_else(|| defaults.first.map(|n| n.to_string()));
     let order_arg = order_arg.or_else(|| {
         defaults
@@ -6447,14 +6509,14 @@ mod tests {
 
     #[test]
     fn order_by_variable_missing_value_is_safe() {
-        // No `ob` key in the payload: leave the variable unset so Hasura simply
-        // doesn't order, rather than failing the request.
+        // No `ob` key in the payload: graph-node's default `id` order rather
+        // than failing the request, or leaving the rows unordered.
         let payload = argus_payload(
             "query Q($ob: Launch_orderBy!) { launches(orderBy: $ob) { id } }",
             json!({}),
         );
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        assert!(result.query["variables"].get("ob").is_none());
+        assert_eq!(result.query["variables"]["ob"], json!([{"id": "asc"}]));
     }
 
     #[test]
@@ -8124,6 +8186,47 @@ mod tests {
         let query = result.query["query"].as_str().unwrap();
         assert!(query.contains("Token_by_pk(id: \"0xa\")"), "{query}");
         assert!(result.single_row_keys.is_empty());
+    }
+
+
+    #[test]
+    fn null_order_by_variable_gets_the_default_order() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($ob: Swap_orderBy, $dir: OrderDirection) { swaps(orderBy: $ob, orderDirection: $dir) { id } }",
+            "variables": {"ob": null, "dir": "desc"}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        // A lone direction is ignored, as in graph-node.
+        assert_eq!(result.query["variables"]["ob"], json!([{"id": "asc"}]));
+    }
+
+    #[test]
+    fn null_first_variable_gets_the_default_page() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($first: Int, $n: Int) { swaps(first: $first) { id } swapUsers { swap(first: $n) { id } } }",
+            "variables": {"first": null}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("Swap(limit: $first"), "{query}");
+        assert!(query.contains("swap(limit: $n"), "{query}");
+        // Explicit null and left out both mean graph-node's 100.
+        assert_eq!(result.query["variables"], json!({"first": 100, "n": 100}));
+    }
+
+    #[test]
+    fn first_variable_with_a_value_or_a_declared_default_is_kept() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($first: Int, $d: Int = 7, $req: Int!) { a: swaps(first: $first) { id } b: swaps(first: $d) { id } c: swaps(first: $req) { id } }",
+            "variables": {"first": 5}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        // `$d` is left to Hasura, which applies its default; a missing `$req` is
+        // the client's error to see.
+        assert_eq!(result.query["variables"], json!({"first": 5}));
     }
 
 }
