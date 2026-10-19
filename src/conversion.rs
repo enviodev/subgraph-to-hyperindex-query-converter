@@ -2409,8 +2409,11 @@ fn process_nested_filters_recursive(
         .and_then(|info| info.nested_type_name)
         .unwrap_or_else(|| parent.to_string());
 
-    // Group child filters by field name to handle duplicates
-    let mut grouped_child_filters: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    // Group child filters by field name to handle duplicates, in a fixed order.
+    let mut child_filters: Vec<(String, String)> = child_filters.into_iter().collect();
+    child_filters.sort();
+    let mut grouped_child_filters: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
     for (child_key, child_value) in child_filters {
         let field_name = if child_key.contains('_') {
             if let Some(underscore_idx) = child_key.find('_') {
@@ -2446,6 +2449,7 @@ fn process_nested_filters_recursive(
         }
     }
 
+    let mut child_conditions = move_repeated_keys(child_conditions, &mut child_and_conditions);
     if !child_and_conditions.is_empty() {
         child_conditions.push(format!("_and: [{}]", child_and_conditions.join(", ")));
     }
@@ -2491,6 +2495,9 @@ fn convert_filters_to_where_clause(
     let mut grouped_filters: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut basic_filters: HashMap<String, Vec<(String, String)>> = HashMap::new();
 
+    // Sorted, so conditions on one field come out in the same order every time.
+    let mut flat_filters: Vec<(String, String)> = flat_filters.into_iter().collect();
+    flat_filters.sort();
     for (key, value) in flat_filters {
         if key.contains('.') {
             // This is a nested filter (e.g., "user.name_starts_with")
@@ -2599,6 +2606,7 @@ fn convert_filters_to_where_clause(
         }
     }
 
+    let mut where_conditions = move_repeated_keys(where_conditions, &mut and_conditions);
     if !and_conditions.is_empty() {
         where_conditions.push(format!("_and: [{}]", and_conditions.join(", ")));
     }
@@ -2614,6 +2622,23 @@ fn convert_filters_to_where_clause(
         where_clause: format!("where: {{{}}}", where_conditions.join(", ")),
         variable_type_overrides,
     })
+}
+
+/// Keep the first condition for each key and move any repeat into `_and`. A
+/// GraphQL object cannot carry a key twice, and two `_not_*` filters on
+/// different fields both render as `_not: {...}`.
+fn move_repeated_keys(conditions: Vec<String>, and_conditions: &mut Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut kept = Vec::new();
+    for condition in conditions {
+        let key = condition.split(':').next().unwrap_or_default().trim().to_string();
+        if seen.insert(key) {
+            kept.push(condition);
+        } else {
+            and_conditions.push(format!("{{{}}}", condition));
+        }
+    }
+    kept
 }
 
 /// Whether `key: value` is an inline logical filter: `and`/`or` (or Hasura's
@@ -2865,38 +2890,52 @@ pub fn translate_subgraph_filter_value(value: &Value, entity_name: &str) -> Valu
     };
 
     let mut out = serde_json::Map::new();
-    // `_not_*` operators in the inline path each emit their own `_not: { ... }`
-    // wrapper. JSON object keys are unique, so we accumulate the inner fields
-    // and emit a single combined `_not` at the end.
-    let mut not_accum = serde_json::Map::new();
-
     for (key, val) in obj {
         match key.as_str() {
             "and" | "_and" => {
-                let arr = translate_filter_array(val, entity_name);
-                out.insert("_and".to_string(), Value::Array(arr));
+                for item in translate_filter_array(val, entity_name) {
+                    push_and(&mut out, item);
+                }
             }
             "or" | "_or" => {
                 let arr = translate_filter_array(val, entity_name);
-                out.insert("_or".to_string(), Value::Array(arr));
+                insert_condition(&mut out, "_or", Value::Array(arr));
             }
             "_not" | "not" => {
                 let inner = translate_subgraph_filter_value(val, entity_name);
-                if let Value::Object(m) = inner {
-                    for (k, v) in m {
-                        not_accum.insert(k, v);
-                    }
-                }
+                insert_condition(&mut out, "_not", inner);
             }
-            _ => translate_leaf_filter(key, val, entity_name, &mut out, &mut not_accum),
+            _ => translate_leaf_filter(key, val, entity_name, &mut out),
         }
     }
-
-    if !not_accum.is_empty() {
-        out.insert("_not".to_string(), Value::Object(not_accum));
-    }
-
     Value::Object(out)
+}
+
+/// Add `key: condition` to a translated filter object. JSON keys are unique, so
+/// when the key is already taken (`amount_gt` and `amount_lt` both become
+/// `amount`, two `_not_*` filters both become `_not`) the condition joins `_and`
+/// rather than overwriting the first one.
+fn insert_condition(out: &mut serde_json::Map<String, Value>, key: &str, condition: Value) {
+    if out.contains_key(key) {
+        let mut item = serde_json::Map::new();
+        item.insert(key.to_string(), condition);
+        push_and(out, Value::Object(item));
+    } else {
+        out.insert(key.to_string(), condition);
+    }
+}
+
+fn push_and(out: &mut serde_json::Map<String, Value>, item: Value) {
+    match out
+        .entry("_and")
+        .or_insert_with(|| Value::Array(Vec::new()))
+    {
+        Value::Array(items) => items.push(item),
+        other => {
+            let first = other.take();
+            *other = Value::Array(vec![first, item]);
+        }
+    }
 }
 
 fn translate_filter_array(val: &Value, entity_name: &str) -> Vec<Value> {
@@ -2909,69 +2948,82 @@ fn translate_filter_array(val: &Value, entity_name: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// Translate a single non-connective filter entry, writing into `out`
-/// (or `not_accum` for `_not_*` operators).
+/// Translate a single non-connective filter entry, writing into `out`.
 fn translate_leaf_filter(
     key: &str,
     value: &Value,
     entity_name: &str,
     out: &mut serde_json::Map<String, Value>,
-    not_accum: &mut serde_json::Map<String, Value>,
 ) {
     // ORDER MATTERS — longest suffixes must be checked first, mirroring the
     // ordering in `convert_basic_filter_to_hasura_condition`. Changes here
     // must be applied to both functions.
 
     if let Some((field, filter)) = string_match_filter(key) {
-        let target = if filter.negated { not_accum } else { out };
-        target.insert(field.to_string(), like_value(value, filter));
+        let condition = like_value(value, filter);
+        if filter.negated {
+            // Each negation is its own `_not`: `_not: {a, b}` would mean
+            // "not (a and b)", where graph-node means "not a and not b".
+            let mut negated = serde_json::Map::new();
+            negated.insert(field.to_string(), condition);
+            insert_condition(out, "_not", Value::Object(negated));
+        } else {
+            insert_condition(out, field, condition);
+        }
         return;
     }
     if let Some(field) = key.strip_suffix("_not_in") {
-        out.insert(
-            field.to_string(),
+        insert_condition(
+            out,
+            field,
             nested_aware_value(entity_name, field, "_nin", value),
         );
         return;
     }
     if let Some(field) = key.strip_suffix("_gte") {
-        out.insert(
-            field.to_string(),
+        insert_condition(
+            out,
+            field,
             nested_aware_value(entity_name, field, "_gte", value),
         );
         return;
     }
     if let Some(field) = key.strip_suffix("_lte") {
-        out.insert(
-            field.to_string(),
+        insert_condition(
+            out,
+            field,
             nested_aware_value(entity_name, field, "_lte", value),
         );
         return;
     }
     if let Some(field) = key.strip_suffix("_not") {
-        out.insert(
-            field.to_string(),
+        insert_condition(
+            out,
+            field,
             nested_aware_value(entity_name, field, "_neq", value),
         );
         return;
     }
     if let Some(field) = key.strip_suffix("_gt") {
-        out.insert(
-            field.to_string(),
+        insert_condition(
+            out,
+            field,
             nested_aware_value(entity_name, field, "_gt", value),
         );
         return;
     }
     if let Some(field) = key.strip_suffix("_lt") {
-        out.insert(
-            field.to_string(),
+        insert_condition(
+            out,
+            field,
             nested_aware_value(entity_name, field, "_lt", value),
         );
         return;
     }
     if let Some(field) = key.strip_suffix("_in") {
-        out.insert(
-            field.to_string(),
+        insert_condition(
+            out,
+            field,
             nested_aware_value(entity_name, field, "_in", value),
         );
         return;
@@ -2980,7 +3032,7 @@ fn translate_leaf_filter(
     // Unsupported in the inline path; pass through here so Hasura surfaces a
     // useful error instead of silently dropping the filter.
     if key.ends_with("_containsAny") || key.ends_with("_containsAll") {
-        out.insert(key.to_string(), value.clone());
+        insert_condition(out, key, value.clone());
         return;
     }
 
@@ -2988,7 +3040,7 @@ fn translate_leaf_filter(
     // a nested-entity reference.
 
     if key == "chainId" {
-        out.insert(key.to_string(), op_wrap("_eq", value.clone()));
+        insert_condition(out, key, op_wrap("_eq", value.clone()));
         return;
     }
 
@@ -3007,11 +3059,11 @@ fn translate_leaf_filter(
                 .and_then(|info| info.nested_type_name)
                 .unwrap_or_else(|| lookup_key.to_string());
             let translated = translate_subgraph_filter_value(value, &nested_type);
-            out.insert(target_key.to_string(), translated);
+            insert_condition(out, target_key, translated);
         } else {
             // Object value on a non-nested field — most commonly an already
             // Hasura-shaped sub-expression (e.g. `{_eq: 1}`). Pass through.
-            out.insert(target_key.to_string(), value.clone());
+            insert_condition(out, target_key, value.clone());
         }
         return;
     }
@@ -3020,11 +3072,11 @@ fn translate_leaf_filter(
         // Scalar against a nested entity → ID equality.
         let mut id_wrapper = serde_json::Map::new();
         id_wrapper.insert("id".to_string(), op_wrap("_eq", value.clone()));
-        out.insert(target_key.to_string(), Value::Object(id_wrapper));
+        insert_condition(out, target_key, Value::Object(id_wrapper));
         return;
     }
 
-    out.insert(target_key.to_string(), op_wrap("_eq", value.clone()));
+    insert_condition(out, target_key, op_wrap("_eq", value.clone()));
 }
 
 /// Build an operator condition for `field`, routing through `id` when `field`
@@ -5477,24 +5529,19 @@ mod tests {
             "amount_lte": 4,
         });
         let out = translate_subgraph_filter_value(&v, "Trade");
-        let expected = json!({
-            "amount": { "_gt": 1 },
-        });
-        // Note: in JSON, multiple operators on the same field collapse to a
-        // single key (last write wins) — same as Hasura object semantics. We
-        // assert membership of each key rather than full equality because
-        // HashMap iteration order is not deterministic.
-        let out_obj = out.as_object().unwrap();
-        assert_eq!(out_obj["amount"].as_object().unwrap().len(), 1);
-        assert!(["_gt", "_gte", "_lt", "_lte"].contains(
-            &out_obj["amount"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .next()
-                .unwrap()
-                .as_str()
-        ));
+        // Every condition survives: the first keeps the field's key and the
+        // rest, which would collide with it, join `_and`.
+        assert_eq!(
+            out,
+            json!({
+                "amount": { "_gt": 1 },
+                "_and": [
+                    { "amount": { "_gte": 2 } },
+                    { "amount": { "_lt": 3 } },
+                    { "amount": { "_lte": 4 } },
+                ],
+            })
+        );
         // Spot-check that each op individually translates correctly.
         for (suffix, op) in [
             ("amount_gt", "_gt"),
@@ -5505,7 +5552,6 @@ mod tests {
             let single = translate_subgraph_filter_value(&json!({ suffix: 1 }), "Trade");
             assert_eq!(single, json!({ "amount": { op: 1 } }));
         }
-        let _ = expected; // silence warning
     }
 
     #[test]
@@ -7128,10 +7174,10 @@ mod tests {
         );
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        // Two conditions on one field come out in either order.
-        let gt_first = "Swap(limit: 100, order_by: {id: asc}, where: {_and: [{_and: [{fee: {_gt: 1}}, {fee: {_lt: 5}}]}, {trader: {_eq: \"0xa\"}}]})";
-        let lt_first = "Swap(limit: 100, order_by: {id: asc}, where: {_and: [{_and: [{fee: {_lt: 5}}, {fee: {_gt: 1}}]}, {trader: {_eq: \"0xa\"}}]})";
-        assert!(query.contains(gt_first) || query.contains(lt_first), "{query}");
+        assert!(
+            query.contains("Swap(limit: 100, order_by: {id: asc}, where: {_and: [{_and: [{fee: {_gt: 1}}, {fee: {_lt: 5}}]}, {trader: {_eq: \"0xa\"}}]})"),
+            "{query}"
+        );
     }
 
     #[test]
@@ -7647,4 +7693,69 @@ mod tests {
             Some(100)
         );
     }
+
+    #[test]
+    fn conditions_on_one_field_come_out_in_a_fixed_order() {
+        init_test_schema_if_needed();
+        for _ in 0..20 {
+            let payload = create_test_payload(
+                "query { swaps(where: {fee_lt: 5, fee_gt: 1, tokenIn_: {symbol_starts_with: \"W\", symbol_not: \"X\", decimals: 18}}) { id } }",
+            );
+            let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+            let query = result.query["query"].as_str().unwrap();
+            assert!(query.contains("_and: [{fee: {_gt: 1}}, {fee: {_lt: 5}}]"), "{query}");
+            assert!(
+                query.contains("tokenIn: {decimals: {_eq: 18}, _and: [{symbol: {_neq: \"X\"}}, {symbol: {_like: \"W%\"}}]}"),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_negations_on_two_fields_are_separate() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pairs(where: {name_not_contains: \"a\", symbol_not_starts_with: \"b\"}) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        // One `_not` key, the other negation in `_and`: not "not (a and b)".
+        assert!(
+            query.contains("where: {_not: {name: {_like: \"%a%\"}}, _and: [{_not: {symbol: {_like: \"b%\"}}}]}"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn variable_negations_on_two_fields_are_separate() {
+        init_test_schema_if_needed();
+        let out = translate_subgraph_filter_value(
+            &json!({"name_not_contains": "a", "symbol_not_starts_with": "b"}),
+            "Pair",
+        );
+        assert_eq!(
+            out,
+            json!({
+                "_not": {"name": {"_like": "%a%"}},
+                "_and": [{"_not": {"symbol": {"_like": "b%"}}}]
+            })
+        );
+    }
+
+    #[test]
+    fn variable_range_and_connective_share_one_and() {
+        init_test_schema_if_needed();
+        let out = translate_subgraph_filter_value(
+            &json!({"amount_gt": 1, "amount_lt": 9, "and": [{"name": "x"}]}),
+            "Trade",
+        );
+        assert_eq!(
+            out,
+            json!({
+                "amount": {"_gt": 1},
+                "_and": [{"amount": {"_lt": 9}}, {"name": {"_eq": "x"}}]
+            })
+        );
+    }
+
 }
