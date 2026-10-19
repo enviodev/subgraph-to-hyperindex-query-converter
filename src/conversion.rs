@@ -994,10 +994,21 @@ struct ArgContext {
 
 /// The Hyperindex entity a root field reads, and whether it is a primary-key
 /// lookup (`token(id: "0x..")`) rather than a collection (`tokens(...)`).
+///
+/// graph-node names the single-entity field after the entity (`swapUser`) and the
+/// collection after its plural (`swapUsers`), so the schema settles both. Without
+/// a schema match, a name not ending in `s` and carrying only `id` is taken as a
+/// lookup.
 fn classify_root_field(name: &str, params: &HashMap<String, String>) -> (String, bool) {
+    let id_only = params.len() == 1 && params.contains_key("id");
+    if let Some(entity) = schema::entity_for_single_field(name) {
+        return (entity, id_only);
+    }
+    if let Some(entity) = schema::resolve_entity_for_collection_field(name) {
+        return (entity, false);
+    }
     let entity = singularize_and_capitalize(name);
-    let is_pk = !name.ends_with('s') && params.len() == 1 && params.contains_key("id");
-    (entity, is_pk)
+    (entity, !name.ends_with('s') && id_only)
 }
 
 /// Hasura arguments for a collection field from its subgraph arguments: `first`
@@ -7147,5 +7158,55 @@ mod tests {
             split_list_items("[{a: \"x,}\"}, {b: [1, 2]} {c: 3}]"),
             vec!["{a: \"x,}\"}", "{b: [1, 2]}", "{c: 3}"]
         );
+    }
+
+    // ── Singular vs collection from the schema ───────────────────────────────
+
+    #[test]
+    fn singular_entity_ending_in_s_is_a_primary_key_lookup() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { status(id: \"1\") { id name } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("Status_by_pk(id: \"1\") {"), "{query}");
+        assert_eq!(result.field_name_map.get("Status_by_pk"), Some(&"status".to_string()));
+    }
+
+    #[test]
+    fn plural_of_a_singular_ending_in_s_is_a_collection() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { statuses(where: {id: \"1\"}) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("  Status(where: {id: {_eq: \"1\"}})"), "{query}");
+    }
+
+    #[test]
+    fn collection_filtered_by_id_alone_stays_a_collection() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { swapUsers(where: {id: \"0xa\"}) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("  SwapUser(where: {id: {_eq: \"0xa\"}})"), "{query}");
+    }
+
+    #[test]
+    fn root_fields_outside_the_schema_use_the_word_rules() {
+        init_test_schema_if_needed();
+        let payload =
+            create_test_payload("query { stream(id: \"1\") { id } streams(first: 1) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("Stream_by_pk(id: \"1\")"), "{query}");
+        assert!(query.contains("  Stream(limit: 1)"), "{query}");
+    }
+
+    #[test]
+    fn hasura_metadata_types_are_not_single_entity_fields() {
+        init_test_schema_if_needed();
+        assert_eq!(schema::entity_for_single_field("swapUser"), Some("SwapUser".to_string()));
+        assert_eq!(schema::entity_for_single_field("status"), Some("Status".to_string()));
+        assert_eq!(schema::entity_for_single_field("query_root"), None);
+        assert_eq!(schema::entity_for_single_field("nonexistent"), None);
     }
 }

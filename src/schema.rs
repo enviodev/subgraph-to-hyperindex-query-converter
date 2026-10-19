@@ -295,6 +295,36 @@ pub fn resolve_entity_for_collection_field(field_name: &str) -> Option<String> {
     found
 }
 
+/// Find the cached entity whose graph-node single-entity field is `field_name`:
+/// the entity name with its first letter lowercased (`swapUser` for `SwapUser`).
+///
+/// Word rules cannot tell a singular that ends in `s` (`status`) from a plural,
+/// nor recover the entity from it (`Statu`); the schema can. Hasura's own root
+/// and metadata types are not entities and never match.
+pub fn entity_for_single_field(field_name: &str) -> Option<String> {
+    const NOT_ENTITIES: [&str; 6] = [
+        "query_root",
+        "mutation_root",
+        "subscription_root",
+        "chain_metadata",
+        "_meta",
+        "raw_events",
+    ];
+    let cache = SCHEMA_CACHE.clone();
+    let found = cache
+        .iter()
+        .map(|entry| entry.key().clone())
+        .filter(|entity| !NOT_ENTITIES.contains(&entity.as_str()))
+        .find(|entity| {
+            let mut chars = entity.chars();
+            match chars.next() {
+                Some(first) => first.to_lowercase().chain(chars).eq(field_name.chars()),
+                None => false,
+            }
+        });
+    found
+}
+
 /// graph-node's plural collection field for an entity: lowercase the first
 /// letter, then apply English pluralization.
 fn graph_node_plural(entity: &str) -> String {
@@ -786,6 +816,13 @@ pub fn init_test_schema() {
                     ("second", "Supply", false),
                 ],
             ),
+        );
+
+        // A singular entity name ending in `s`, which word rules would take for
+        // a plural.
+        cache.insert(
+            "Status".to_string(),
+            build(&[("id", "String"), ("name", "String")], &[]),
         );
 
         // A user with a list of their swaps, which nested `first`/`orderBy`
