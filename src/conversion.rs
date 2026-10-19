@@ -1445,6 +1445,22 @@ fn sanitize_selection_set(input: &str) -> Result<String, ConversionError> {
             continue;
         }
 
+        // A `#` comment runs to the end of the line and may contain anything -
+        // `(`, `{`, a stray quote. Copy it through without interpreting it,
+        // because an open paren inside a note would otherwise start an argument
+        // scan that swallows the rest of the selection set.
+        if !in_string && ch == '#' {
+            output.push(ch);
+            while let Some(&nc) = chars.peek() {
+                if nc == '\n' || nc == '\r' {
+                    break;
+                }
+                output.push(nc);
+                chars.next();
+            }
+            continue;
+        }
+
         if !in_string && ch == '(' {
             // Capture balanced parentheses and their contents so we can
             // translate subgraph-style nested-field args (first/skip/orderBy/
@@ -1453,6 +1469,21 @@ fn sanitize_selection_set(input: &str) -> Result<String, ConversionError> {
             let mut depth: i32 = 1;
             let mut in_args_string = false;
             while let Some(nc) = chars.next() {
+                // Inside an argument list a comment is dropped rather than
+                // copied through: the arguments are re-emitted on a single line,
+                // so a retained `#` would comment out everything after it -
+                // including the remaining arguments and the closing paren. The
+                // line break is kept, since commas are optional and it may be
+                // the only thing separating two arguments.
+                if !in_args_string && nc == '#' {
+                    for cc in chars.by_ref() {
+                        if cc == '\n' || cc == '\r' {
+                            content.push(cc);
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 if nc == '"' {
                     in_args_string = !in_args_string;
                     content.push(nc);
@@ -5466,6 +5497,60 @@ mod tests {
             "Enum override regression, got: {}",
             query
         );
+    }
+
+    #[test]
+    fn test_comment_inside_nested_arguments_is_dropped() {
+        // A `#` comment runs to end of line and can hold a `)`, which closed the
+        // argument list early and forwarded malformed GraphQL. Keeping the
+        // comment is no better: the arguments are re-emitted on one line, so it
+        // would comment out the rest of them and the closing paren with it.
+        init_test_schema_if_needed();
+        for query in [
+            "{\n  pools(first: 1) {\n    poolHourData(\n      first: 3   # only three (for now)\n      skip: 1\n    ) { id }\n  }\n}",
+            "{\n  pools(first: 1) {\n    poolHourData(\n      first: 3   # keep ) three\n      skip: 1\n    ) { id }\n  }\n}",
+            "{\n  pools(first: 1) {\n    poolHourData(first: 3, # a note\n      skip: 1) { id }\n  }\n}",
+        ] {
+            let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None)
+                .unwrap_or_else(|e| panic!("expected {query:?} to convert, got {e:?}"));
+            let converted = result.query["query"].as_str().unwrap();
+            assert!(
+                converted.contains("poolHourData(limit: 3, offset: 1)"),
+                "{converted}"
+            );
+            assert!(!converted.contains('#'), "comment survived: {converted}");
+        }
+    }
+
+    #[test]
+    fn test_comment_in_a_selection_set_is_left_alone() {
+        // An open paren in a note used to start an argument scan that ate the
+        // rest of the selection set - silently before nested args were
+        // translated, and as a bogus `UnsupportedNestedArgument` after.
+        init_test_schema_if_needed();
+        let query = "{\n  pools(first: 1) {\n    id   # a note with ( an open paren\n    poolHourData(first: 3) { id }\n  }\n}";
+        let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("poolHourData(limit: 3)"), "{converted}");
+        assert!(
+            converted.contains("# a note with ( an open paren"),
+            "the comment itself should survive: {converted}"
+        );
+    }
+
+    #[test]
+    fn test_a_hash_inside_a_string_argument_is_not_a_comment() {
+        // `#` only opens a comment outside a string. If it were treated as one
+        // here the scan would end inside the quotes and the argument name would
+        // be lost, so the error naming `foo` is the proof that it did not.
+        let sanitized = sanitize_selection_set("b(first: 3, foo: \"#)(\") { id }");
+        match sanitized {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "b");
+                assert_eq!(detail, "foo");
+            }
+            other => panic!("expected UnsupportedNestedArgument naming foo, got {other:?}"),
+        }
     }
 
     #[test]
