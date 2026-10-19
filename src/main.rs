@@ -108,12 +108,12 @@ async fn execute_query_with_retry(
                     if field == "query" { "The request body must include a 'query' string field." } else { "A required field is missing from the request." },
                 conversion::ConversionError::UnsupportedFilter(_filter) =>
                     "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
+                conversion::ConversionError::UnsupportedNestedArgument(_, _) =>
+                    "Only first, skip, orderBy and orderDirection are translated on a nested field. A nested `where` arrives as its own filter keys, and a variable sort needs its declared type rewritten; both are rejected rather than dropped, because dropping them returns unfiltered or unordered rows that the caller cannot tell apart from a complete answer.",
                 conversion::ConversionError::ComplexMetaQuery(_) =>
                     "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
                 conversion::ConversionError::MetaWithOtherFields(_) =>
                     "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
-                conversion::ConversionError::UnsupportedNestedArgument(_, _) =>
-                    "Only first, skip, orderBy and orderDirection are translated on a nested field. A nested `where` arrives as its own filter keys, and a variable sort needs its declared type rewritten; both are rejected rather than dropped, because dropping them returns unfiltered or unordered rows that the caller cannot tell apart from a complete answer.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -308,12 +308,12 @@ async fn handle_debug(Json(payload): Json<Value>) -> impl IntoResponse {
                     if field == "query" { "The request body must include a 'query' string field." } else { "A required field is missing from the request." },
                 conversion::ConversionError::UnsupportedFilter(_filter) =>
                     "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
+                conversion::ConversionError::UnsupportedNestedArgument(_, _) =>
+                    "Only first, skip, orderBy and orderDirection are translated on a nested field. A nested `where` arrives as its own filter keys, and a variable sort needs its declared type rewritten; both are rejected rather than dropped, because dropping them returns unfiltered or unordered rows that the caller cannot tell apart from a complete answer.",
                 conversion::ConversionError::ComplexMetaQuery(_) =>
                     "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
                 conversion::ConversionError::MetaWithOtherFields(_) =>
                     "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
-                conversion::ConversionError::UnsupportedNestedArgument(_, _) =>
-                    "Only first, skip, orderBy and orderDirection are translated on a nested field. A nested `where` arrives as its own filter keys, and a variable sort needs its declared type rewritten; both are rejected rather than dropped, because dropping them returns unfiltered or unordered rows that the caller cannot tell apart from a complete answer.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
@@ -370,12 +370,12 @@ async fn handle_chain_debug(
                     if field == "query" { "The request body must include a 'query' string field." } else { "A required field is missing from the request." },
                 conversion::ConversionError::UnsupportedFilter(_filter) =>
                     "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
+                conversion::ConversionError::UnsupportedNestedArgument(_, _) =>
+                    "Only first, skip, orderBy and orderDirection are translated on a nested field. A nested `where` arrives as its own filter keys, and a variable sort needs its declared type rewritten; both are rejected rather than dropped, because dropping them returns unfiltered or unordered rows that the caller cannot tell apart from a complete answer.",
                 conversion::ConversionError::ComplexMetaQuery(_) =>
                     "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
                 conversion::ConversionError::MetaWithOtherFields(_) =>
                     "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
-                conversion::ConversionError::UnsupportedNestedArgument(_, _) =>
-                    "Only first, skip, orderBy and orderDirection are translated on a nested field. A nested `where` arrives as its own filter keys, and a variable sort needs its declared type rewritten; both are rejected rather than dropped, because dropping them returns unfiltered or unordered rows that the caller cannot tell apart from a complete answer.",
             };
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;

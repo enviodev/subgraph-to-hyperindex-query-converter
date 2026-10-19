@@ -13,12 +13,12 @@ pub enum ConversionError {
     MissingField(String),
     #[error("Unsupported filter: {0}")]
     UnsupportedFilter(String),
+    #[error("Nested field `{0}` has arguments that cannot be translated: {1}")]
+    UnsupportedNestedArgument(String, String),
     #[error("_meta fields with no Hyperindex equivalent: {0}. Only _meta {{ block {{ number }} }} can be served, and a partial answer would look like a complete one to the caller")]
     ComplexMetaQuery(String),
     #[error("_meta cannot be combined with other root fields: {0}")]
     MetaWithOtherFields(String),
-    #[error("Nested field `{0}` has arguments that cannot be translated: {1}")]
-    UnsupportedNestedArgument(String, String),
 }
 
 /// Where one half of an `order_by` pair comes from: a GraphQL variable the client
