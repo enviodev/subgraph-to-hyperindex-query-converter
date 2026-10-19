@@ -77,6 +77,10 @@ pub struct ConversionResult {
     /// converted query carries the indexer's progress under `BLOCK_CHECK_KEY`,
     /// for the caller to compare against this before answering.
     pub min_block: Option<u64>,
+    /// Response keys of single-entity lookups that were read as a one-row list
+    /// (on the `/chainId/{id}` route, where `_by_pk` cannot filter by chain).
+    /// The caller replaces each list with its row, or null.
+    pub single_row_keys: Vec<String>,
 }
 
 /// Response key of the hidden `_meta` root that reports indexing progress for a
@@ -143,6 +147,7 @@ pub fn convert_subgraph_to_hyperindex(
             dropped_variables: Vec::new(),
             shape_plans: HashMap::new(),
             min_block: None,
+            single_row_keys: Vec::new(),
         });
     }
 
@@ -160,6 +165,7 @@ pub fn convert_subgraph_to_hyperindex(
         min_blocks,
         like_variables,
         chain_filter_variables,
+        single_row_keys,
     } = convert_query_structure(query, chain_id)?;
 
     // Variables are read before any are dropped from the forwarded payload: a
@@ -278,6 +284,7 @@ pub fn convert_subgraph_to_hyperindex(
         dropped_variables,
         shape_plans,
         min_block,
+        single_row_keys,
     })
 }
 
@@ -551,6 +558,8 @@ struct MainConversion {
     like_variables: Vec<LikeVariable>,
     /// `where: $var` variables that need the route's chain condition added.
     chain_filter_variables: HashMap<String, String>,
+    /// Response keys of lookups read as one-row lists; see `ConversionResult`.
+    single_row_keys: Vec<String>,
 }
 
 fn convert_query_structure(
@@ -584,6 +593,7 @@ fn convert_query_structure(
         min_blocks: main.min_blocks,
         like_variables: main.like_variables,
         chain_filter_variables: main.chain_filter_variables,
+        single_row_keys: main.single_row_keys,
     })
 }
 
@@ -967,6 +977,7 @@ fn convert_main_query(
         .or_else(|| (!fragments_text.is_empty()).then(|| fragments_text.to_string()));
     let mut root_rewrites = rewrites.roots.into_iter();
     let mut shape_plans: HashMap<String, ShapePlan> = HashMap::new();
+    let mut single_row_keys = Vec::new();
 
     for ((root, (entity_cap, is_pk)), selection) in roots.into_iter().zip(classified).zip(selections)
     {
@@ -1008,6 +1019,29 @@ fn convert_main_query(
         };
 
         // Single-entity by primary key: singular entity, only 'id' param
+        if is_pk && chain_id.is_some() {
+            // `_by_pk` takes no filter, so it would return the row whatever its
+            // chain. A one-row collection read under the same response key
+            // keeps the chain filter; the caller unwraps it (`single_row_keys`).
+            let key = alias
+                .clone()
+                .unwrap_or_else(|| format!("{}_by_pk", entity_cap));
+            let mut filters = HashMap::new();
+            filters.insert("id".to_string(), params["id"].clone());
+            filters.insert(
+                "chainId".to_string(),
+                format!("\"{}\"", chain_id.unwrap_or_default()),
+            );
+            let converted = convert_filters_to_where_clause(&filters, &entity_cap)?;
+            ctx.variable_type_overrides
+                .extend(converted.variable_type_overrides);
+            converted_entities.push(format!(
+                "  {}: {}(limit: 1, {}) {}",
+                key, entity_cap, converted.where_clause, selection
+            ));
+            single_row_keys.push(key);
+            continue;
+        }
         if is_pk {
             let pk_query = format!(
                 "  {}{}_by_pk(id: {}) {}",
@@ -1114,6 +1148,7 @@ fn convert_main_query(
         min_blocks,
         like_variables,
         chain_filter_variables: ctx.chain_filter_variables,
+        single_row_keys,
     })
 }
 
@@ -3718,7 +3753,7 @@ mod tests {
     #[test]
     fn test_single_entity_query() {
         let payload = create_test_payload("query { stream(id: \"123\") { id name } }");
-        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let expected = json!({
             "query": "query {\n  Stream_by_pk(id: \"123\") {\n    id name\n  }\n}"
         });
@@ -4998,7 +5033,7 @@ mod tests {
     fn test_single_entity_by_pk_capitalization_stream() {
         // Test with stream entity
         let payload = create_test_payload("query { stream(id: \"123\") { id name } }");
-        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let converted_query = result.query["query"].as_str().unwrap();
 
         // Should use capitalized entity name: Stream_by_pk not stream_by_pk
@@ -8057,6 +8092,38 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         assert_eq!(result.query["variables"], json!({"w": {"id": {"_eq": "a"}}}));
+    }
+
+
+    #[test]
+    fn lookup_on_the_chain_route_filters_by_chain() {
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($id: ID!) { token(id: $id) { id } mine: token(id: \"0xb\") { id } }",
+            "variables": {"id": "0xa"}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, Some("5031")).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("Token_by_pk: Token(limit: 1, where: {chainId: {_eq: \"5031\"}, id: {_eq: $id}}) {"),
+            "{query}"
+        );
+        assert!(
+            query.contains("mine: Token(limit: 1, where: {chainId: {_eq: \"5031\"}, id: {_eq: \"0xb\"}}) {"),
+            "{query}"
+        );
+        assert!(query.starts_with("query Q($id: String!)"), "{query}");
+        assert_eq!(result.single_row_keys, vec!["Token_by_pk".to_string(), "mine".to_string()]);
+    }
+
+    #[test]
+    fn lookup_off_the_chain_route_stays_by_pk() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { token(id: \"0xa\") { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("Token_by_pk(id: \"0xa\")"), "{query}");
+        assert!(result.single_row_keys.is_empty());
     }
 
 }

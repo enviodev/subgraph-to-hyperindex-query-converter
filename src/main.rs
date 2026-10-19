@@ -140,6 +140,7 @@ async fn execute_query_with_retry(
     let field_name_map = conversion_result.field_name_map;
     let meta_selection = conversion_result.meta_selection;
     let shape_plans = conversion_result.shape_plans;
+    let single_row_keys = conversion_result.single_row_keys;
 
     if !conversion_result.filter_variable_entities.is_empty() {
         tracing::info!(
@@ -254,6 +255,7 @@ async fn execute_query_with_retry(
 
     // Success - no errors
     let transform_start = Instant::now();
+    unwrap_single_rows(&mut response, &single_row_keys);
     apply_shape_plans(&mut response, &shape_plans);
     let transformed =
         transform_response_to_subgraph_shape(response, &field_name_map, meta_selection.as_ref());
@@ -466,6 +468,22 @@ fn lowest_progress_block(rows: &Value) -> Option<u64> {
                 .and_then(Value::as_u64)
         })
         .min()
+}
+
+/// Replace each one-row list read in place of a `_by_pk` lookup with its row, or
+/// null when nothing matched, which is what the lookup would have returned.
+fn unwrap_single_rows(response: &mut Value, keys: &[String]) {
+    if let Some(Value::Object(data)) = response.get_mut("data") {
+        for key in keys {
+            if let Some(value) = data.get_mut(key) {
+                let row = match value.take() {
+                    Value::Array(rows) => rows.into_iter().next().unwrap_or(Value::Null),
+                    other => other,
+                };
+                *value = row;
+            }
+        }
+    }
 }
 
 /// Merge rewritten interface-link fields back into their rows (see `fragments`).
@@ -1059,4 +1077,28 @@ mod response_shape_tests {
         apply_shape_plans(&mut resp, &std::collections::HashMap::new());
         assert_eq!(resp, before);
     }
+
+    #[test]
+    fn chain_route_lookup_returns_the_row_or_null() {
+        crate::schema::init_test_schema_once();
+        let payload = serde_json::json!({
+            "query": "{ token(id: \"0xa\") { id } other: token(id: \"0xb\") { id } }"
+        });
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        let mut hasura = serde_json::json!({"data": {
+            "Token_by_pk": [{"id": "0xa"}],
+            "other": []
+        }});
+        unwrap_single_rows(&mut hasura, &converted.single_row_keys);
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            converted.meta_selection.as_ref(),
+        );
+        assert_eq!(
+            out,
+            serde_json::json!({"data": {"token": {"id": "0xa"}, "other": null}})
+        );
+    }
+
 }
