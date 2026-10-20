@@ -82,10 +82,7 @@ async fn execute_query_with_retry(
         metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": "Schema initialization failed",
-                "details": redact_upstream_error(&*e)
-            })),
+            Json(graphql_errors(["Internal server error: schema initialization failed".to_string()])),
         );
     }
 
@@ -101,44 +98,38 @@ async fn execute_query_with_retry(
             metrics::CONVERSION_ERRORS.inc();
             metrics::TOTAL_ERRORS.inc();
             tracing::error!("Conversion error: {}", e);
-            let reasoning = match &e {
-                conversion::ConversionError::InvalidQueryFormat =>
-                    "The provided GraphQL query string could not be parsed. Ensure it is a valid single operation with balanced braces and proper syntax.",
-                conversion::ConversionError::MissingField(field) =>
-                    if field == "query" { "The request body must include a 'query' string field." } else { "A required field is missing from the request." },
-                conversion::ConversionError::UnsupportedFilter(_filter) =>
-                    "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
-                conversion::ConversionError::UnsupportedNestedArgument(_, _) =>
-                    "Only first, skip, orderBy and orderDirection are translated on a nested field. A nested `where` arrives as its own filter keys, and a variable sort needs its declared type rewritten; both are rejected rather than dropped, because dropping them returns unfiltered or unordered rows that the caller cannot tell apart from a complete answer.",
-                conversion::ConversionError::ComplexMetaQuery(_) =>
-                    "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
-                conversion::ConversionError::MetaWithOtherFields(_) =>
-                    "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
-                conversion::ConversionError::BlockArgument(_) =>
-                    "Hyperindex stores current state, not per-block history, so a query pinned to a past block cannot be answered. It is rejected rather than served at the latest block, because the caller could not tell the difference.",
+            metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
+            // graph-node answers a malformed request with 400 and `{"error"}`,
+            // and a query it cannot run with 200 and `{"errors": [...]}`.
+            let (status, mut body) = if e.is_request_error() {
+                (
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({
+                        "error": format!("GraphQL server error (client error): {}", e)
+                    }),
+                )
+            } else {
+                (StatusCode::OK, graphql_errors([e.to_string()]))
             };
-            let details = e.to_string();
-            let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "Conversion failed",
-                    "details": details,
-                    "reasoning": reasoning,
-                    "debug": {
-                        "inputQuery": payload.get("query").and_then(|q| q.as_str()).unwrap_or_default(),
-                        "chainId": chain_id.map(|c| serde_json::Value::String(c.to_string())).unwrap_or(serde_json::Value::Null),
-                    },
-                    "subgraphResponse": subgraph_debug,
-                })),
-            );
+            if debug_errors_enabled() {
+                body["debug"] = serde_json::json!({
+                    "reasoning": conversion_error_reasoning(&e),
+                    "inputQuery": payload.get("query").and_then(|q| q.as_str()).unwrap_or_default(),
+                    "chainId": chain_id,
+                });
+                body["subgraphResponse"] =
+                    maybe_fetch_subgraph_debug(payload.clone()).await.unwrap_or(Value::Null);
+            }
+            return (status, Json(body));
         }
     };
 
     let converted_query = conversion_result.query;
+    let min_block = conversion_result.min_block;
     let field_name_map = conversion_result.field_name_map;
-    let meta_selection = conversion_result.meta_selection;
+    let meta_selections = conversion_result.meta_selections;
     let shape_plans = conversion_result.shape_plans;
+    let single_row_keys = conversion_result.single_row_keys;
 
     if !conversion_result.filter_variable_entities.is_empty() {
         tracing::info!(
@@ -191,9 +182,8 @@ async fn execute_query_with_retry(
             metrics::QUERY_RESPONSE_WAIT_DURATION.observe(query_start.elapsed().as_secs_f64() * 1000.0);
             metrics::QUERY_EXECUTION_ERRORS.inc();
             metrics::TOTAL_ERRORS.inc();
+            // `reqwest::Error` repeats the request URL, credentials and all.
             let details = redact_upstream_error(&*e);
-            tracing::error!("Hyperindex request error: {}", details);
-            let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
             tracing::error!(
                 original_query = original_query,
                 converted_query = converted_query_str,
@@ -202,58 +192,62 @@ async fn execute_query_with_retry(
                 "Error forwarding converted query to Hyperindex"
             );
             metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "Hyperindex request failed",
+            // graph-node reports a store it cannot reach as a GraphQL error. The
+            // transport error itself names the upstream URL, so it stays in the log.
+            let mut body = graphql_errors(["Store error: the indexer could not be reached".to_string()]);
+            if debug_errors_enabled() {
+                body["debug"] = serde_json::json!({
                     "details": details,
-                    "debug": {
-                        "originalQuery": original_query,
-                        "convertedQuery": converted_query_str,
-                        "chainId": chain_id.map(|c| serde_json::Value::String(c.to_string())).unwrap_or(serde_json::Value::Null),
-                    },
-                    "subgraphResponse": subgraph_debug,
-                })),
-            );
+                    "originalQuery": original_query,
+                    "convertedQuery": converted_query_str,
+                    "chainId": chain_id,
+                });
+                body["subgraphResponse"] =
+                    maybe_fetch_subgraph_debug(payload.clone()).await.unwrap_or(Value::Null);
+            }
+            return (StatusCode::OK, Json(body));
         }
     };
+
+    let mut response = response;
+    enforce_min_block(&mut response, min_block, &deployment_label());
 
     // Check for GraphQL errors
     if let Some(errors) = response.get("errors") {
         // Return GraphQL errors normally (no schema refresh retry)
         metrics::QUERY_EXECUTION_ERRORS.inc();
         metrics::TOTAL_ERRORS.inc();
-        let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
         tracing::error!(
             original_query = original_query,
             converted_query = converted_query_str,
+            errors = %errors,
             hyperindex_url = %loggable_upstream(&hyperindex_url),
             "Upstream GraphQL returned errors for converted query"
         );
-        let mut debug = serde_json::json!({
-            "originalQuery": original_query,
-            "convertedQuery": converted_query_str,
-        });
-        if let Some(chain_id) = chain_id {
-            debug["chainId"] = serde_json::Value::String(chain_id.to_string());
+        let mut body = subgraph_errors(errors);
+        if debug_errors_enabled() {
+            let mut debug = serde_json::json!({
+                "upstreamErrors": errors.clone(),
+                "originalQuery": original_query,
+                "convertedQuery": converted_query_str,
+            });
+            if let Some(chain_id) = chain_id {
+                debug["chainId"] = serde_json::Value::String(chain_id.to_string());
+            }
+            body["debug"] = debug;
+            body["subgraphResponse"] =
+                maybe_fetch_subgraph_debug(payload.clone()).await.unwrap_or(Value::Null);
         }
         metrics::REQUEST_DURATION.observe(request_start.elapsed().as_secs_f64() * 1000.0);
-        return (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "errors": errors.clone(),
-                "debug": debug,
-                "subgraphResponse": subgraph_debug,
-            })),
-        );
+        return (StatusCode::OK, Json(body));
     }
 
     // Success - no errors
     let transform_start = Instant::now();
-    let mut response = response;
+    unwrap_single_rows(&mut response, &single_row_keys);
     apply_shape_plans(&mut response, &shape_plans);
     let transformed =
-        transform_response_to_subgraph_shape(response, &field_name_map, meta_selection.as_ref());
+        transform_response_to_subgraph_shape(response, &field_name_map, &meta_selections);
     let transform_duration_ms = transform_start.elapsed().as_secs_f64() * 1000.0;
     metrics::RESPONSE_TRANSFORM_DURATION.observe(transform_duration_ms);
 
@@ -303,22 +297,7 @@ async fn handle_debug(Json(payload): Json<Value>) -> impl IntoResponse {
         }
         Err(e) => {
             tracing::error!("Debug conversion error: {}", e);
-            let reasoning = match &e {
-                conversion::ConversionError::InvalidQueryFormat =>
-                    "The provided GraphQL query string could not be parsed. Ensure it is a valid single operation with balanced braces and proper syntax.",
-                conversion::ConversionError::MissingField(field) =>
-                    if field == "query" { "The request body must include a 'query' string field." } else { "A required field is missing from the request." },
-                conversion::ConversionError::UnsupportedFilter(_filter) =>
-                    "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
-                conversion::ConversionError::UnsupportedNestedArgument(_, _) =>
-                    "Only first, skip, orderBy and orderDirection are translated on a nested field. A nested `where` arrives as its own filter keys, and a variable sort needs its declared type rewritten; both are rejected rather than dropped, because dropping them returns unfiltered or unordered rows that the caller cannot tell apart from a complete answer.",
-                conversion::ConversionError::ComplexMetaQuery(_) =>
-                    "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
-                conversion::ConversionError::MetaWithOtherFields(_) =>
-                    "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
-                conversion::ConversionError::BlockArgument(_) =>
-                    "Hyperindex stores current state, not per-block history, so a query pinned to a past block cannot be answered. It is rejected rather than served at the latest block, because the caller could not tell the difference.",
-            };
+            let reasoning = conversion_error_reasoning(&e);
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
             (
@@ -367,22 +346,7 @@ async fn handle_chain_debug(
         }
         Err(e) => {
             tracing::error!("Chain debug conversion error: {}", e);
-            let reasoning = match &e {
-                conversion::ConversionError::InvalidQueryFormat =>
-                    "The provided GraphQL query string could not be parsed. Ensure it is a valid single operation with balanced braces and proper syntax.",
-                conversion::ConversionError::MissingField(field) =>
-                    if field == "query" { "The request body must include a 'query' string field." } else { "A required field is missing from the request." },
-                conversion::ConversionError::UnsupportedFilter(_filter) =>
-                    "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
-                conversion::ConversionError::UnsupportedNestedArgument(_, _) =>
-                    "Only first, skip, orderBy and orderDirection are translated on a nested field. A nested `where` arrives as its own filter keys, and a variable sort needs its declared type rewritten; both are rejected rather than dropped, because dropping them returns unfiltered or unordered rows that the caller cannot tell apart from a complete answer.",
-                conversion::ConversionError::ComplexMetaQuery(_) =>
-                    "Hyperindex can only answer _meta { block { number } }. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
-                conversion::ConversionError::MetaWithOtherFields(_) =>
-                    "_meta maps onto a different Hyperindex root field (chain_metadata) and cannot share an operation with entity queries. Split it into its own request.",
-                conversion::ConversionError::BlockArgument(_) =>
-                    "Hyperindex stores current state, not per-block history, so a query pinned to a past block cannot be answered. It is rejected rather than served at the latest block, because the caller could not tell the difference.",
-            };
+            let reasoning = conversion_error_reasoning(&e);
             let details = e.to_string();
             let subgraph_debug = maybe_fetch_subgraph_debug(payload.clone()).await;
             (
@@ -402,6 +366,81 @@ async fn handle_chain_debug(
     }
 }
 
+/// A GraphQL error response as graph-node sends it: `errors` with a `message`
+/// each, and no `data`.
+fn graphql_errors(messages: impl IntoIterator<Item = String>) -> Value {
+    let errors: Vec<Value> = messages
+        .into_iter()
+        .map(|message| serde_json::json!({ "message": message }))
+        .collect();
+    serde_json::json!({ "errors": errors })
+}
+
+/// Hasura's errors in graph-node's shape: each `message` is kept, and Hasura's
+/// `extensions` (its error code and a path through the converted query) are
+/// dropped. The original errors are logged.
+fn subgraph_errors(errors: &Value) -> Value {
+    let messages: Vec<String> = match errors {
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item.get("message") {
+                Some(Value::String(m)) => m.clone(),
+                _ => item.to_string(),
+            })
+            .collect(),
+        other => vec![other.to_string()],
+    };
+    graphql_errors(messages)
+}
+
+/// `CONVERTER_DEBUG_ERRORS=on` adds the converter's diagnostics (`debug`,
+/// `subgraphResponse`) to error responses, as they were before errors took
+/// graph-node's shape. Off by default: they name the upstream URL and the
+/// converted query.
+fn debug_errors_enabled() -> bool {
+    !cfg!(test) && debug_errors_setting(std::env::var("CONVERTER_DEBUG_ERRORS").ok().as_deref())
+}
+
+fn debug_errors_setting(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
+/// What graph-node's "only indexed up to block" error names as the subgraph:
+/// the deployment hash of `HYPERINDEX_URL`, as `_meta.deployment` reports it.
+fn deployment_label() -> String {
+    conversion::deployment_id().unwrap_or_else(|| "hyperindex".to_string())
+}
+
+/// Why a conversion error happened, for the `/debug` endpoints and
+/// `CONVERTER_DEBUG_ERRORS`.
+fn conversion_error_reasoning(e: &conversion::ConversionError) -> &'static str {
+    match e {
+        conversion::ConversionError::InvalidQueryFormat =>
+            "The provided GraphQL query string could not be parsed. Ensure it is a valid single operation with balanced braces and proper syntax.",
+        conversion::ConversionError::MissingField(field) =>
+            if field == "query" { "The request body must include a 'query' string field." } else { "A required field is missing from the request." },
+        conversion::ConversionError::QueryNotString =>
+            "The request body's 'query' field must be a string.",
+        conversion::ConversionError::UnsupportedFilter(_filter) =>
+            "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
+        conversion::ConversionError::UnsupportedNestedArgument(_, _) =>
+            "graph-node takes only first, skip, orderBy, orderDirection and where on a nested field. Anything else is rejected rather than converted or dropped, because the answer would not be to the question that was asked.",
+        conversion::ConversionError::ComplexMetaQuery(_) =>
+            "Hyperindex can answer _meta { deployment block { number timestamp } } (timestamp needs an indexer with Hasura's _meta; deployment is the deployment hash of HYPERINDEX_URL). block.hash and hasIndexingErrors have no Hyperindex source. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
+        conversion::ConversionError::MissingOperationName =>
+            "The document holds several operations. Set operationName to the one to run.",
+        conversion::ConversionError::UnknownOperation(_) =>
+            "operationName does not match any operation in the document.",
+        conversion::ConversionError::InvalidBlockNumber(_) =>
+            "graph-node reads number_gte as a block number and rejects anything else, null included. A negative number is accepted and always met.",
+        conversion::ConversionError::UnsupportedBlockConstraint(_) =>
+            "Only block: { number_gte: N } can be served: it answers from the latest state once block N is indexed. Reads pinned to a past block (number or hash) need historical state, which Hyperindex does not keep.",
+    }
+}
+
 async fn forward_to_hyperindex(
     query: &Value,
 ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
@@ -416,6 +455,72 @@ async fn forward_to_hyperindex(
 
     let response_json: Value = response.json().await?;
     Ok(response_json)
+}
+
+/// Answer `block: {number_gte: N}` as graph-node does: with the latest data once
+/// block N is indexed, and with an error before then.
+///
+/// The converted query carries the indexer's progress under
+/// `conversion::BLOCK_CHECK_KEY`, one row per chain; the lowest is the block
+/// every chain has reached. The key is always removed, so the caller never sees
+/// it.
+fn enforce_min_block(response: &mut Value, min_block: Option<u64>, deployment: &str) {
+    let Some(data) = response.get_mut("data").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(progress) = data.remove(conversion::BLOCK_CHECK_KEY) else {
+        return;
+    };
+    let Some(required) = min_block else {
+        return;
+    };
+    // Upstream errors are reported as they are, not hidden behind this one.
+    if response.get("errors").is_some() {
+        return;
+    }
+    let indexed = lowest_progress_block(&progress);
+    if indexed.map(|n| n >= required).unwrap_or(false) {
+        return;
+    }
+    // graph-node's wording, so clients that match on it keep working. With no
+    // progress row at all the indexer has not processed a block yet.
+    let indexed = match indexed {
+        Some(n) => format!("has only indexed up to block number {}", n),
+        None => "has not indexed any blocks yet".to_string(),
+    };
+    *response = graphql_errors([format!(
+        "Failed to decode `block.number_gte` value: `subgraph {} {} and data for block number {} is therefore not yet available`",
+        deployment, indexed, required
+    )]);
+}
+
+/// The lowest processed block among indexing-progress rows, from Hasura's native
+/// `_meta` (`progressBlock`) or `chain_metadata` (`latest_processed_block`).
+fn lowest_progress_block(rows: &Value) -> Option<u64> {
+    rows.as_array()?
+        .iter()
+        .filter_map(|row| {
+            row.get("progressBlock")
+                .or_else(|| row.get("latest_processed_block"))
+                .and_then(Value::as_u64)
+        })
+        .min()
+}
+
+/// Replace each one-row list read in place of a `_by_pk` lookup with its row, or
+/// null when nothing matched, which is what the lookup would have returned.
+fn unwrap_single_rows(response: &mut Value, keys: &[String]) {
+    if let Some(Value::Object(data)) = response.get_mut("data") {
+        for key in keys {
+            if let Some(value) = data.get_mut(key) {
+                let row = match value.take() {
+                    Value::Array(rows) => rows.into_iter().next().unwrap_or(Value::Null),
+                    other => other,
+                };
+                *value = row;
+            }
+        }
+    }
 }
 
 /// Merge rewritten interface-link fields back into their rows (see `fragments`).
@@ -523,49 +628,17 @@ fn redact_upstream_error(e: &(dyn std::error::Error + 'static)) -> String {
     redact_upstream_url(&text)
 }
 
-fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::collections::HashMap<String, String>, meta_selection: Option<&conversion::MetaSelection>) -> Value {
+fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::collections::HashMap<String, String>, meta_selections: &[conversion::MetaSelection]) -> Value {
     let mut root = match resp {
         Value::Object(map) => map,
         other => return other,
     };
 
     if let Some(Value::Object(data_obj)) = root.get_mut("data") {
-        // Special handling for _meta query response
-        if let Some(selection) = meta_selection {
-            if let Some(chain_metadata) = data_obj.get("chain_metadata") {
-                // Transform chain_metadata response to _meta format
-                // From: {"data":{"chain_metadata":[{"latest_fetched_block_number":419538012}]}}
-                // To:   {"data":{"_meta":{"block":{"number":419538012}}}}
-                //
-                // Conversion already rejected any selection we cannot answer in
-                // full, so echoing back exactly what was asked for is safe here.
-                let block_number = chain_metadata
-                    .as_array()
-                    .and_then(|arr| arr.first())
-                    .and_then(|obj| obj.get("latest_fetched_block_number"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-
-                let mut meta = serde_json::Map::new();
-                if selection.block_number || selection.block_typename {
-                    let mut block = serde_json::Map::new();
-                    if selection.block_number {
-                        block.insert("number".to_string(), block_number);
-                    }
-                    if selection.block_typename {
-                        block.insert("__typename".to_string(), Value::String("_Block_".into()));
-                    }
-                    meta.insert("block".to_string(), Value::Object(block));
-                }
-                if selection.typename {
-                    meta.insert("__typename".to_string(), Value::String("_Meta_".into()));
-                }
-
-                let mut out = serde_json::Map::new();
-                let meta_key = selection.alias.clone().unwrap_or_else(|| "_meta".to_string());
-                out.insert(meta_key, Value::Object(meta));
-                *data_obj = out;
-                return Value::Object(root);
+        // `_meta` arrives as Hyperindex's progress rows; rebuild graph-node's object.
+        for selection in meta_selections {
+            if let Some(rows) = data_obj.remove(&selection.key) {
+                data_obj.insert(selection.key.clone(), subgraph_meta(&rows, selection));
             }
         }
 
@@ -589,6 +662,54 @@ fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::colle
     }
 
     Value::Object(root)
+}
+
+/// graph-node's `_meta` object from Hyperindex's progress rows (Hasura `_meta`
+/// or `chain_metadata`), with only the fields the client selected.
+///
+/// With one row per chain, the lowest processed block is reported: the block
+/// every chain has reached.
+fn subgraph_meta(rows: &Value, selection: &conversion::MetaSelection) -> Value {
+    let progress = |row: &&Value| {
+        row.get("progressBlock")
+            .or_else(|| row.get("latest_processed_block"))
+            .and_then(Value::as_u64)
+    };
+    let row = rows
+        .as_array()
+        .and_then(|rows| rows.iter().filter(|row| progress(row).is_some()).min_by_key(|row| progress(row)));
+
+    let mut meta = serde_json::Map::new();
+    if selection.block_number || selection.block_timestamp || selection.block_typename {
+        let mut block = serde_json::Map::new();
+        if selection.block_number {
+            let number = row.and_then(|r| progress(&r)).map(Value::from).unwrap_or(Value::Null);
+            block.insert("number".to_string(), number);
+        }
+        if selection.block_timestamp {
+            // graph-node's `timestamp` is unix seconds; Hasura gives timestamptz.
+            let timestamp = row
+                .and_then(|r| r.get("progressBlockTime"))
+                .and_then(Value::as_str)
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| Value::from(t.timestamp()))
+                .unwrap_or(Value::Null);
+            block.insert("timestamp".to_string(), timestamp);
+        }
+        if selection.block_typename {
+            block.insert("__typename".to_string(), Value::String("_Block_".into()));
+        }
+        meta.insert("block".to_string(), Value::Object(block));
+    }
+    if selection.deployment {
+        // graph-node's IPFS id; Hyperindex's equivalent is the endpoint's hash.
+        let deployment = conversion::deployment_id().map(Value::String).unwrap_or(Value::Null);
+        meta.insert("deployment".to_string(), deployment);
+    }
+    if selection.typename {
+        meta.insert("__typename".to_string(), Value::String("_Meta_".into()));
+    }
+    Value::Object(meta)
 }
 
 fn is_pascal_case(s: &str) -> bool {
@@ -904,7 +1025,7 @@ mod response_shape_tests {
             }
         });
         let empty_map = std::collections::HashMap::new();
-        let out = transform_response_to_subgraph_shape(resp, &empty_map, None);
+        let out = transform_response_to_subgraph_shape(resp, &empty_map, &[]);
         let data = out.get("data").unwrap();
         assert!(data.get("streams").is_some());
         assert!(data.get("batches").is_some());
@@ -929,7 +1050,7 @@ mod response_shape_tests {
         field_map.insert("LpShare".to_string(), "lpShares".to_string());
         field_map.insert("LpNFT".to_string(), "lpNFTs".to_string());
 
-        let out = transform_response_to_subgraph_shape(resp, &field_map, None);
+        let out = transform_response_to_subgraph_shape(resp, &field_map, &[]);
         let data = out.get("data").unwrap();
 
         // Should use exact names from the map (original query field names)
@@ -947,8 +1068,8 @@ mod response_shape_tests {
         // Test _meta query response transformation
         let resp = serde_json::json!({
             "data": {
-                "chain_metadata": [
-                    {"latest_fetched_block_number": 419538012}
+                "_meta": [
+                    {"progressBlock": 419538012}
                 ]
             }
         });
@@ -956,12 +1077,11 @@ mod response_shape_tests {
         let out = transform_response_to_subgraph_shape(
             resp,
             &empty_map,
-            Some(&conversion::MetaSelection {
+            &[conversion::MetaSelection {
                 block_number: true,
-                typename: false,
-                block_typename: false,
-                alias: None,
-            }),
+                key: "_meta".to_string(),
+                ..conversion::MetaSelection::default()
+            }],
         );
         let data = out.get("data").unwrap();
 
@@ -995,7 +1115,7 @@ mod response_shape_tests {
         let out = transform_response_to_subgraph_shape(
             hasura,
             &converted.field_name_map,
-            converted.meta_selection.as_ref(),
+            &converted.meta_selections,
         );
 
         assert_eq!(
@@ -1009,10 +1129,301 @@ mod response_shape_tests {
     }
 
     #[test]
+    fn aliased_roots_come_back_under_their_alias() {
+        let payload = json!({
+            "query": "query { Recent: streams(first: 1) { id } top: tokens(first: 1) { id } }"
+        });
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let hasura = json!({"data": {
+            "Recent": [{"id": "s1"}],
+            "top": [{"id": "t1"}]
+        }});
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            &converted.meta_selections,
+        );
+        assert_eq!(
+            out,
+            json!({"data": {"Recent": [{"id": "s1"}], "top": [{"id": "t1"}]}})
+        );
+    }
+
+    #[test]
+    fn number_gte_passes_once_every_chain_has_reached_the_block() {
+        let mut resp = json!({"data": {
+            "Token": [{"id": "t"}],
+            "__converter_meta": [{"progressBlock": 120}, {"progressBlock": 100}]
+        }});
+        enforce_min_block(&mut resp, Some(100), "b232c6d");
+        assert_eq!(resp, json!({"data": {"Token": [{"id": "t"}]}}));
+    }
+
+    #[test]
+    fn number_gte_fails_while_any_chain_is_behind() {
+        let mut resp = json!({"data": {
+            "Token": [{"id": "t"}],
+            "__converter_meta": [{"progressBlock": 120}, {"progressBlock": 99}]
+        }});
+        enforce_min_block(&mut resp, Some(100), "b232c6d");
+        assert!(resp.get("data").is_none(), "{resp}");
+        assert_eq!(
+            resp,
+            json!({"errors": [{"message": "Failed to decode `block.number_gte` value: `subgraph b232c6d has only indexed up to block number 99 and data for block number 100 is therefore not yet available`"}]})
+        );
+    }
+
+    #[test]
+    fn number_gte_reads_the_chain_metadata_fallback() {
+        let mut resp = json!({"data": {
+            "Token": [],
+            "__converter_meta": [{"latest_processed_block": 50}]
+        }});
+        enforce_min_block(&mut resp, Some(60), "b232c6d");
+        assert!(resp["errors"][0]["message"].as_str().unwrap().contains("block number 50"));
+    }
+
+    #[test]
+    fn progress_key_is_removed_even_without_a_requirement() {
+        let mut resp = json!({"data": {"Token": [], "__converter_meta": [{"progressBlock": 1}]}});
+        enforce_min_block(&mut resp, None, "b232c6d");
+        assert_eq!(resp, json!({"data": {"Token": []}}));
+    }
+
+    #[test]
+    fn number_gte_end_to_end_strips_the_progress_root() {
+        crate::schema::init_test_schema_once();
+        let payload = json!({"query": "{ tokens(first: 1, block: {number_gte: 10}) { id } }"});
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(converted.min_block, Some(10));
+        let mut hasura = json!({"data": {
+            "Token": [{"id": "t"}],
+            "__converter_meta": [{"progressBlock": 10}]
+        }});
+        enforce_min_block(&mut hasura, converted.min_block, "b232c6d");
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            &converted.meta_selections,
+        );
+        assert_eq!(out, json!({"data": {"tokens": [{"id": "t"}]}}));
+    }
+
+    #[test]
+    fn meta_response_reports_the_lowest_chain_with_its_block_time() {
+        let selection = conversion::MetaSelection {
+            block_number: true,
+            block_timestamp: true,
+            typename: true,
+            block_typename: true,
+            deployment: false,
+            key: "_meta".to_string(),
+        };
+        let rows = json!([
+            {"progressBlock": 442680100, "progressBlockTime": "2026-10-19T15:03:00+00:00"},
+            {"progressBlock": 442680053, "progressBlockTime": "2026-10-19T15:02:36+00:00"}
+        ]);
+        assert_eq!(
+            subgraph_meta(&rows, &selection),
+            json!({
+                "__typename": "_Meta_",
+                "block": {"number": 442680053, "timestamp": 1792422156i64, "__typename": "_Block_"}
+            })
+        );
+    }
+
+    #[test]
+    fn meta_timestamp_with_fractional_seconds_and_null() {
+        let selection = conversion::MetaSelection {
+            block_timestamp: true,
+            key: "_meta".to_string(),
+            ..conversion::MetaSelection::default()
+        };
+        assert_eq!(
+            subgraph_meta(
+                &json!([{"progressBlock": 1, "progressBlockTime": "2026-10-19T13:05:36.429+00:00"}]),
+                &selection
+            ),
+            json!({"block": {"timestamp": 1792415136i64}})
+        );
+        // During backfill Hasura has no block time yet; graph-node's field is nullable.
+        assert_eq!(
+            subgraph_meta(&json!([{"progressBlock": 1, "progressBlockTime": null}]), &selection),
+            json!({"block": {"timestamp": null}})
+        );
+    }
+
+    #[test]
+    fn meta_alongside_entities_keeps_the_rest_of_the_response() {
+        crate::schema::init_test_schema_once();
+        let payload = json!({"query": "query { m: _meta { block { number } } tokens(first: 1) { id } }"});
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let hasura = json!({"data": {
+            "m": [{"progressBlock": 7}],
+            "Token": [{"id": "t"}]
+        }});
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            &converted.meta_selections,
+        );
+        assert_eq!(
+            out,
+            json!({"data": {"m": {"block": {"number": 7}}, "tokens": [{"id": "t"}]}})
+        );
+    }
+
+    #[test]
+    fn meta_response_from_chain_metadata_fallback() {
+        let selection = conversion::MetaSelection {
+            block_number: true,
+            key: "_meta".to_string(),
+            ..conversion::MetaSelection::default()
+        };
+        assert_eq!(
+            subgraph_meta(&json!([{"latest_processed_block": 99}]), &selection),
+            json!({"block": {"number": 99}})
+        );
+    }
+
+    #[test]
     fn responses_without_plans_are_untouched() {
         let mut resp = json!({"data": {"Stream": [{"id": "1", "_on_Supply": null}]}});
         let before = resp.clone();
         apply_shape_plans(&mut resp, &std::collections::HashMap::new());
         assert_eq!(resp, before);
     }
+
+    #[test]
+    fn chain_route_lookup_returns_the_row_or_null() {
+        crate::schema::init_test_schema_once();
+        let payload = serde_json::json!({
+            "query": "{ token(id: \"0xa\") { id } other: token(id: \"0xb\") { id } }"
+        });
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        let mut hasura = serde_json::json!({"data": {
+            "Token_by_pk": [{"id": "0xa"}],
+            "other": []
+        }});
+        unwrap_single_rows(&mut hasura, &converted.single_row_keys);
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            &converted.meta_selections,
+        );
+        assert_eq!(
+            out,
+            serde_json::json!({"data": {"token": {"id": "0xa"}, "other": null}})
+        );
+    }
+
+
+    #[test]
+    fn upstream_errors_keep_only_their_messages() {
+        let hasura = json!([
+            {"message": "field 'foo' not found in type: 'Swap'", "extensions": {"path": "$.selectionSet.Swap.selectionSet.foo", "code": "validation-failed"}},
+            {"extensions": {"code": "unexpected"}}
+        ]);
+        assert_eq!(
+            subgraph_errors(&hasura),
+            json!({"errors": [
+                {"message": "field 'foo' not found in type: 'Swap'"},
+                {"message": "{\"extensions\":{\"code\":\"unexpected\"}}"}
+            ]})
+        );
+    }
+
+    #[test]
+    fn debug_errors_switch_values() {
+        assert!(!debug_errors_setting(None));
+        assert!(!debug_errors_setting(Some("off")));
+        for on in ["on", "ON", " true ", "1", "yes"] {
+            assert!(debug_errors_setting(Some(on)), "{on}");
+        }
+    }
+
+    #[tokio::test]
+    async fn query_the_converter_cannot_run_is_a_graphql_error_with_status_200() {
+        crate::schema::init_test_schema_once();
+        let payload = json!({"query": "{ _meta { hasIndexingErrors block { number } } }"});
+        let (status, Json(body)) = execute_query_with_retry(&payload, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let errors = body["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0]["message"].as_str().unwrap().contains("hasIndexingErrors"), "{body}");
+        // graph-node's shape: no `data`, and none of the converter's diagnostics.
+        assert_eq!(body.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["errors"]);
+    }
+
+    #[tokio::test]
+    async fn request_without_a_query_string_is_a_400() {
+        crate::schema::init_test_schema_once();
+        for payload in [json!({}), json!({"query": 7})] {
+            let (status, Json(body)) = execute_query_with_retry(&payload, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+            let error = body["error"].as_str().unwrap();
+            assert!(error.starts_with("GraphQL server error (client error): "), "{error}");
+            assert_eq!(body.as_object().unwrap().len(), 1, "{body}");
+        }
+    }
+
+
+    #[test]
+    fn meta_deployment_response_is_the_indexer_hash() {
+        crate::schema::init_test_schema_once();
+        let payload = json!({"query": "{ _meta { deployment block { number } } }"});
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let hasura = json!({"data": {"_meta": [{"chainId": 5031, "progressBlock": 10}]}});
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            &converted.meta_selections,
+        );
+        assert_eq!(
+            out,
+            json!({"data": {"_meta": {"deployment": "b232c6d", "block": {"number": 10}}}})
+        );
+    }
+
+
+    #[test]
+    fn number_gte_with_no_progress_rows_says_so() {
+        let mut resp = json!({"data": {"Token": [], "__converter_meta": []}});
+        enforce_min_block(&mut resp, Some(10), "b232c6d");
+        let message = resp["errors"][0]["message"].as_str().unwrap();
+        assert!(message.contains("subgraph b232c6d has not indexed any blocks yet"), "{message}");
+        assert!(!message.contains("number no"), "{message}");
+    }
+
+    #[test]
+    fn upstream_errors_are_not_replaced_by_the_block_error() {
+        let mut resp = json!({
+            "data": {"__converter_meta": [{"progressBlock": 1}]},
+            "errors": [{"message": "upstream"}]
+        });
+        enforce_min_block(&mut resp, Some(10), "b232c6d");
+        assert_eq!(resp["errors"], json!([{"message": "upstream"}]));
+        assert!(resp["data"].get("__converter_meta").is_none());
+    }
+
+    #[test]
+    fn several_meta_roots_are_rebuilt() {
+        crate::schema::init_test_schema_once();
+        let payload = json!({"query": "{ a: _meta { block { number } } b: _meta { deployment } }"});
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let hasura = json!({"data": {
+            "a": [{"progressBlock": 7}],
+            "b": [{"progressBlock": 7}]
+        }});
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            &converted.meta_selections,
+        );
+        assert_eq!(
+            out,
+            json!({"data": {"a": {"block": {"number": 7}}, "b": {"deployment": "b232c6d"}}})
+        );
+    }
+
 }

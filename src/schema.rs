@@ -889,6 +889,41 @@ pub fn init_test_schema() {
                 ],
             ),
         );
+
+        // Hasura's native `_meta` (newer Hyperindex versions): indexing progress
+        // per chain.
+        cache.insert(
+            "_meta".to_string(),
+            build(
+                &[
+                    ("chainId", "Int"),
+                    ("progressBlock", "Int"),
+                    ("progressBlockTime", "timestamptz"),
+                ],
+                &[],
+            ),
+        );
+
+        // A singular entity name ending in `s`, which word rules would take for
+        // a plural.
+        cache.insert(
+            "Status".to_string(),
+            build(&[("id", "String"), ("name", "String")], &[]),
+        );
+
+        // A user with a list of their swaps, which nested `first`/`orderBy`
+        // arguments page and sort (the Termini history query).
+        cache.insert(
+            "SwapUser".to_string(),
+            build(&[("id", "String"), ("count", "numeric")], &[("swap", "Swap", true)]),
+        );
+        if let Some(mut swap) = cache.get_mut("Swap") {
+            for (name, ty) in [("swapUserIndex", "numeric"), ("fee", "numeric")] {
+                swap.insert(name.to_string(), scalar(ty));
+            }
+            swap.insert("tokenIn".to_string(), object("Token", false));
+            swap.insert("sender".to_string(), object("SwapUser", false));
+        }
     }
 
     // Entities whose names open with a run of capitals. graph-node queries these

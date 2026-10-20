@@ -60,7 +60,7 @@ fn test_actions_and_assets_query() {
     decimals
   }
 }"#;
-    let expected = "query {\n  Action(limit: 5, where: {chainId: {_eq: \"1\"}}) {\n    id\n    block\n    category\n    chainId\n  }\n  Asset(limit: 5, where: {chainId: {_eq: \"1\"}}) {\n    id\n    address\n    chainId\n    decimals\n  }\n}";
+    let expected = "query {\n  Action(limit: 5, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    id\n    block\n    category\n    chainId\n  }\n  Asset(limit: 5, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    id\n    address\n    chainId\n    decimals\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -74,7 +74,7 @@ fn test_streams_with_order_by_query() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
+    let expected = "query {\n  Stream(limit: 100, offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -88,7 +88,7 @@ fn test_streams_with_filter_query() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
+    let expected = "query {\n  Stream(limit: 100, offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -104,7 +104,7 @@ fn test_streams_with_order_by_and_skip_query() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
+    let expected = "query {\n  Stream(limit: 100, offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -118,7 +118,7 @@ fn test_streams_with_order_by_skip_and_filter_query() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
+    let expected = "query {\n  Stream(limit: 100, offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -142,7 +142,7 @@ fn test_complex_nested_query_with_multiple_filters() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 10, offset: 5, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%test%\"}, asset: {address: {_ilike: \"0x%\"}}}) {\n    id\n    alias\n    asset {\n      address\n      decimals\n      symbol\n    }\n  }\n}";
+    let expected = "query {\n  Stream(limit: 10, offset: 5, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%test%\"}, asset: {address: {_like: \"0x%\"}}}) {\n    id\n    alias\n    asset {\n      address\n      decimals\n      symbol\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -163,7 +163,7 @@ fn test_multiple_entities_single_query() {
     symbol
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 5, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%test%\"}}) {\n    id\n    alias\n  }\n  Action(limit: 3, where: {chainId: {_eq: \"1\"}}) {\n    id\n    category\n  }\n  Asset(limit: 2, where: {chainId: {_eq: \"1\"}}) {\n    id\n    address\n    symbol\n  }\n}";
+    let expected = "query {\n  Stream(limit: 5, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%test%\"}}) {\n    id\n    alias\n  }\n  Action(limit: 3, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    id\n    category\n  }\n  Asset(limit: 2, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    id\n    address\n    symbol\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -181,8 +181,8 @@ fn test_advanced_filter_combinations() {
     alias
   }
 }"#;
-    let variant_a = "query {\n  Stream(limit: 20, where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%test%\"}}, {_not: {alias: {_ilike: \"%invalid%\"}}}]}) {\n    id\n    alias\n  }\n}";
-    let variant_b = "query {\n  Stream(limit: 20, where: {chainId: {_eq: \"1\"}, _and: [{_not: {alias: {_ilike: \"%invalid%\"}}}, {alias: {_ilike: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_a = "query {\n  Stream(limit: 20, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _and: [{alias: {_like: \"%test%\"}}, {_not: {alias: {_like: \"%invalid%\"}}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_b = "query {\n  Stream(limit: 20, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _and: [{_not: {alias: {_like: \"%invalid%\"}}}, {alias: {_like: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
     assert_converts_to_any(subgraph, &[variant_a, variant_b]);
 }
 
@@ -200,7 +200,7 @@ fn test_pagination_and_ordering_edge_cases() {
     alias
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 1, offset: 999, order_by: {id: desc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%test%\"}}) {\n    id\n    alias\n  }\n}";
+    let expected = "query {\n  Stream(limit: 1, offset: 999, order_by: {id: desc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%test%\"}}) {\n    id\n    alias\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -218,8 +218,8 @@ fn test_string_vs_numeric_filter_values() {
     asset { decimals }
   }
 }"#;
-    let variant_a = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%ll%\"}, asset: {_and: [{decimals: {_lte: 18}}, {decimals: {_gte: 6}}]}}) {\n    id\n    alias\n    asset { decimals }\n  }\n}";
-    let variant_b = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%ll%\"}, asset: {_and: [{decimals: {_gte: 6}}, {decimals: {_lte: 18}}]}}) {\n    id\n    alias\n    asset { decimals }\n  }\n}";
+    let variant_a = "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%ll%\"}, asset: {_and: [{decimals: {_lte: 18}}, {decimals: {_gte: 6}}]}}) {\n    id\n    alias\n    asset { decimals }\n  }\n}";
+    let variant_b = "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%ll%\"}, asset: {_and: [{decimals: {_gte: 6}}, {decimals: {_lte: 18}}]}}) {\n    id\n    alias\n    asset { decimals }\n  }\n}";
     assert_converts_to_any(subgraph, &[variant_a, variant_b]);
 }
 
@@ -236,8 +236,8 @@ fn test_case_sensitive_vs_insensitive_filters() {
     alias
   }
 }"#;
-    let variant_a = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%test%\"}}, {alias: {_ilike: \"%TEST%\"}}]}) {\n    id\n    alias\n  }\n}";
-    let variant_b = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%TEST%\"}}, {alias: {_ilike: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_a = "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%test%\"}}, {alias: {_like: \"%TEST%\"}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_b = "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _and: [{alias: {_like: \"%TEST%\"}}, {alias: {_ilike: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
     assert_converts_to_any(subgraph, &[variant_a, variant_b]);
 }
 
@@ -253,7 +253,7 @@ fn test_response_format_comparison() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 10, offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
+    let expected = "query {\n  Stream(limit: 10, offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -281,7 +281,7 @@ query {
     ...AssetFields
   }
 }"#;
-    let expected = "fragment ActionFields on Action {id\n  block\n  category\n  chainId}\nfragment AssetFields on Asset {id\n  address\n  chainId\n  decimals}\nquery {\n  Action(limit: 5, where: {chainId: {_eq: \"1\"}}) {\n    ...ActionFields\n  }\n  Asset(limit: 5, where: {chainId: {_eq: \"1\"}}) {\n    ...AssetFields\n  }\n}";
+    let expected = "fragment ActionFields on Action {id\n  block\n  category\n  chainId}\nfragment AssetFields on Asset {id\n  address\n  chainId\n  decimals}\nquery {\n  Action(limit: 5, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    ...ActionFields\n  }\n  Asset(limit: 5, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    ...AssetFields\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -301,7 +301,7 @@ fn test_gist_query_1_actions_and_assets() {
     decimals
   }
 }"#;
-    let expected = "query {\n  Action(limit: 5, where: {chainId: {_eq: \"1\"}}) {\n    id\n    block\n    category\n    chainId\n  }\n  Asset(limit: 5, where: {chainId: {_eq: \"1\"}}) {\n    id\n    address\n    chainId\n    decimals\n  }\n}";
+    let expected = "query {\n  Action(limit: 5, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    id\n    block\n    category\n    chainId\n  }\n  Asset(limit: 5, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    id\n    address\n    chainId\n    decimals\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -315,7 +315,7 @@ fn test_gist_query_2_streams_with_order_by() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
+    let expected = "query {\n  Stream(limit: 100, offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -329,7 +329,7 @@ fn test_gist_query_3_streams_with_filter() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
+    let expected = "query {\n  Stream(limit: 100, offset: 10, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%113%\"}}) {\n    alias\n    asset {\n      address\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -353,7 +353,7 @@ fn test_gist_query_4_complex_nested_query() {
     }
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 10, offset: 5, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%test%\"}, asset: {address: {_ilike: \"0x%\"}}}) {\n    id\n    alias\n    asset {\n      address\n      decimals\n      symbol\n    }\n  }\n}";
+    let expected = "query {\n  Stream(limit: 10, offset: 5, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%test%\"}, asset: {address: {_like: \"0x%\"}}}) {\n    id\n    alias\n    asset {\n      address\n      decimals\n      symbol\n    }\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -374,7 +374,7 @@ fn test_gist_query_5_multiple_entities() {
     symbol
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 5, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%test%\"}}) {\n    id\n    alias\n  }\n  Action(limit: 3, where: {chainId: {_eq: \"1\"}}) {\n    id\n    category\n  }\n  Asset(limit: 2, where: {chainId: {_eq: \"1\"}}) {\n    id\n    address\n    symbol\n  }\n}";
+    let expected = "query {\n  Stream(limit: 5, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%test%\"}}) {\n    id\n    alias\n  }\n  Action(limit: 3, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    id\n    category\n  }\n  Asset(limit: 2, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    id\n    address\n    symbol\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -392,8 +392,8 @@ fn test_gist_query_6_advanced_filters() {
     alias
   }
 }"#;
-    let variant_a = "query {\n  Stream(limit: 20, where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%test%\"}}, {_not: {alias: {_ilike: \"%invalid%\"}}}]}) {\n    id\n    alias\n  }\n}";
-    let variant_b = "query {\n  Stream(limit: 20, where: {chainId: {_eq: \"1\"}, _and: [{_not: {alias: {_ilike: \"%invalid%\"}}}, {alias: {_ilike: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_a = "query {\n  Stream(limit: 20, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _and: [{alias: {_like: \"%test%\"}}, {_not: {alias: {_like: \"%invalid%\"}}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_b = "query {\n  Stream(limit: 20, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _and: [{_not: {alias: {_like: \"%invalid%\"}}}, {alias: {_like: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
     assert_converts_to_any(subgraph, &[variant_a, variant_b]);
 }
 
@@ -411,7 +411,7 @@ fn test_gist_query_7_pagination_edge_cases() {
     alias
   }
 }"#;
-    let expected = "query {\n  Stream(limit: 1, offset: 999, order_by: {id: desc}, where: {chainId: {_eq: \"1\"}, alias: {_ilike: \"%test%\"}}) {\n    id\n    alias\n  }\n}";
+    let expected = "query {\n  Stream(limit: 1, offset: 999, order_by: {id: desc}, where: {chainId: {_eq: \"1\"}, alias: {_like: \"%test%\"}}) {\n    id\n    alias\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -430,8 +430,8 @@ fn test_gist_query_8_mixed_type_filters() {
     asset { decimals }
   }
 }"#;
-    let variant_a = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, asset: {_and: [{decimals: {_lte: 18}}, {decimals: {_gte: 6}}]}}) {\n    id\n    asset { decimals }\n  }\n}";
-    let variant_b = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, asset: {_and: [{decimals: {_gte: 6}}, {decimals: {_lte: 18}}]}}) {\n    id\n    asset { decimals }\n  }\n}";
+    let variant_a = "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, asset: {_and: [{decimals: {_lte: 18}}, {decimals: {_gte: 6}}]}}) {\n    id\n    asset { decimals }\n  }\n}";
+    let variant_b = "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, asset: {_and: [{decimals: {_gte: 6}}, {decimals: {_lte: 18}}]}}) {\n    id\n    asset { decimals }\n  }\n}";
     assert_converts_to_any(subgraph, &[variant_a, variant_b]);
 }
 
@@ -448,8 +448,8 @@ fn test_gist_query_9_case_sensitivity() {
     alias
   }
 }"#;
-    let variant_a = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%test%\"}}, {alias: {_ilike: \"%TEST%\"}}]}) {\n    id\n    alias\n  }\n}";
-    let variant_b = "query {\n  Stream(where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%TEST%\"}}, {alias: {_ilike: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_a = "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _and: [{alias: {_ilike: \"%test%\"}}, {alias: {_like: \"%TEST%\"}}]}) {\n    id\n    alias\n  }\n}";
+    let variant_b = "query {\n  Stream(limit: 100, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}, _and: [{alias: {_like: \"%TEST%\"}}, {alias: {_ilike: \"%test%\"}}]}) {\n    id\n    alias\n  }\n}";
     assert_converts_to_any(subgraph, &[variant_a, variant_b]);
 }
 
@@ -477,7 +477,7 @@ query {
     ...AssetFields
   }
 }"#;
-    let expected = "fragment ActionFields on Action {id\n  block\n  category\n  chainId}\nfragment AssetFields on Asset {id\n  address\n  chainId\n  decimals}\nquery {\n  Action(limit: 5, where: {chainId: {_eq: \"1\"}}) {\n    ...ActionFields\n  }\n  Asset(limit: 5, where: {chainId: {_eq: \"1\"}}) {\n    ...AssetFields\n  }\n}";
+    let expected = "fragment ActionFields on Action {id\n  block\n  category\n  chainId}\nfragment AssetFields on Asset {id\n  address\n  chainId\n  decimals}\nquery {\n  Action(limit: 5, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    ...ActionFields\n  }\n  Asset(limit: 5, order_by: {id: asc}, where: {chainId: {_eq: \"1\"}}) {\n    ...AssetFields\n  }\n}";
     assert_converts_to(subgraph, expected);
 }
 
@@ -515,7 +515,7 @@ fn argus_launch_key_page_end_to_end() {
         "query LaunchKeyPage($where: Launch_filter!, $orderBy: Launch_orderBy!, $direction: OrderDirection!, $first: Int!) { launches(first: $first, where: $where, orderBy: $orderBy, orderDirection: $direction) { id key: createdAt } }",
         json!({"where": {"dividendsPaid_gt": "0"}, "orderBy": "createdAt", "direction": "desc", "first": 25}),
         "query LaunchKeyPage($where: Launch_bool_exp!, $orderBy: [Launch_order_by!], $first: Int!) {\n  Launch(limit: $first, order_by: $orderBy, where: $where) {\n    id key: createdAt\n  }\n}",
-        json!({"where": {"dividendsPaid": {"_gt": "0"}}, "orderBy": [{"createdAt": "desc"}, {"id": "desc"}], "first": 25}),
+        json!({"where": {"_and": [{"dividendsPaid": {"_gt": "0"}}, {"chainId": {"_eq": "5042"}}]}, "orderBy": [{"createdAt": "desc"}, {"id": "desc"}], "first": 25}),
     );
 }
 
@@ -539,9 +539,9 @@ fn argus_hours_of_launches_end_to_end() {
     );
 }
 
-/// Argus `Meta` asks for `block { timestamp }` and `hasIndexingErrors`, neither of
-/// which Hyperindex can answer. The query is rejected rather than served partially:
-/// a response missing `hasIndexingErrors` would read as "no indexing errors".
+/// Argus `Meta` asks for `hasIndexingErrors`, which Hyperindex cannot answer. The
+/// query is rejected rather than served partially: a response missing
+/// `hasIndexingErrors` would read as "no indexing errors".
 #[test]
 fn argus_meta_end_to_end_is_rejected() {
     crate::schema::init_test_schema_once();
@@ -549,7 +549,7 @@ fn argus_meta_end_to_end_is_rejected() {
         json!({ "query": "query Meta { _meta { block { number timestamp } hasIndexingErrors } }" });
     match conversion::convert_subgraph_to_hyperindex(&payload, Some("5042")) {
         Err(conversion::ConversionError::ComplexMetaQuery(fields)) => {
-            assert_eq!(fields, "block.timestamp, hasIndexingErrors")
+            assert_eq!(fields, "hasIndexingErrors")
         }
         other => panic!("expected ComplexMetaQuery, got {:?}", other.map(|r| r.query)),
     }
@@ -564,9 +564,9 @@ fn argus_meta_reduced_end_to_end() {
         .expect("block { number } is servable");
     assert_eq!(
         result.query["query"].as_str().unwrap(),
-        "query {\n  chain_metadata {\n    latest_fetched_block_number\n  }\n}"
+        "query Meta {\n  _meta(where: {chainId: {_eq: 5042}}) {\n    progressBlock\n  }\n}"
     );
-    assert!(result.meta_selection.is_some());
+    assert!(!result.meta_selections.is_empty());
 }
 
 /// Their keyset pager walks `id_gt` over `orderBy: id`. Breaking either the
