@@ -127,7 +127,7 @@ async fn execute_query_with_retry(
     let converted_query = conversion_result.query;
     let min_block = conversion_result.min_block;
     let field_name_map = conversion_result.field_name_map;
-    let meta_selection = conversion_result.meta_selection;
+    let meta_selections = conversion_result.meta_selections;
     let shape_plans = conversion_result.shape_plans;
     let single_row_keys = conversion_result.single_row_keys;
 
@@ -247,7 +247,7 @@ async fn execute_query_with_retry(
     unwrap_single_rows(&mut response, &single_row_keys);
     apply_shape_plans(&mut response, &shape_plans);
     let transformed =
-        transform_response_to_subgraph_shape(response, &field_name_map, meta_selection.as_ref());
+        transform_response_to_subgraph_shape(response, &field_name_map, &meta_selections);
     let transform_duration_ms = transform_start.elapsed().as_secs_f64() * 1000.0;
     metrics::RESPONSE_TRANSFORM_DURATION.observe(transform_duration_ms);
 
@@ -434,6 +434,8 @@ fn conversion_error_reasoning(e: &conversion::ConversionError) -> &'static str {
             "The document holds several operations. Set operationName to the one to run.",
         conversion::ConversionError::UnknownOperation(_) =>
             "operationName does not match any operation in the document.",
+        conversion::ConversionError::InvalidBlockNumber(_) =>
+            "graph-node reads number_gte as a block number and rejects anything else, null included. A negative number is accepted and always met.",
         conversion::ConversionError::UnsupportedBlockConstraint(_) =>
             "Only block: { number_gte: N } can be served: it answers from the latest state once block N is indexed. Reads pinned to a past block (number or hash) need historical state, which Hyperindex does not keep.",
     }
@@ -472,16 +474,22 @@ fn enforce_min_block(response: &mut Value, min_block: Option<u64>, deployment: &
     let Some(required) = min_block else {
         return;
     };
+    // Upstream errors are reported as they are, not hidden behind this one.
+    if response.get("errors").is_some() {
+        return;
+    }
     let indexed = lowest_progress_block(&progress);
     if indexed.map(|n| n >= required).unwrap_or(false) {
         return;
     }
-    let indexed = indexed
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "no".to_string());
-    // graph-node's wording, so clients that match on it keep working.
+    // graph-node's wording, so clients that match on it keep working. With no
+    // progress row at all the indexer has not processed a block yet.
+    let indexed = match indexed {
+        Some(n) => format!("has only indexed up to block number {}", n),
+        None => "has not indexed any blocks yet".to_string(),
+    };
     *response = graphql_errors([format!(
-        "Failed to decode `block.number_gte` value: `subgraph {} has only indexed up to block number {} and data for block number {} is therefore not yet available`",
+        "Failed to decode `block.number_gte` value: `subgraph {} {} and data for block number {} is therefore not yet available`",
         deployment, indexed, required
     )]);
 }
@@ -620,7 +628,7 @@ fn redact_upstream_error(e: &(dyn std::error::Error + 'static)) -> String {
     redact_upstream_url(&text)
 }
 
-fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::collections::HashMap<String, String>, meta_selection: Option<&conversion::MetaSelection>) -> Value {
+fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::collections::HashMap<String, String>, meta_selections: &[conversion::MetaSelection]) -> Value {
     let mut root = match resp {
         Value::Object(map) => map,
         other => return other,
@@ -628,7 +636,7 @@ fn transform_response_to_subgraph_shape(resp: Value, field_name_map: &std::colle
 
     if let Some(Value::Object(data_obj)) = root.get_mut("data") {
         // `_meta` arrives as Hyperindex's progress rows; rebuild graph-node's object.
-        if let Some(selection) = meta_selection {
+        for selection in meta_selections {
             if let Some(rows) = data_obj.remove(&selection.key) {
                 data_obj.insert(selection.key.clone(), subgraph_meta(&rows, selection));
             }
@@ -1017,7 +1025,7 @@ mod response_shape_tests {
             }
         });
         let empty_map = std::collections::HashMap::new();
-        let out = transform_response_to_subgraph_shape(resp, &empty_map, None);
+        let out = transform_response_to_subgraph_shape(resp, &empty_map, &[]);
         let data = out.get("data").unwrap();
         assert!(data.get("streams").is_some());
         assert!(data.get("batches").is_some());
@@ -1042,7 +1050,7 @@ mod response_shape_tests {
         field_map.insert("LpShare".to_string(), "lpShares".to_string());
         field_map.insert("LpNFT".to_string(), "lpNFTs".to_string());
 
-        let out = transform_response_to_subgraph_shape(resp, &field_map, None);
+        let out = transform_response_to_subgraph_shape(resp, &field_map, &[]);
         let data = out.get("data").unwrap();
 
         // Should use exact names from the map (original query field names)
@@ -1069,11 +1077,11 @@ mod response_shape_tests {
         let out = transform_response_to_subgraph_shape(
             resp,
             &empty_map,
-            Some(&conversion::MetaSelection {
+            &[conversion::MetaSelection {
                 block_number: true,
                 key: "_meta".to_string(),
                 ..conversion::MetaSelection::default()
-            }),
+            }],
         );
         let data = out.get("data").unwrap();
 
@@ -1107,7 +1115,7 @@ mod response_shape_tests {
         let out = transform_response_to_subgraph_shape(
             hasura,
             &converted.field_name_map,
-            converted.meta_selection.as_ref(),
+            &converted.meta_selections,
         );
 
         assert_eq!(
@@ -1133,7 +1141,7 @@ mod response_shape_tests {
         let out = transform_response_to_subgraph_shape(
             hasura,
             &converted.field_name_map,
-            converted.meta_selection.as_ref(),
+            &converted.meta_selections,
         );
         assert_eq!(
             out,
@@ -1196,7 +1204,7 @@ mod response_shape_tests {
         let out = transform_response_to_subgraph_shape(
             hasura,
             &converted.field_name_map,
-            converted.meta_selection.as_ref(),
+            &converted.meta_selections,
         );
         assert_eq!(out, json!({"data": {"tokens": [{"id": "t"}]}}));
     }
@@ -1257,7 +1265,7 @@ mod response_shape_tests {
         let out = transform_response_to_subgraph_shape(
             hasura,
             &converted.field_name_map,
-            converted.meta_selection.as_ref(),
+            &converted.meta_selections,
         );
         assert_eq!(
             out,
@@ -1301,7 +1309,7 @@ mod response_shape_tests {
         let out = transform_response_to_subgraph_shape(
             hasura,
             &converted.field_name_map,
-            converted.meta_selection.as_ref(),
+            &converted.meta_selections,
         );
         assert_eq!(
             out,
@@ -1369,11 +1377,52 @@ mod response_shape_tests {
         let out = transform_response_to_subgraph_shape(
             hasura,
             &converted.field_name_map,
-            converted.meta_selection.as_ref(),
+            &converted.meta_selections,
         );
         assert_eq!(
             out,
             json!({"data": {"_meta": {"deployment": "b232c6d", "block": {"number": 10}}}})
+        );
+    }
+
+
+    #[test]
+    fn number_gte_with_no_progress_rows_says_so() {
+        let mut resp = json!({"data": {"Token": [], "__converter_meta": []}});
+        enforce_min_block(&mut resp, Some(10), "b232c6d");
+        let message = resp["errors"][0]["message"].as_str().unwrap();
+        assert!(message.contains("subgraph b232c6d has not indexed any blocks yet"), "{message}");
+        assert!(!message.contains("number no"), "{message}");
+    }
+
+    #[test]
+    fn upstream_errors_are_not_replaced_by_the_block_error() {
+        let mut resp = json!({
+            "data": {"__converter_meta": [{"progressBlock": 1}]},
+            "errors": [{"message": "upstream"}]
+        });
+        enforce_min_block(&mut resp, Some(10), "b232c6d");
+        assert_eq!(resp["errors"], json!([{"message": "upstream"}]));
+        assert!(resp["data"].get("__converter_meta").is_none());
+    }
+
+    #[test]
+    fn several_meta_roots_are_rebuilt() {
+        crate::schema::init_test_schema_once();
+        let payload = json!({"query": "{ a: _meta { block { number } } b: _meta { deployment } }"});
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let hasura = json!({"data": {
+            "a": [{"progressBlock": 7}],
+            "b": [{"progressBlock": 7}]
+        }});
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            &converted.meta_selections,
+        );
+        assert_eq!(
+            out,
+            json!({"data": {"a": {"block": {"number": 7}}, "b": {"deployment": "b232c6d"}}})
         );
     }
 

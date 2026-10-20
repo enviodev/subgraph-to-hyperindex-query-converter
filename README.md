@@ -140,7 +140,9 @@ The plain string forms are case-sensitive, as in graph-node; only `_nocase` igno
 
 A string filter given a variable (`name_contains: $q`) reads a pattern variable, `$q__contains`, whose value is built from `$q`'s at request time; `$q` is dropped if nothing else uses it. Several conditions on one field (`amount_gt` and `amount_lt`) are all kept, inline or in a `where` variable, and each `_not_*` filter negates only its own condition.
 
-Filters, `first`/`skip` and `orderBy`/`orderDirection` are converted the same way on nested collections (`user { swaps(first: 10, orderBy: timestamp, orderDirection: desc) { id } }`) as on root fields. Arguments may be separated by commas or by whitespace alone.
+Filters, `first`/`skip` and `orderBy`/`orderDirection` are converted the same way on nested collections (`user { swaps(first: 10, orderBy: timestamp, orderDirection: desc) { id } }`) as on root fields. Arguments may be separated by commas or by whitespace alone. As in graph-node, a nested list takes only those arguments; anything else, such as a nested `block:`, is rejected. `@include` and `@skip` are kept on root and nested fields alike.
+
+A `where` variable's declared default (`$w: Token_filter = {symbol: "A"}`) is sent, translated, as the variable's value when the request leaves it out; Hasura could not read it in subgraph syntax. A non-null `where` variable left out is passed to Hasura as missing, which rejects the request, as graph-node does.
 
 See the full filter table and known limitations in the source code.
 
@@ -163,13 +165,13 @@ A fragment is left untouched, as before, when the surrounding type is unknown, n
 
 `deployment` is the deployment hash of `HYPERINDEX_URL`: the path segment before `/v1/graphql` (`b232c6d` in `https://indexer.hyperindex.xyz/b232c6d/v1/graphql`), or the subdomain of a dedicated host (`0xostium-7cfbfa6` in `https://0xostium-7cfbfa6.dedicated.hyperindex.xyz/v1/graphql`). It identifies the Hyperindex endpoint, not graph-node's IPFS id. Where a URL has no hash (`http://localhost:8080/v1/graphql`), `deployment` is rejected. The same value names the subgraph in the `number_gte` "only indexed up to block" error.
 
-`_meta` can be aliased and combined with entity root fields in one operation.
+`_meta` can be aliased, repeated under different aliases, and combined with entity root fields in one operation.
 
 `block.hash` and `hasIndexingErrors` have no Hyperindex source, so a selection containing any of them is rejected whole rather than answered partially: a response missing `hasIndexingErrors` would read as "no indexing errors".
 
 ## Block constraints
 
-`block: { number_gte: N }` (on any root field, or on `_meta`) is answered from the latest state once every chain has indexed block N, and with graph-node's "only indexed up to block" error before then. Literal, `$n` and `$block: Block_height` forms work.
+`block: { number_gte: N }` (on any root field, or on `_meta`) is answered from the latest state once every chain has indexed block N, and with graph-node's "only indexed up to block" error before then. Literal, `$n` and `$block: Block_height` forms work, with graph-node's reading of the value: a negative N is always met, a null or missing `$n` is an error, and a null `$block` means the latest block.
 
 `block: { number: N }` and `block: { hash: ... }` ask for the state at a past block. Hyperindex does not keep historical state, so these are rejected rather than answered from the latest state. `subgraphError` is accepted and ignored: a Hyperindex indexer stops on a handler error, so there is no failed-but-serving state to choose.
 

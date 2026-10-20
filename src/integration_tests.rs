@@ -566,7 +566,7 @@ fn argus_meta_reduced_end_to_end() {
         result.query["query"].as_str().unwrap(),
         "query Meta {\n  _meta(where: {chainId: {_eq: 5042}}) {\n    progressBlock\n  }\n}"
     );
-    assert!(result.meta_selection.is_some());
+    assert!(!result.meta_selections.is_empty());
 }
 
 /// Their keyset pager walks `id_gt` over `orderBy: id`. Breaking either the
