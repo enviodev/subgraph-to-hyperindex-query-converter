@@ -73,9 +73,6 @@ CONVERTER_DEFAULT_FIRST=100
 CONVERTER_DEFAULT_ORDER_ID=on
 # Set to on to add the converter's diagnostics to error responses (see "Errors")
 CONVERTER_DEBUG_ERRORS=off
-# The subgraph name in graph-node's "only indexed up to block" error; defaults to the
-# deployment hash in HYPERINDEX_URL
-CONVERTER_DEPLOYMENT_ID=
 ```
 
 ### Run with Docker
@@ -164,9 +161,11 @@ A fragment is left untouched, as before, when the surrounding type is unknown, n
 
 `_meta { block { number timestamp } }` is answered from Hyperindex's indexing progress: Hasura's `_meta.progressBlock` and `progressBlockTime` (as unix seconds), or `chain_metadata.latest_processed_block` on indexers that predate Hasura's `_meta` (those cannot serve `timestamp`). `__typename` is answered locally. On `/chainId/{id}` the progress of that chain is reported; otherwise the lowest chain's, the block every chain has reached.
 
+`deployment` is the deployment hash of `HYPERINDEX_URL`: the path segment before `/v1/graphql` (`b232c6d` in `https://indexer.hyperindex.xyz/b232c6d/v1/graphql`), or the subdomain of a dedicated host (`0xostium-7cfbfa6` in `https://0xostium-7cfbfa6.dedicated.hyperindex.xyz/v1/graphql`). It identifies the Hyperindex endpoint, not graph-node's IPFS id. Where a URL has no hash (`http://localhost:8080/v1/graphql`), `deployment` is rejected. The same value names the subgraph in the `number_gte` "only indexed up to block" error.
+
 `_meta` can be aliased and combined with entity root fields in one operation.
 
-`deployment`, `block.hash` and `hasIndexingErrors` have no Hyperindex source, so a selection containing any of them is rejected whole rather than answered partially: a response missing `hasIndexingErrors` would read as "no indexing errors".
+`block.hash` and `hasIndexingErrors` have no Hyperindex source, so a selection containing any of them is rejected whole rather than answered partially: a response missing `hasIndexingErrors` would read as "no indexing errors".
 
 ## Block constraints
 
@@ -200,7 +199,7 @@ One thing this does not do:
 
 - Uses string parsing rather than a full GraphQL parser
 - Historical (time-travel) queries, `block: { number }` and `block: { hash }`, are rejected; see "Block constraints"
-- `_meta` cannot serve `deployment`, `block.hash` or `hasIndexingErrors`
+- `_meta` cannot serve `block.hash` or `hasIndexingErrors`, and `deployment` is the Hyperindex endpoint's hash rather than an IPFS id
 - `first` above 1000 and `skip` above 5000 are passed through, where graph-node would reject them
 - Default limit should not exceed 1000 unless HyperIndex is configured for higher limits
 

@@ -407,25 +407,9 @@ fn debug_errors_setting(value: Option<&str>) -> bool {
 }
 
 /// What graph-node's "only indexed up to block" error names as the subgraph:
-/// `CONVERTER_DEPLOYMENT_ID` when set, otherwise the deployment hash in
-/// `HYPERINDEX_URL` (`b232c6d` in `https://indexer.hyperindex.xyz/b232c6d/v1/graphql`).
+/// the deployment hash of `HYPERINDEX_URL`, as `_meta.deployment` reports it.
 fn deployment_label() -> String {
-    if let Ok(id) = std::env::var("CONVERTER_DEPLOYMENT_ID") {
-        if !id.trim().is_empty() {
-            return id.trim().to_string();
-        }
-    }
-    std::env::var("HYPERINDEX_URL")
-        .ok()
-        .and_then(|url| url_deployment_hash(&url))
-        .unwrap_or_else(|| "hyperindex".to_string())
-}
-
-/// The first path segment of an indexer URL, when it is followed by `/v1/graphql`.
-fn url_deployment_hash(url: &str) -> Option<String> {
-    let path = url.split("://").nth(1)?.split_once('/')?.1;
-    let (hash, rest) = path.split_once('/')?;
-    (rest.starts_with("v1/graphql") && !hash.is_empty()).then(|| hash.to_string())
+    conversion::deployment_id().unwrap_or_else(|| "hyperindex".to_string())
 }
 
 /// Why a conversion error happened, for the `/debug` endpoints and
@@ -441,7 +425,7 @@ fn conversion_error_reasoning(e: &conversion::ConversionError) -> &'static str {
         conversion::ConversionError::UnsupportedFilter(_filter) =>
             "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
         conversion::ConversionError::ComplexMetaQuery(_) =>
-            "Hyperindex can answer _meta { block { number timestamp } } (timestamp needs an indexer with Hasura's _meta). deployment, block.hash and hasIndexingErrors have no Hyperindex source. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
+            "Hyperindex can answer _meta { deployment block { number timestamp } } (timestamp needs an indexer with Hasura's _meta; deployment is the deployment hash of HYPERINDEX_URL). block.hash and hasIndexingErrors have no Hyperindex source. The query is rejected rather than served partially, because a response missing these fields would be indistinguishable from one where they were false or zero.",
         conversion::ConversionError::MissingOperationName =>
             "The document holds several operations. Set operationName to the one to run.",
         conversion::ConversionError::UnknownOperation(_) =>
@@ -617,6 +601,11 @@ fn subgraph_meta(rows: &Value, selection: &conversion::MetaSelection) -> Value {
             block.insert("__typename".to_string(), Value::String("_Block_".into()));
         }
         meta.insert("block".to_string(), Value::Object(block));
+    }
+    if selection.deployment {
+        // graph-node's IPFS id; Hyperindex's equivalent is the endpoint's hash.
+        let deployment = conversion::deployment_id().map(Value::String).unwrap_or(Value::Null);
+        meta.insert("deployment".to_string(), deployment);
     }
     if selection.typename {
         meta.insert("__typename".to_string(), Value::String("_Meta_".into()));
@@ -1043,6 +1032,7 @@ mod response_shape_tests {
             block_timestamp: true,
             typename: true,
             block_typename: true,
+            deployment: false,
             key: "_meta".to_string(),
         };
         let rows = json!([
@@ -1160,20 +1150,6 @@ mod response_shape_tests {
     }
 
     #[test]
-    fn deployment_hash_from_the_indexer_url() {
-        assert_eq!(
-            url_deployment_hash("https://indexer.hyperindex.xyz/b232c6d/v1/graphql").as_deref(),
-            Some("b232c6d")
-        );
-        assert_eq!(
-            url_deployment_hash("https://indexer.eu.hyperindex.xyz/303e73c/v1/graphql").as_deref(),
-            Some("303e73c")
-        );
-        assert_eq!(url_deployment_hash("http://localhost:8080/v1/graphql"), None);
-        assert_eq!(url_deployment_hash("not a url"), None);
-    }
-
-    #[test]
     fn debug_errors_switch_values() {
         assert!(!debug_errors_setting(None));
         assert!(!debug_errors_setting(Some("off")));
@@ -1185,12 +1161,12 @@ mod response_shape_tests {
     #[tokio::test]
     async fn query_the_converter_cannot_run_is_a_graphql_error_with_status_200() {
         crate::schema::init_test_schema_once();
-        let payload = json!({"query": "{ _meta { deployment block { number } } }"});
+        let payload = json!({"query": "{ _meta { hasIndexingErrors block { number } } }"});
         let (status, Json(body)) = execute_query_with_retry(&payload, None).await;
         assert_eq!(status, StatusCode::OK);
         let errors = body["errors"].as_array().unwrap();
         assert_eq!(errors.len(), 1);
-        assert!(errors[0]["message"].as_str().unwrap().contains("deployment"), "{body}");
+        assert!(errors[0]["message"].as_str().unwrap().contains("hasIndexingErrors"), "{body}");
         // graph-node's shape: no `data`, and none of the converter's diagnostics.
         assert_eq!(body.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["errors"]);
     }
@@ -1205,6 +1181,24 @@ mod response_shape_tests {
             assert!(error.starts_with("GraphQL server error (client error): "), "{error}");
             assert_eq!(body.as_object().unwrap().len(), 1, "{body}");
         }
+    }
+
+
+    #[test]
+    fn meta_deployment_response_is_the_indexer_hash() {
+        crate::schema::init_test_schema_once();
+        let payload = json!({"query": "{ _meta { deployment block { number } } }"});
+        let converted = conversion::convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let hasura = json!({"data": {"_meta": [{"chainId": 5031, "progressBlock": 10}]}});
+        let out = transform_response_to_subgraph_shape(
+            hasura,
+            &converted.field_name_map,
+            converted.meta_selection.as_ref(),
+        );
+        assert_eq!(
+            out,
+            json!({"data": {"_meta": {"deployment": "b232c6d", "block": {"number": 10}}}})
+        );
     }
 
 }

@@ -15,7 +15,7 @@ pub enum ConversionError {
     MissingField(String),
     #[error("Unsupported filter: {0}")]
     UnsupportedFilter(String),
-    #[error("_meta fields with no Hyperindex equivalent: {0}. Only _meta {{ block {{ number timestamp }} }} can be served (block.timestamp needs an indexer with Hasura's _meta), and a partial answer would look like a complete one to the caller")]
+    #[error("_meta fields with no Hyperindex equivalent: {0}. Only _meta {{ deployment block {{ number timestamp }} }} can be served (block.timestamp needs an indexer with Hasura's _meta, deployment a HYPERINDEX_URL with a deployment hash), and a partial answer would look like a complete one to the caller")]
     ComplexMetaQuery(String),
     #[error("Must provide operation name if query contains multiple operations")]
     MissingOperationName,
@@ -979,7 +979,12 @@ fn convert_main_query(
             ));
         }
         let key = meta.alias.unwrap_or_else(|| "_meta".to_string());
-        let selection = convert_meta_selection(&meta.selection, native_meta, key.clone())?;
+        let selection = convert_meta_selection(
+            &meta.selection,
+            native_meta,
+            deployment_id().is_some(),
+            key.clone(),
+        )?;
         // The response key is rebuilt in place and must not be renamed after.
         field_name_map.insert(key.clone(), key.clone());
         meta_lines.push(progress_root(
@@ -2424,8 +2429,37 @@ pub struct MetaSelection {
     pub block_timestamp: bool,
     pub typename: bool,
     pub block_typename: bool,
+    pub deployment: bool,
     /// Response key: the client's alias, or `_meta`.
     pub key: String,
+}
+
+/// The deployment hash of the configured Hyperindex endpoint, which stands in
+/// for graph-node's deployment id in `_meta.deployment` and in errors.
+pub fn deployment_id() -> Option<String> {
+    if cfg!(test) {
+        return Some("b232c6d".to_string());
+    }
+    std::env::var("HYPERINDEX_URL")
+        .ok()
+        .and_then(|url| deployment_id_from_url(&url))
+}
+
+/// The deployment hash in a Hyperindex GraphQL URL: the path segment before
+/// `/v1/graphql` (`https://indexer.hyperindex.xyz/b232c6d/v1/graphql`), or the
+/// subdomain of a dedicated host (`https://0xostium-7cfbfa6.dedicated.hyperindex.xyz/v1/graphql`).
+pub fn deployment_id_from_url(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.split(':').next().unwrap_or(host);
+    match path.trim_end_matches('/').split('/').collect::<Vec<_>>().as_slice() {
+        [hash, "v1", "graphql"] if !hash.is_empty() => Some(hash.to_string()),
+        ["v1", "graphql"] => host
+            .strip_suffix(".dedicated.hyperindex.xyz")
+            .filter(|label| !label.is_empty() && !label.contains('.'))
+            .map(str::to_string),
+        _ => None,
+    }
 }
 
 /// Read a `_meta` selection, refusing it whole if any field cannot be served.
@@ -2437,6 +2471,7 @@ pub struct MetaSelection {
 fn convert_meta_selection(
     selection: &str,
     native: bool,
+    deployment_known: bool,
     key: String,
 ) -> Result<MetaSelection, ConversionError> {
     let requested = selection_leaf_paths(selection);
@@ -2447,6 +2482,7 @@ fn convert_meta_selection(
     let servable = |path: &str| match path {
         "block.number" | "__typename" | "block.__typename" => true,
         "block.timestamp" => native,
+        "deployment" => deployment_known,
         _ => false,
     };
     let unsupported: Vec<String> = requested
@@ -2463,6 +2499,7 @@ fn convert_meta_selection(
         block_timestamp: requested.iter().any(|p| p == "block.timestamp"),
         typename: requested.iter().any(|p| p == "__typename"),
         block_typename: requested.iter().any(|p| p == "block.__typename"),
+        deployment: requested.iter().any(|p| p == "deployment"),
         key,
     })
 }
@@ -3903,8 +3940,8 @@ mod tests {
                 "hasIndexingErrors",
             ),
             (
-                "query { _meta { block { number } deployment } }",
-                "deployment",
+                "query { _meta { block { number } deployment hasIndexingErrors } }",
+                "hasIndexingErrors",
             ),
         ] {
             let payload = create_test_payload(query);
@@ -4011,14 +4048,10 @@ mod tests {
     #[test]
     fn test_meta_query_with_deployment() {
         init_test_schema_if_needed();
-        // deployment field should trigger ComplexMetaQuery error
+        // deployment is answered from the Hyperindex endpoint's deployment hash.
         let payload = create_test_payload("query { _meta { deployment } }");
-        let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
-        assert!(result.is_err());
-        match result {
-            Err(ConversionError::ComplexMetaQuery(_)) => {}
-            _ => panic!("Expected ComplexMetaQuery error"),
-        }
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        assert!(result.meta_selection.unwrap().deployment);
     }
 
     #[test]
@@ -4047,7 +4080,7 @@ mod tests {
             "query {\n  _meta(where: {chainId: {_eq: 1}}) {\n    progressBlock progressBlockTime\n  }\n}"
         );
         assert!(result.meta_selection.unwrap().block_timestamp);
-        match convert_meta_selection("block { timestamp }", false, "_meta".to_string()) {
+        match convert_meta_selection("block { timestamp }", false, true, "_meta".to_string()) {
             Err(ConversionError::ComplexMetaQuery(fields)) => assert_eq!(fields, "block.timestamp"),
             other => panic!("expected ComplexMetaQuery, got {:?}", other),
         }
@@ -7717,7 +7750,7 @@ mod tests {
             progress_root("_meta", None, false, false),
             "  _meta: chain_metadata {\n    latest_processed_block\n  }"
         );
-        let selection = convert_meta_selection("block { number }", false, "_meta".to_string());
+        let selection = convert_meta_selection("block { number }", false, true, "_meta".to_string());
         assert!(selection.unwrap().block_number);
     }
 
@@ -7729,7 +7762,7 @@ mod tests {
         );
         match convert_subgraph_to_hyperindex(&payload, None) {
             Err(ConversionError::ComplexMetaQuery(fields)) => {
-                assert_eq!(fields, "deployment, block.hash, hasIndexingErrors")
+                assert_eq!(fields, "block.hash, hasIndexingErrors")
             }
             other => panic!("expected ComplexMetaQuery, got {:?}", other.map(|r| r.query)),
         }
@@ -8241,6 +8274,44 @@ mod tests {
         // `$d` is left to Hasura, which applies its default; a missing `$req` is
         // the client's error to see.
         assert_eq!(result.query["variables"], json!({"first": 5}));
+    }
+
+
+    #[test]
+    fn deployment_id_from_hyperindex_urls() {
+        for (url, id) in [
+            ("https://indexer.hyperindex.xyz/b232c6d/v1/graphql", Some("b232c6d")),
+            ("https://indexer.eu.hyperindex.xyz/303e73c/v1/graphql", Some("303e73c")),
+            ("https://indexer.us.hyperindex.xyz/32230f9/v1/graphql/", Some("32230f9")),
+            ("https://0xostium-7cfbfa6.dedicated.hyperindex.xyz/v1/graphql", Some("0xostium-7cfbfa6")),
+            // The converter's own endpoint is not the indexer's.
+            ("https://indexer.us.hyperindex.xyz/32230f9/converter", None),
+            ("https://indexer.hyperindex.xyz/v1/graphql", None),
+            ("http://localhost:8080/v1/graphql", None),
+            ("not a url", None),
+        ] {
+            assert_eq!(deployment_id_from_url(url).as_deref(), id, "{url}");
+        }
+    }
+
+    #[test]
+    fn meta_deployment_is_served() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { _meta { deployment block { number } } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let selection = result.meta_selection.unwrap();
+        assert!(selection.deployment && selection.block_number);
+        let query = result.query["query"].as_str().unwrap();
+        // Answered locally: nothing about it goes upstream.
+        assert!(!query.contains("deployment"), "{query}");
+    }
+
+    #[test]
+    fn meta_deployment_needs_a_known_deployment() {
+        match convert_meta_selection("deployment", true, false, "_meta".to_string()) {
+            Err(ConversionError::ComplexMetaQuery(fields)) => assert_eq!(fields, "deployment"),
+            other => panic!("expected ComplexMetaQuery, got {other:?}"),
+        }
     }
 
 }
