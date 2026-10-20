@@ -15,6 +15,8 @@ pub enum ConversionError {
     MissingField(String),
     #[error("Unsupported filter: {0}")]
     UnsupportedFilter(String),
+    #[error("Nested field `{0}` has arguments that cannot be translated: {1}")]
+    UnsupportedNestedArgument(String, String),
     #[error("_meta fields with no Hyperindex equivalent: {0}. Only _meta {{ deployment block {{ number timestamp }} }} can be served (block.timestamp needs an indexer with Hasura's _meta, deployment a HYPERINDEX_URL with a deployment hash), and a partial answer would look like a complete one to the caller")]
     ComplexMetaQuery(String),
     #[error("Must provide operation name if query contains multiple operations")]
@@ -39,7 +41,7 @@ impl ConversionError {
 
 /// Where one half of an `order_by` pair comes from: a GraphQL variable the client
 /// sends, or a literal written into the query text.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderValueSource {
     Variable(String),
     Literal(String),
@@ -931,14 +933,15 @@ fn convert_main_query(
             (None, main_query.to_string())
         }
     } else if main_query.trim().starts_with('{') {
-        // Already a selection body, no header
-        (
-            None,
-            main_query
-                .trim_start_matches('{')
-                .trim_end_matches('}')
-                .to_string(),
-        )
+        // Already a selection body, no header. Strip exactly one brace at each
+        // end: `trim_start_matches`/`trim_end_matches` remove *every* repeat, so
+        // `{reserves{id}}` lost the inner `}` and the selection never closed.
+        let trimmed = main_query.trim();
+        let body = trimmed
+            .strip_prefix('{')
+            .map(|rest| rest.strip_suffix('}').unwrap_or(rest))
+            .unwrap_or(trimmed);
+        (None, body.to_string())
     } else {
         (None, main_query.to_string())
     };
@@ -963,7 +966,7 @@ fn convert_main_query(
     // filters, or `block` would become a `where` on a column that does not exist.
     let mut min_blocks = Vec::new();
     for root in roots.iter_mut() {
-        min_blocks.extend(take_block_arguments(&mut root.params, &mut ctx)?);
+        min_blocks.extend(take_block_arguments(root, &mut ctx)?);
     }
 
     // `_meta` reads Hyperindex's indexing progress, not an entity.
@@ -1037,6 +1040,13 @@ fn convert_main_query(
     let mut shape_plans: HashMap<String, ShapePlan> = HashMap::new();
     let mut single_row_keys = Vec::new();
 
+    // Response keys handed out in this operation, each with the caller key it
+    // resolves to. Hasura requires response names to be unique, and
+    // `field_name_map` has to stay injective or two roots collapse onto one key
+    // in the rename pass. Two roots that share a caller key are the deliberate
+    // merge case (`{ trades { a } trades { b } }`) and keep the same key.
+    let mut used_response_keys: HashMap<String, String> = HashMap::new();
+
     for ((root, (entity_cap, is_pk)), selection) in roots.into_iter().zip(classified).zip(selections)
     {
         let RootField {
@@ -1045,35 +1055,65 @@ fn convert_main_query(
             params,
             ..
         } = root;
+
+        // The key the caller expects to read the result under.
+        let client_key = alias.clone().unwrap_or_else(|| entity.clone());
+        // The key we would naturally emit for it.
+        let natural_key = match (&alias, is_pk) {
+            (Some(a), _) => a.clone(),
+            (None, true) => format!("{}_by_pk", entity_cap),
+            (None, false) => entity_cap.clone(),
+        };
+        // An alias is free-form, so it can collide with another root's entity
+        // name (`users: reserves` beside `users`, or `Reserve: users` beside
+        // `reserves`). Hasura rejects duplicate response names outright, and a
+        // duplicate `field_name_map` key silently drops one result set, so
+        // disambiguate before either can happen.
+        let response_key = {
+            let mut candidate = natural_key.clone();
+            let mut n = 2;
+            while used_response_keys
+                .get(&candidate)
+                .is_some_and(|taken| *taken != client_key)
+            {
+                candidate = format!("{}_{}", natural_key, n);
+                n += 1;
+            }
+            candidate
+        };
+        used_response_keys.insert(response_key.clone(), client_key.clone());
+
         let selection = match root_rewrites.next().flatten() {
             Some(rewrite) => {
-                // Key by the response key of the root field actually emitted below,
-                // and merge: the same entity can be selected twice in one operation
-                // (GraphQL merges them).
-                let key = match &alias {
-                    Some(alias) => alias.clone(),
-                    None if is_pk => format!("{}_by_pk", entity_cap),
-                    None => entity_cap.clone(),
-                };
-                shape_plans.entry(key).or_default().merge(rewrite.plan);
+                // Key by the root field actually emitted below, and merge: the same
+                // entity can be selected twice in one operation (GraphQL merges them).
+                shape_plans
+                    .entry(response_key.clone())
+                    .or_default()
+                    .merge(rewrite.plan);
                 rewrite.selection
             }
             None => selection,
         };
 
-        // Record the mapping: Hyperindex name -> original query name
-        // e.g., "LpAction" -> "lpActions", "LpAction_by_pk" -> "lpActions"
-        field_name_map.insert(entity_cap.clone(), entity.clone());
-        field_name_map.insert(format!("{}_by_pk", entity_cap), entity.clone());
-        // An aliased root comes back under the alias, which the client chose and
-        // expects verbatim. Mapping it to itself keeps the PascalCase fallback in
-        // the response transform from renaming it.
-        let alias_prefix = match &alias {
-            Some(alias) => {
-                field_name_map.insert(alias.clone(), alias.clone());
-                format!("{}: ", alias)
-            }
-            None => String::new(),
+        // Record the mapping: emitted response key -> the key the caller asked
+        // for. For an unaliased root those differ ("LpAction" -> "lpActions");
+        // for an aliased one the alias maps to itself, and that identity entry
+        // also keeps the PascalCase fallback in
+        // `transform_response_to_subgraph_shape` from rewriting it.
+        field_name_map.insert(response_key.clone(), client_key);
+
+        // Hasura honours aliases, so the root is emitted under the key the
+        // response needs.
+        let hasura_field = if is_pk {
+            format!("{}_by_pk", entity_cap)
+        } else {
+            entity_cap.clone()
+        };
+        let alias_prefix = if response_key == hasura_field {
+            String::new()
+        } else {
+            format!("{}: ", response_key)
         };
 
         // Single-entity by primary key: singular entity, only 'id' param
@@ -1081,9 +1121,6 @@ fn convert_main_query(
             // `_by_pk` takes no filter, so it would return the row whatever its
             // chain. A one-row collection read under the same response key
             // keeps the chain filter; the caller unwraps it (`single_row_keys`).
-            let key = alias
-                .clone()
-                .unwrap_or_else(|| format!("{}_by_pk", entity_cap));
             let mut filters = HashMap::new();
             filters.insert("id".to_string(), params["id"].clone());
             filters.insert(
@@ -1095,16 +1132,16 @@ fn convert_main_query(
                 .extend(converted.variable_type_overrides);
             converted_entities.push(format!(
                 "  {}: {}(limit: 1, {}) {}",
-                key, entity_cap, converted.where_clause, selection
+                response_key, entity_cap, converted.where_clause, selection
             ));
-            single_row_keys.push(key);
+            single_row_keys.push(response_key);
             continue;
         }
         if is_pk {
             let pk_query = format!(
-                "  {}{}_by_pk(id: {}) {}",
+                "  {}{}(id: {}) {}",
                 alias_prefix,
-                entity_cap,
+                hasura_field,
                 params.get("id").unwrap(),
                 selection
             );
@@ -1234,61 +1271,48 @@ fn convert_main_query(
 /// serve data; a Hyperindex indexer stops on a handler error instead, so there is
 /// nothing to choose and the argument is dropped.
 fn take_block_arguments(
-    params: &mut HashMap<String, String>,
+    root: &mut RootField,
     ctx: &mut ArgContext,
 ) -> Result<Vec<MinBlockSource>, ConversionError> {
     let mut sources = Vec::new();
-    if let Some(value) = params.remove("subgraphError") {
+    if let Some(value) = root.params.remove("subgraphError") {
         if let Some(var) = value.trim().strip_prefix('$') {
             ctx.dead_candidates.push(var.to_string());
         }
     }
-    if let Some(value) = params.remove("block") {
-        match value.trim().strip_prefix('$') {
+    let Some(value) = root.block_argument.take() else {
+        return Ok(sources);
+    };
+    let unsupported = || ConversionError::UnsupportedBlockConstraint(format!("block: {}", value));
+    if let Some(var) = value.strip_prefix('$') {
+        ctx.dead_candidates.push(var.to_string());
+        sources.push(MinBlockSource::BlockVariable(var.to_string()));
+        return Ok(sources);
+    }
+    // Only `number_gte` can be answered; anything else (`number`, `hash`, an
+    // unknown key, an empty object) could be a stricter constraint than it looks.
+    let fields = value
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .map(top_level_arguments)
+        .unwrap_or_default();
+    if fields.is_empty() {
+        return Err(unsupported());
+    }
+    for field in fields {
+        if field.name != "number_gte" {
+            return Err(unsupported());
+        }
+        let n = field.value.trim();
+        match n.strip_prefix('$') {
             Some(var) => {
                 ctx.dead_candidates.push(var.to_string());
-                sources.push(MinBlockSource::BlockVariable(var.to_string()));
+                sources.push(MinBlockSource::NumberVariable(var.to_string()));
             }
-            None => {
-                return Err(ConversionError::UnsupportedBlockConstraint(format!(
-                    "block: {}",
-                    value.trim()
-                )))
-            }
-        }
-    }
-    let mut keys: Vec<String> = params
-        .keys()
-        .filter(|k| k.starts_with("block."))
-        .cloned()
-        .collect();
-    keys.sort();
-    for key in keys {
-        let value = params.remove(&key).unwrap_or_default();
-        let value = value.trim();
-        match key.as_str() {
-            "block.number_gte" => match value.strip_prefix('$') {
-                Some(var) => {
-                    ctx.dead_candidates.push(var.to_string());
-                    sources.push(MinBlockSource::NumberVariable(var.to_string()));
-                }
-                None => match value.trim_matches('"').parse::<u64>() {
-                    Ok(n) => sources.push(MinBlockSource::Literal(n)),
-                    Err(_) => {
-                        return Err(ConversionError::UnsupportedBlockConstraint(format!(
-                            "block: {{ number_gte: {} }}",
-                            value
-                        )))
-                    }
-                },
+            None => match n.trim_matches('"').parse::<u64>() {
+                Ok(n) => sources.push(MinBlockSource::Literal(n)),
+                Err(_) => return Err(unsupported()),
             },
-            _ => {
-                return Err(ConversionError::UnsupportedBlockConstraint(format!(
-                    "block: {{ {}: {} }}",
-                    key.trim_start_matches("block."),
-                    value
-                )))
-            }
         }
     }
     Ok(sources)
@@ -1375,11 +1399,9 @@ struct ArgContext {
 /// lookup.
 fn classify_root_field(name: &str, params: &HashMap<String, String>) -> (String, bool) {
     let id_only = params.len() == 1 && params.contains_key("id");
-    if let Some(entity) = schema::entity_for_single_field(name) {
-        return (entity, id_only);
-    }
     if let Some(entity) = schema::resolve_entity_for_collection_field(name) {
-        return (entity, false);
+        let singular = schema::is_singular_field_for(name, &entity).unwrap_or(false);
+        return (entity, singular && id_only);
     }
     let entity = singularize_and_capitalize(name);
     (entity, !name.ends_with('s') && id_only)
@@ -1705,9 +1727,25 @@ fn plan_order_by(
     // instead of quietly returning unordered rows.
     let var = field.trim_start_matches('$').to_string();
 
+    let direction_source = match (&dir_var, order_dir) {
+        (Some(d), _) => OrderValueSource::Variable(d.clone()),
+        (None, Some(lit)) => OrderValueSource::Literal(lit.to_string()),
+        (None, None) => OrderValueSource::Literal("asc".to_string()),
+    };
+
+    // Two roots can share one `orderBy` variable while asking for different
+    // directions (`a: reserves(orderBy: $o, orderDirection: $d1)` beside
+    // `b: … $d2`). They cannot then share one rewritten variable, or the second
+    // root silently inherits the first root's direction.
+    let direction_conflict = order_var_owner.get(&var).is_some()
+        && specs
+            .iter()
+            .any(|sp| sp.target_var == var && sp.direction_source != direction_source);
+
     let target_var = match order_var_owner.get(&var) {
-        // One variable cannot be typed as two different entities' order_by.
-        Some(prev) if prev != entity_cap => {
+        // One variable cannot be typed as two different entities' order_by, nor
+        // carry two different directions.
+        Some(prev) if prev != entity_cap || direction_conflict => {
             let mut name;
             loop {
                 *synth_counter += 1;
@@ -1729,15 +1767,14 @@ fn plan_order_by(
         dead_candidates.push(dir);
     }
 
-    if !specs.iter().any(|sp| sp.target_var == target_var) {
+    if !specs
+        .iter()
+        .any(|sp| sp.target_var == target_var && sp.direction_source == direction_source)
+    {
         specs.push(OrderBySpec {
             target_var: target_var.clone(),
             field_source: OrderValueSource::Variable(var),
-            direction_source: match (&dir_var, order_dir) {
-                (Some(d), _) => OrderValueSource::Variable(d.clone()),
-                (None, Some(lit)) => OrderValueSource::Literal(lit.to_string()),
-                (None, None) => OrderValueSource::Literal("asc".to_string()),
-            },
+            direction_source,
             entity: entity_cap.to_string(),
         });
     }
@@ -1871,6 +1908,13 @@ fn match_paren(chars: &[char], open: usize) -> Option<usize> {
         } else {
             match c {
                 '"' => in_str = true,
+                // A `#` comment runs to the end of the line and may hold a `)`.
+                '#' => {
+                    while i < chars.len() && chars[i] != '\n' && chars[i] != '\r' {
+                        i += 1;
+                    }
+                    continue;
+                }
                 '(' | '[' | '{' => depth += 1,
                 ')' | ']' | '}' => {
                     depth -= 1;
@@ -1970,13 +2014,20 @@ fn rewrite_filter_type_names(header: &str) -> String {
     out
 }
 
-/// One root field of an operation, as written by the client.
 struct RootField {
     /// Response key the client asked for (`recent` in `recent: swaps`).
     alias: Option<String>,
     /// The subgraph field name (`swaps`).
     name: String,
     params: HashMap<String, String>,
+    /// The raw value of a top-level `block:` argument (`{ number_gte: 5 }`,
+    /// `$block`), taken out of the argument text before it is parsed.
+    ///
+    /// Read from the raw text rather than from `params`, because
+    /// `parse_single_param` hoists the contents of `where: {...}` into the same
+    /// map unprefixed. By then a `block` key is ambiguous: it is equally the
+    /// block argument and a filter on an entity that has a `block` field.
+    block_argument: Option<String>,
     /// The selection set's contents, without the enclosing braces.
     selection: String,
 }
@@ -2022,36 +2073,39 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
             continue;
         }
 
-        let entity_name = query_chars[entity_start..current_pos]
+        let mut token_end = current_pos;
+        let mut entity_name = query_chars[entity_start..current_pos]
             .iter()
             .collect::<String>();
 
-        // `recent: swaps(...)`: the first name is the response key the client
-        // asked for, and the field itself follows the colon.
-        let mut alias = None;
-        let mut lookahead = current_pos;
-        while lookahead < query_chars.len() && query_chars[lookahead].is_whitespace() {
-            lookahead += 1;
+        // `alias: field` - GraphQL lets any root field be renamed, and the
+        // response must use the alias. This has to run before the validity
+        // guard below, which would otherwise discard a short alias like `a`.
+        let mut alias: Option<String> = None;
+        {
+            let mut probe = current_pos;
+            while probe < query_chars.len() && query_chars[probe].is_whitespace() {
+                probe += 1;
+            }
+            if probe < query_chars.len() && query_chars[probe] == ':' {
+                probe += 1;
+                while probe < query_chars.len() && query_chars[probe].is_whitespace() {
+                    probe += 1;
+                }
+                let field_start = probe;
+                while probe < query_chars.len()
+                    && (query_chars[probe].is_alphanumeric() || query_chars[probe] == '_')
+                {
+                    probe += 1;
+                }
+                if probe > field_start {
+                    alias = Some(entity_name.clone());
+                    entity_name = query_chars[field_start..probe].iter().collect::<String>();
+                    current_pos = probe;
+                    token_end = probe;
+                }
+            }
         }
-        let entity_name = if lookahead < query_chars.len() && query_chars[lookahead] == ':' {
-            let mut field_start = lookahead + 1;
-            while field_start < query_chars.len() && query_chars[field_start].is_whitespace() {
-                field_start += 1;
-            }
-            current_pos = field_start;
-            while current_pos < query_chars.len()
-                && (query_chars[current_pos].is_alphanumeric() || query_chars[current_pos] == '_')
-            {
-                current_pos += 1;
-            }
-            if current_pos == field_start {
-                continue;
-            }
-            alias = Some(entity_name);
-            query_chars[field_start..current_pos].iter().collect::<String>()
-        } else {
-            entity_name
-        };
 
         // Skip if this is not a valid entity name (too short or common words)
         if entity_name.len() < 2
@@ -2072,6 +2126,7 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
         }
 
         let mut params = HashMap::new();
+        let mut block_argument = None;
 
         if current_pos < query_chars.len() && query_chars[current_pos] == '(' {
 
@@ -2079,13 +2134,43 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
             let params_start = current_pos + 1;
             let mut paren_count = 1; // We're already inside the first parenthesis
 
+            // Walk to the matching `)`, ignoring parentheses inside string
+            // literals and `#` comments. A `)` in either closed the argument
+            // list early, and the rest of the query then parsed as stray text:
+            // `streams(first: 1 # note )` collapsed to an empty operation,
+            // which is a 200 with no rows rather than an error.
+            let mut in_string = false;
+            let mut escape = false;
+            let mut in_comment = false;
             while current_pos < query_chars.len() {
                 current_pos += 1;
                 if current_pos >= query_chars.len() {
                     break;
                 }
+                let ch = query_chars[current_pos];
 
-                match query_chars[current_pos] {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                if in_string {
+                    match ch {
+                        '\\' => escape = true,
+                        '"' => in_string = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                if in_comment {
+                    if ch == '\n' || ch == '\r' {
+                        in_comment = false;
+                    }
+                    continue;
+                }
+
+                match ch {
+                    '"' => in_string = true,
+                    '#' => in_comment = true,
                     '(' => paren_count += 1,
                     ')' => {
                         paren_count -= 1;
@@ -2101,9 +2186,24 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
                 break;
             }
 
-            let params_str = query_chars[params_start..current_pos]
-                .iter()
-                .collect::<String>();
+            let mut params_str = strip_line_comments(
+                &query_chars[params_start..current_pos].iter().collect::<String>(),
+            );
+
+            // Take `block:` from the raw argument text, before
+            // `parse_graphql_params` flattens `block: {number: N}` into a
+            // `block.number` key that is indistinguishable from a `where` filter
+            // on a `block` field. Excise the text rather than dropping parsed
+            // keys, which could take a real filter with it.
+            let block = top_level_arguments(&params_str)
+                .into_iter()
+                .find(|arg| arg.name == "block")
+                .map(|arg| (arg.value.trim().to_string(), arg.span));
+            if let Some((value, span)) = block {
+                params_str.replace_range(span, "");
+                block_argument = Some(value);
+            }
+
             parse_graphql_params(&params_str, &mut params)?;
 
             // Advance past the closing parenthesis
@@ -2111,8 +2211,14 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
         } else if current_pos < query_chars.len() && query_chars[current_pos] == '{' {
             // Entity without parameters, continue to selection set
         } else {
-            // This is not an entity definition, skip
-            current_pos += 1;
+            // Not an entity definition. Resume at the end of the token just
+            // read: `current_pos` has been advanced past trailing whitespace and
+            // is sitting inside the next identifier, so stepping on from here
+            // would read that identifier from its second character.
+            current_pos = token_end;
+            if current_pos <= entity_start {
+                current_pos = entity_start + 1;
+            }
             continue;
         }
 
@@ -2166,6 +2272,7 @@ fn extract_multiple_entities(query: &str) -> Result<Vec<RootField>, ConversionEr
             alias,
             name: entity_name,
             params,
+            block_argument,
             selection: raw_selection,
         });
     }
@@ -2242,6 +2349,17 @@ fn convert_selection_arguments(
             let end = i.min(chars.len() - 1);
             out.extend(&chars[start..=end]);
             i = end + 1;
+            continue;
+        }
+
+        // A comment is copied through as written: Hasura accepts it, and the
+        // line break that ends it survives. Read as syntax, a `(` in it would
+        // start an argument scan that ate the rest of the selection set.
+        if c == '#' {
+            while i < chars.len() && chars[i] != '\n' && chars[i] != '\r' {
+                out.push(chars[i]);
+                i += 1;
+            }
             continue;
         }
 
@@ -2324,7 +2442,10 @@ fn convert_selection_arguments(
                 out.extend(&chars[i..=close]);
                 after_directive = false;
             } else if let Some(pending) = field.as_mut() {
-                let inner: String = chars[i + 1..close].iter().collect();
+                // Arguments are re-emitted on one line, so a comment kept here
+                // would comment out everything after it, the closing paren too.
+                let inner = strip_line_comments(&chars[i + 1..close].iter().collect::<String>());
+                check_nested_arguments(&pending.name, &inner)?;
                 let mut params = HashMap::new();
                 parse_graphql_params(&inner, &mut params)?;
                 let args = convert_collection_args(&params, &pending.entity(), None, ctx)?;
@@ -2372,6 +2493,33 @@ fn convert_selection_arguments(
     }
 
     Ok(out)
+}
+
+/// graph-node takes exactly `first`, `skip`, `orderBy`, `orderDirection` and
+/// `where` on a nested list. Anything else (a nested `block:`, a bare filter
+/// key) is a mistake or a constraint we cannot honour, and an argument list that
+/// reads as nothing is not an empty one; either way, converting it would answer
+/// a question that was not asked.
+fn check_nested_arguments(field: &str, inner: &str) -> Result<(), ConversionError> {
+    let args = top_level_arguments(inner);
+    if args.is_empty() && !inner.trim().is_empty() {
+        return Err(ConversionError::UnsupportedNestedArgument(
+            field.to_string(),
+            "unparseable arguments".to_string(),
+        ));
+    }
+    let unsupported: Vec<&str> = args
+        .iter()
+        .map(|arg| arg.name)
+        .filter(|name| !matches!(*name, "first" | "skip" | "orderBy" | "orderDirection" | "where"))
+        .collect();
+    if !unsupported.is_empty() {
+        return Err(ConversionError::UnsupportedNestedArgument(
+            field.to_string(),
+            unsupported.join(", "),
+        ));
+    }
+    Ok(())
 }
 
 /// `convert_selection_arguments` for a named fragment definition, whose type
@@ -2702,6 +2850,14 @@ fn convert_filters_to_where_clause(
     flat_filters.remove("orderBy");
     flat_filters.remove("orderDirection");
     flat_filters.remove("where");
+    // `where: {first: 2}` filters on a field named `first`.
+    let mut flat_filters: HashMap<String, String> = flat_filters
+        .into_iter()
+        .map(|(key, value)| match key.strip_prefix(WHERE_FIELD_MARKER) {
+            Some(field) => (field.to_string(), value),
+            None => (key, value),
+        })
+        .collect();
 
     // Inline `and: [{...}, {...}]` / `or: [...]`. Each item is a filter of its own.
     let logical_keys: Vec<String> = flat_filters
@@ -3727,6 +3883,21 @@ fn starts_with_argument_name(text: &str) -> bool {
     after_name.trim_start().starts_with(':')
 }
 
+/// Argument names a hoisted `where` field must not be mistaken for.
+const ARGUMENT_NAMES: [&str; 7] = [
+    "first",
+    "skip",
+    "orderBy",
+    "orderDirection",
+    "where",
+    "block",
+    "subgraphError",
+];
+
+/// Prefix on a hoisted `where` field named like an argument. `:` cannot occur
+/// in a GraphQL name, so the marked key cannot clash with a real one.
+const WHERE_FIELD_MARKER: &str = "where:";
+
 fn parse_single_param(
     param_str: &str,
     params: &mut HashMap<String, String>,
@@ -3743,9 +3914,18 @@ fn parse_single_param(
             let mut nested_params = HashMap::new();
             parse_graphql_params(nested_content, &mut nested_params)?;
 
-            // Add nested params directly without flattening
+            // Add nested params directly without flattening. A filter field
+            // that shares a name with an argument (`where: {first: 2}`) is
+            // marked, so it can neither become pagination nor overwrite the
+            // real `first`; `convert_filters_to_where_clause` unmarks it.
             for (nested_key, nested_value) in nested_params {
-                params.insert(nested_key, nested_value);
+                let head = nested_key.split('.').next().unwrap_or_default();
+                let key = if ARGUMENT_NAMES.contains(&head) {
+                    format!("{}{}", WHERE_FIELD_MARKER, nested_key)
+                } else {
+                    nested_key
+                };
+                params.insert(key, nested_value);
             }
         } else if value.starts_with('{') && value.ends_with('}') {
             // Parse the nested object
@@ -3766,6 +3946,200 @@ fn parse_single_param(
 }
 
 // Removed unused brace matching helper
+
+/// Strip `#` comments out of an argument list, keeping the line breaks.
+///
+/// GraphQL allows a comment anywhere whitespace is allowed, including between
+/// arguments, and it runs to the end of the line. The converter re-emits
+/// arguments on a single line, so a comment left in place comments out
+/// everything after it - the remaining arguments and the closing paren
+/// included. It also makes `block:` appear in a note look like a real
+/// time-travel argument. A `#` inside a string literal is not a comment.
+fn strip_line_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    let mut in_string = false;
+    let mut escape = false;
+
+    while let Some(ch) = chars.next() {
+        if escape {
+            out.push(ch);
+            escape = false;
+            continue;
+        }
+        if in_string {
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            out.push(ch);
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
+            '#' => {
+                // Keep the line break. Commas are optional in GraphQL, so it can
+                // be the only thing separating this argument from the next.
+                for cc in chars.by_ref() {
+                    if cc == '\n' || cc == '\r' {
+                        out.push(cc);
+                        break;
+                    }
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+
+    out
+}
+
+/// One top-level `name: value` pair from an argument list, as raw text.
+struct TopLevelArg<'a> {
+    /// Byte range of the whole pair, for excising it from the argument text.
+    span: std::ops::Range<usize>,
+    name: &'a str,
+    value: &'a str,
+}
+
+/// Split an argument list into its *top-level* pairs, leaving values as raw text.
+///
+/// `parse_single_param` hoists `where: {...}` contents into the same map without
+/// a prefix, so by the time arguments are parsed a key like `block` is
+/// ambiguous: it is equally a time-travel argument and a filter on an entity
+/// that has a `block` field. This reads the raw argument text, where the nesting
+/// is still visible.
+///
+/// Commas are insignificant in GraphQL, so `first: 1 block: {…}` is the same
+/// list as `first: 1, block: {…}` - and the comma-less form is how prettier
+/// prints a multi-line query. An unexpected token is skipped rather than ending
+/// the scan, so one malformed argument cannot hide the arguments after it.
+fn top_level_arguments(params_str: &str) -> Vec<TopLevelArg<'_>> {
+    let bytes = params_str.as_bytes();
+    let mut args = Vec::new();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() || bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+
+        // A GraphQL name: /[_A-Za-z][_0-9A-Za-z]*/.
+        let name_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i == name_start {
+            i += 1; // Not a name at all; resynchronize.
+            continue;
+        }
+        let name_end = i;
+
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b':' {
+            continue; // Not an argument. The name was consumed, so this advances.
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        let value_start = i;
+        let value_end = value_end_at(bytes, value_start);
+        if value_end == value_start {
+            continue; // No value to take. The name was consumed, so this advances.
+        }
+        i = value_end;
+
+        args.push(TopLevelArg {
+            span: name_start..value_end,
+            name: params_str.get(name_start..name_end).unwrap_or_default(),
+            value: params_str.get(value_start..value_end).unwrap_or_default(),
+        });
+    }
+
+    args
+}
+
+/// Where the single GraphQL value starting at `from` ends.
+///
+/// Objects and lists are followed to their matching close, counting both kinds
+/// together so a list of objects (or an object holding a list) ends in the right
+/// place. Everything else - a number, an enum, `$variable`, `true` - runs to the
+/// next separator.
+fn value_end_at(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    match bytes.get(i) {
+        Some(b'{') | Some(b'[') => {
+            let mut depth = 0usize;
+            let mut in_string = false;
+            let mut escape = false;
+            while i < bytes.len() {
+                let c = bytes[i];
+                i += 1;
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                if in_string {
+                    match c {
+                        b'\\' => escape = true,
+                        b'"' => in_string = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                match c {
+                    b'"' => in_string = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return i;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i
+        }
+        Some(b'"') => {
+            i += 1;
+            let mut escape = false;
+            while i < bytes.len() {
+                let c = bytes[i];
+                i += 1;
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                match c {
+                    b'\\' => escape = true,
+                    b'"' => return i,
+                    _ => {}
+                }
+            }
+            i
+        }
+        Some(_) => {
+            while i < bytes.len()
+                && !bytes[i].is_ascii_whitespace()
+                && !matches!(bytes[i], b',' | b')' | b'}' | b']')
+            {
+                i += 1;
+            }
+            i
+        }
+        None => i,
+    }
+}
 
 fn singularize_and_capitalize(s: &str) -> String {
     // Prefer an entity the schema actually declares. Word rules cannot recover
@@ -4430,6 +4804,459 @@ mod tests {
             Err(ConversionError::QueryNotString) => {}
             _ => panic!("Expected QueryNotString error"),
         }
+    }
+
+    #[test]
+    fn a_where_filter_on_a_block_field_is_not_mistaken_for_time_travel() {
+        init_test_schema_if_needed();
+        // `parse_single_param` hoists `where: {...}` into the same param map
+        // unprefixed, so the guard cannot read the flattened keys.
+        let payload = create_test_payload(r#"query { trades(where: { block: 123 }, first: 1) { id } }"#);
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("where: {block: {_eq: 123}}"), "{converted}");
+    }
+
+    #[test]
+    fn a_nested_where_filter_named_block_is_not_mistaken_for_time_travel() {
+        init_test_schema_if_needed();
+        let payload =
+            create_test_payload(r#"query { trades(where: { block: { number: 5 } }, first: 1) { id } }"#);
+        assert!(convert_subgraph_to_hyperindex(&payload, None).is_ok());
+    }
+
+    #[test]
+    fn an_alias_colliding_with_another_roots_entity_name_gets_a_distinct_hasura_key() {
+        init_test_schema_if_needed();
+        // `users:` is the alias of one root; `User` is the Hasura name of the
+        // other. Emitting both under the same response name makes Hasura reject
+        // the whole operation, so the keys must differ.
+        //
+        // (The two roots here share the caller-facing name `users`, which is
+        // itself invalid GraphQL - graph-node rejects two root fields with the
+        // same response name. The converter only has to avoid turning it into a
+        // 502 from Hasura.)
+        let payload = create_test_payload("query { users: trades(first: 1) { id } users(first: 1) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let keys: std::collections::HashSet<&String> = result.field_name_map.keys().collect();
+        assert_eq!(keys.len(), 2, "map: {:?}", result.field_name_map);
+    }
+
+    #[test]
+    fn an_alias_equal_to_an_entity_name_does_not_duplicate_a_response_name() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { Trade: users(first: 1) { id } trades(first: 1) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        // Whatever the emitted keys are, they must be distinct or Hasura rejects
+        // the operation with "specify the same response name".
+        let emitted: Vec<&String> = result.field_name_map.keys().collect();
+        assert_eq!(
+            emitted.iter().collect::<std::collections::HashSet<_>>().len(),
+            emitted.len(),
+            "{converted}"
+        );
+        assert!(result.field_name_map.values().any(|v| v == "Trade"), "{:?}", result.field_name_map);
+        assert!(result.field_name_map.values().any(|v| v == "trades"), "{:?}", result.field_name_map);
+    }
+
+    #[test]
+    fn two_roots_sharing_an_order_by_variable_keep_their_own_directions() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query Q($o: Trade_orderBy!, $d1: OrderDirection!, $d2: OrderDirection!) { \
+             a: trades(first: 2, orderBy: $o, orderDirection: $d1) { id } \
+             b: trades(first: 2, orderBy: $o, orderDirection: $d2) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        // One spec per direction, or the second root silently inherits the first.
+        assert_eq!(
+            result.order_by_variables.len(),
+            2,
+            "specs: {:?}",
+            result.order_by_variables
+        );
+        let targets: std::collections::HashSet<&String> = result
+            .order_by_variables
+            .iter()
+            .map(|sp| &sp.target_var)
+            .collect();
+        assert_eq!(targets.len(), 2, "specs: {:?}", result.order_by_variables);
+    }
+
+    #[test]
+    fn by_id_lookup_on_an_entity_whose_name_ends_in_s_returns_an_object() {
+        init_test_schema_if_needed();
+        // `TxTransfers` is a real entity name; `txTransfers` is its singular
+        // graph-node spelling, so this is a primary-key lookup, not a list.
+        let payload = create_test_payload(r#"query { txTransfers(id: "1") { id } }"#);
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("TxTransfers_by_pk(id:"), "{converted}");
+    }
+
+    #[test]
+    fn a_root_typename_does_not_corrupt_the_next_fields_alias() {
+        init_test_schema_if_needed();
+        // Apollo injects `__typename` into every selection set, root included.
+        // The scanner used to resume one character into the next identifier.
+        let payload = create_test_payload("query { __typename recent: trades(first: 1) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert!(
+            result.field_name_map.values().any(|v| v == "recent"),
+            "map: {:?}",
+            result.field_name_map
+        );
+    }
+
+    #[test]
+    fn an_aliased_meta_keeps_its_alias() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { m: _meta { block { number } } }");
+        let result = convert_subgraph_to_hyperindex(&payload, Some("1")).unwrap();
+        assert_eq!(
+            result.meta_selection.as_ref().map(|m| m.key.clone()),
+            Some("m".to_string())
+        );
+    }
+
+    #[test]
+    fn acronym_entity_names_use_graph_nodes_spelling() {
+        init_test_schema_if_needed();
+        // graph-node lowercases the leading run of capitals and rejects any other
+        // spelling, so these are the only names a real subgraph client can send.
+        assert_eq!(
+            singularize_and_capitalize("atokenBalanceHistoryItems"),
+            "ATokenBalanceHistoryItem"
+        );
+        assert_eq!(
+            singularize_and_capitalize("atokenBalanceHistoryItem"),
+            "ATokenBalanceHistoryItem"
+        );
+        assert_eq!(singularize_and_capitalize("emodeCategories"), "EModeCategory");
+        assert_eq!(singularize_and_capitalize("emodeCategory"), "EModeCategory");
+        // The lowercase-first-letter spelling stays accepted.
+        assert_eq!(
+            singularize_and_capitalize("aTokenBalanceHistoryItems"),
+            "ATokenBalanceHistoryItem"
+        );
+        assert_eq!(singularize_and_capitalize("eModeCategories"), "EModeCategory");
+    }
+
+    #[test]
+    fn root_field_alias_is_preserved() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { a: streams(first: 1) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(
+            converted.contains("a: Stream(limit: 1, order_by: {id: asc})"),
+            "alias missing from converted query: {converted}"
+        );
+        // The response already arrives keyed by the alias, so it must map to itself.
+        assert_eq!(result.field_name_map.get("a"), Some(&"a".to_string()));
+    }
+
+    #[test]
+    fn primary_key_alias_is_preserved() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(r#"query { s: stream(id: "1") { id } }"#);
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(
+            converted.contains(r#"s: Stream_by_pk(id: "1")"#),
+            "alias missing from converted pk query: {converted}"
+        );
+    }
+
+    #[test]
+    fn two_aliases_of_one_entity_both_survive() {
+        init_test_schema_if_needed();
+        let payload =
+            create_test_payload("query { first: streams(first: 1) { id } second: streams(first: 2) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("first: Stream(limit: 1, order_by: {id: asc})"), "{converted}");
+        assert!(converted.contains("second: Stream(limit: 2, order_by: {id: asc})"), "{converted}");
+    }
+
+    #[test]
+    fn selection_set_survives_a_body_with_no_spaces() {
+        init_test_schema_if_needed();
+        // `trim_end_matches('}')` used to eat both closing braces, leaving the
+        // selection set unterminated and the query empty.
+        let payload = create_test_payload("{streams{id}}");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("Stream"), "{converted}");
+        assert!(converted.contains("id"), "{converted}");
+    }
+
+    #[test]
+    fn block_argument_is_rejected_rather_than_turned_into_a_filter() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload("query { streams(first: 1, block: { number: 100 }) { id } }");
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::UnsupportedBlockConstraint(_)) => {}
+            other => panic!("expected UnsupportedBlockConstraint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comments_in_a_root_argument_list_are_stripped() {
+        init_test_schema_if_needed();
+        // A comment runs to the end of the line, and the arguments are re-emitted
+        // on one line, so a comment left in place commented out the rest of them
+        // and the closing paren with it. A `)` inside one was worse: it closed the
+        // argument list early and the whole operation came out empty - a 200 with
+        // no rows rather than an error.
+        for query in [
+            "{\n  streams(\n    first: 1   # a plain note\n  ) { id }\n}",
+            "{\n  streams(first: 1 # trailing ) note\n  ) { id }\n}",
+            "{\n  streams(\n    first: 1   # note with ( and \" inside\n    skip: 2\n  ) { id }\n}",
+        ] {
+            let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None)
+                .unwrap_or_else(|e| panic!("expected {query:?} to convert, got {e:?}"));
+            let converted = result.query["query"].as_str().unwrap();
+            assert!(converted.contains("Stream(limit: 1"), "{converted}");
+            assert!(converted.contains("id"), "selection set lost: {converted}");
+            assert!(!converted.contains('#'), "comment survived: {converted}");
+        }
+    }
+
+    #[test]
+    fn a_block_argument_mentioned_in_a_comment_is_not_time_travel() {
+        init_test_schema_if_needed();
+        // The guard reads the raw argument text, so without comment stripping a
+        // note mentioning `block:` got a valid query rejected.
+        let query = "{\n  streams(\n    first: 1   # block: 5 is the cutoff\n  ) { id }\n}";
+        let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("Stream(limit: 1, order_by: {id: asc})"), "{converted}");
+    }
+
+    #[test]
+    fn a_paren_or_hash_inside_a_string_argument_is_not_syntax() {
+        init_test_schema_if_needed();
+        // Neither ends the argument list: one used to close it early, the other
+        // would start a comment that swallowed the rest.
+        let result = convert_subgraph_to_hyperindex(
+            &create_test_payload("{ streams(where: { name: \"a)b#c\" }) { id } }"),
+            None,
+        )
+        .unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(
+            converted.contains("where: {name: {_eq: \"a)b#c\"}}"),
+            "{converted}"
+        );
+    }
+
+    #[test]
+    fn strip_line_comments_keeps_strings_and_separators() {
+        assert_eq!(
+            strip_line_comments("first: 1 # note\n  skip: 2"),
+            "first: 1 \n  skip: 2"
+        );
+        assert_eq!(strip_line_comments("name: \"a#b\""), "name: \"a#b\"");
+        // An escaped quote does not end the string, so the `#` after it is still
+        // inside one.
+        assert_eq!(
+            strip_line_comments("name: \"a\\\"#b\""),
+            "name: \"a\\\"#b\""
+        );
+        // A comment with no trailing newline runs to the end.
+        assert_eq!(strip_line_comments("first: 1 # the end"), "first: 1 ");
+    }
+
+    #[test]
+    fn block_argument_is_rejected_when_the_arguments_have_no_commas() {
+        init_test_schema_if_needed();
+        // Commas are insignificant in GraphQL, and leaving them out of a
+        // multi-line argument list is how prettier prints a query. The scanner
+        // this replaced accumulated identifier characters across the whitespace,
+        // so the candidate reaching the colon was "1block" and the guard never
+        // fired - the exact silent wrong-filter case it exists to stop.
+        for query in [
+            "query { streams(first: 1\n    block: { number: 100 }) { id } }",
+            "query { streams(first: 1 block: { number: 100 }) { id } }",
+            "query {\n  streams(\n    first: 1\n    block: { number: 100 }\n  ) { id }\n}",
+        ] {
+            let payload = create_test_payload(query);
+            match convert_subgraph_to_hyperindex(&payload, None) {
+                Err(ConversionError::UnsupportedBlockConstraint(_)) => {}
+                other => panic!("expected UnsupportedBlockConstraint for {query:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn block_argument_is_rejected_when_it_follows_a_variable() {
+        init_test_schema_if_needed();
+        // `$f` is not an identifier character, so the old scanner restarted on
+        // `f` and compared "fblock".
+        let payload = create_test_payload(
+            "query ($f: Int) { streams(first: $f\n    block: { number: 100 }) { id } }",
+        );
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::UnsupportedBlockConstraint(_)) => {}
+            other => panic!("expected UnsupportedBlockConstraint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_hash_is_rejected_like_block_number() {
+        init_test_schema_if_needed();
+        for query in [
+            "query { streams(block: { hash: \"0xabc\" }) { id } }",
+            // Mixed with a freshness guard it is still pinned to one block.
+            "query { streams(block: { number: 100, number_gte: 5 }) { id } }",
+            // An unrecognized key could be a stricter constraint than it looks.
+            "query { streams(block: { number_lte: 100 }) { id } }",
+            "query { streams(block: {}) { id } }",
+        ] {
+            let payload = create_test_payload(query);
+            match convert_subgraph_to_hyperindex(&payload, None) {
+                Err(ConversionError::UnsupportedBlockConstraint(_)) => {}
+                other => panic!("expected UnsupportedBlockConstraint for {query:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn block_number_gte_is_served_at_the_latest_block() {
+        init_test_schema_if_needed();
+        // `number_gte` is graph-node's "answer at a block at least N" freshness
+        // guard, which clients send for read-after-write - not time travel. It is
+        // answered from the latest state, once the indexer has reached N.
+        for query in [
+            "query { streams(first: 1, block: { number_gte: 100 }) { id } }",
+            "query { streams(block: { number_gte: 100 }, first: 1) { id } }",
+            "query { streams(first: 1\n    block: { number_gte: 100 }) { id } }",
+        ] {
+            let payload = create_test_payload(query);
+            let result = convert_subgraph_to_hyperindex(&payload, None)
+                .unwrap_or_else(|e| panic!("expected {query:?} to convert, got {e:?}"));
+            let converted = result.query["query"].as_str().unwrap();
+            assert!(converted.contains("Stream(limit: 1, order_by: {id: asc})"), "{converted}");
+            // The argument must not survive as a filter on a `block` column.
+            assert!(!converted.contains("block:"), "{converted}");
+            assert_eq!(result.min_block, Some(100));
+        }
+    }
+
+    #[test]
+    fn a_where_filter_on_a_block_field_is_left_alone() {
+        init_test_schema_if_needed();
+        // `where: {block: {...}}` is a filter on the entity's own `block` field,
+        // not time travel. `parse_single_param` hoists it to the same
+        // `block.number` key the time-travel argument produces, which is why the
+        // guard reads the raw argument text and why a dropped `number_gte` is
+        // excised by span rather than by key.
+        let payload =
+            create_test_payload("query { streams(where: { block: { number: 100 } }) { id } }");
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(
+            converted.contains("where: {block: {number: {_eq: 100}}}"),
+            "{converted}"
+        );
+
+        // Both at once: the guard goes, the filter stays.
+        let payload = create_test_payload(
+            "query { streams(block: { number_gte: 7 }\n  where: { block: { number: 100 } }) { id } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(
+            converted.contains("where: {block: {number: {_eq: 100}}}"),
+            "{converted}"
+        );
+    }
+
+    #[test]
+    fn top_level_arguments_reads_one_value_at_a_time() {
+        // A value has to be consumed whole, or the scan resumes inside it and a
+        // later argument name is read out of a nested object.
+        let args = top_level_arguments(
+            "first: 10 where: { or: [{ a: [1, 2] }, { b: \"}, block: 1)\" }] } block: { number: 3 }",
+        );
+        let names: Vec<&str> = args.iter().map(|a| a.name).collect();
+        assert_eq!(names, vec!["first", "where", "block"]);
+        assert_eq!(args[0].value, "10");
+        assert_eq!(args[2].value, "{ number: 3 }");
+
+        // A string value can hold anything, including an unbalanced brace.
+        let args = top_level_arguments("id: \"a: {b\" block: { number: 1 }");
+        assert_eq!(
+            args.iter().map(|a| a.name).collect::<Vec<_>>(),
+            vec!["id", "block"]
+        );
+
+        // Escaped quotes do not end the string early.
+        let args = top_level_arguments("id: \"a\\\"b\" first: 2");
+        assert_eq!(
+            args.iter().map(|a| a.name).collect::<Vec<_>>(),
+            vec!["id", "first"]
+        );
+
+        // An unexpected token is skipped, not treated as the end of the list.
+        let args = top_level_arguments("@ 7 block: { number: 1 }");
+        assert_eq!(args.iter().map(|a| a.name).collect::<Vec<_>>(), vec!["block"]);
+
+        // A truncated value cannot loop forever.
+        assert_eq!(
+            top_level_arguments("block: { number: 1")
+                .iter()
+                .map(|a| a.name)
+                .collect::<Vec<_>>(),
+            vec!["block"]
+        );
+    }
+
+    #[test]
+    fn block_in_a_nested_object_is_not_a_top_level_argument() {
+        // The whole point of reading raw text: `block` nested inside another
+        // argument's value is not the block argument.
+        let block_of = |args: &str| {
+            let roots = extract_multiple_entities(&format!("{{ streams({}) {{ id }} }}", args)).unwrap();
+            roots.into_iter().next().unwrap().block_argument
+        };
+        assert_eq!(block_of("first: 1"), None);
+        assert_eq!(block_of("where: { block: { number: 1 } }"), None);
+        assert_eq!(block_of("where: { block_gt: 1 } blocking: true"), None);
+        assert_eq!(block_of("block: { number: 1 }").as_deref(), Some("{ number: 1 }"));
+        assert_eq!(block_of("first: 2 block: $b").as_deref(), Some("$b"));
+    }
+
+    #[test]
+    fn entity_resolution_prefers_the_most_specific_spelling() {
+        // The four ranks the single pass collects, in order: exact plural, exact
+        // singular, then both case-insensitively. graph-node lowercases the whole
+        // leading run of capitals, so `ATokenBalanceHistoryItem` is queried as
+        // `atokenBalanceHistoryItems`.
+        init_test_schema_if_needed();
+        for (field, entity) in [
+            ("reserves", "Reserve"),
+            ("reserve", "Reserve"),
+            ("Reserves", "Reserve"),
+            ("RESERVE", "Reserve"),
+            ("atokenBalanceHistoryItems", "ATokenBalanceHistoryItem"),
+            ("atokenBalanceHistoryItem", "ATokenBalanceHistoryItem"),
+            ("emodeCategories", "EModeCategory"),
+            ("userTransactions", "UserTransaction"),
+        ] {
+            assert_eq!(
+                schema::resolve_entity_for_collection_field(field).as_deref(),
+                Some(entity),
+                "{field}"
+            );
+        }
+        assert_eq!(
+            schema::resolve_entity_for_collection_field("widgets"),
+            None,
+            "an unknown field must fall through to the lexical fallback"
+        );
     }
 
     #[test]
@@ -6427,6 +7254,317 @@ mod tests {
     }
 
     #[test]
+    fn test_a_where_field_named_like_pagination_does_not_become_pagination() {
+        // `parse_single_param` hoists the contents of `where: {...}` into the
+        // argument map unprefixed, and `first` is a legal input-field name. The
+        // filter then arrived as pagination: `where: {first: 2}` silently became
+        // `limit: 2`, taking the real `first: 3` with it and dropping the filter.
+        // The hoisted key is now marked, so it stays a filter.
+        init_test_schema_if_needed();
+        for (query, expected) in [
+            (
+                "{ pools(first: 1) { id poolHourData(first: 3, where: { first: 2 }) { id } } }",
+                "poolHourData(limit: 3, order_by: {id: asc}, where: {first: {_eq: 2}})",
+            ),
+            (
+                "{ pools(first: 3, where: { first: 2, skip_gt: 1 }) { id } }",
+                "Pool(limit: 3, order_by: {id: asc}, where: {first: {_eq: 2}, skip: {_gt: 1}})",
+            ),
+        ] {
+            let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None).unwrap();
+            let converted = result.query["query"].as_str().unwrap();
+            assert!(converted.contains(expected), "{converted}");
+        }
+    }
+
+    #[test]
+    fn test_nested_arguments_without_commas_are_split() {
+        // Commas are optional in GraphQL. `parse_graphql_params` only splits on
+        // them, so `first: 3 skip: 1` arrived as a single `first` of "3 skip: 1"
+        // and was emitted verbatim as `limit: 3 skip: 1` - malformed GraphQL,
+        // forwarded upstream.
+        init_test_schema_if_needed();
+        for (query, expected) in [
+            (
+                "{ pools(first: 1) { id poolHourData(first: 3 skip: 1) { id } } }",
+                "poolHourData(limit: 3, offset: 1, order_by: {id: asc})",
+            ),
+            (
+                "{ pools(first: 1) { id poolHourData(first: 3 orderBy: periodStartUnix) { id } } }",
+                "poolHourData(limit: 3, order_by: [{periodStartUnix: asc}, {id: asc}])",
+            ),
+            (
+                "{ pools(first: 1) { id poolHourData(\n  first: 3\n  skip: 1\n) { id } } }",
+                "poolHourData(limit: 3, offset: 1, order_by: {id: asc})",
+            ),
+        ] {
+            let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None)
+                .unwrap_or_else(|e| panic!("expected {query:?} to convert, got {e:?}"));
+            let converted = result.query["query"].as_str().unwrap();
+            assert!(converted.contains(expected), "{converted}");
+        }
+    }
+
+    #[test]
+    fn test_unparseable_nested_arguments_are_rejected() {
+        // An argument list that yields nothing is not an empty one. Dropping it
+        // answers a different question than the one that was asked.
+        init_test_schema_if_needed();
+        let payload =
+            create_test_payload("{ pools(first: 1) { id poolHourData(garbage) { id } } }");
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "poolHourData");
+                assert_eq!(detail, "unparseable arguments");
+            }
+            other => panic!("expected UnsupportedNestedArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_comment_inside_nested_arguments_is_dropped() {
+        // A `#` comment runs to end of line and can hold a `)`, which closed the
+        // argument list early and forwarded malformed GraphQL. Keeping the
+        // comment is no better: the arguments are re-emitted on one line, so it
+        // would comment out the rest of them and the closing paren with it.
+        init_test_schema_if_needed();
+        for query in [
+            "{\n  pools(first: 1) {\n    poolHourData(\n      first: 3   # only three (for now)\n      skip: 1\n    ) { id }\n  }\n}",
+            "{\n  pools(first: 1) {\n    poolHourData(\n      first: 3   # keep ) three\n      skip: 1\n    ) { id }\n  }\n}",
+            "{\n  pools(first: 1) {\n    poolHourData(first: 3, # a note\n      skip: 1) { id }\n  }\n}",
+        ] {
+            let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None)
+                .unwrap_or_else(|e| panic!("expected {query:?} to convert, got {e:?}"));
+            let converted = result.query["query"].as_str().unwrap();
+            assert!(
+                converted.contains("poolHourData(limit: 3, offset: 1, order_by: {id: asc})"),
+                "{converted}"
+            );
+            assert!(!converted.contains('#'), "comment survived: {converted}");
+        }
+    }
+
+    #[test]
+    fn test_comment_in_a_selection_set_is_left_alone() {
+        // An open paren in a note used to start an argument scan that ate the
+        // rest of the selection set - silently before nested args were
+        // translated, and as a bogus `UnsupportedNestedArgument` after.
+        init_test_schema_if_needed();
+        let query = "{\n  pools(first: 1) {\n    id   # a note with ( an open paren\n    poolHourData(first: 3) { id }\n  }\n}";
+        let result = convert_subgraph_to_hyperindex(&create_test_payload(query), None).unwrap();
+        let converted = result.query["query"].as_str().unwrap();
+        assert!(converted.contains("poolHourData(limit: 3, order_by: {id: asc})"), "{converted}");
+        assert!(
+            converted.contains("# a note with ( an open paren"),
+            "the comment itself should survive: {converted}"
+        );
+    }
+
+    #[test]
+    fn test_a_hash_inside_a_string_argument_is_not_a_comment() {
+        // `#` only opens a comment outside a string. If it were treated as one
+        // here the scan would end inside the quotes and the argument name would
+        // be lost, so the error naming `foo` is the proof that it did not.
+        let sanitized = convert_selection_arguments(
+            "b(first: 3, foo: \"#)(\") { id }",
+            None,
+            &mut ArgContext::default(),
+        );
+        match sanitized {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "b");
+                assert_eq!(detail, "foo");
+            }
+            other => panic!("expected UnsupportedNestedArgument naming foo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nested_field_variable_first_and_skip_pass_through() {
+        // `$f`/`$s` keep their declared `Int` type, so they need no rewriting -
+        // unlike a variable sort, which does.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query Q($f: Int, $s: Int) { pools(first: 1) { id poolHourData(first: $f, skip: $s) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(limit: $f, offset: $s, order_by: {id: asc})"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_nested_field_args_are_translated_inside_a_fragment() {
+        // Fragment bodies go through the same sanitizer, by way of
+        // `sanitize_fragment_arguments`.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id ...PoolRows } } fragment PoolRows on Pool { poolHourData(first: 3, orderBy: periodStartUnix, orderDirection: desc) { periodStartUnix } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(limit: 3, order_by: [{periodStartUnix: desc}, {id: desc}])"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_aliased_nested_field_keeps_its_alias() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id recent: poolHourData(first: 2, orderBy: periodStartUnix, orderDirection: desc) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("recent: poolHourData(limit: 2, order_by: [{periodStartUnix: desc}, {id: desc}])"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_two_levels_of_nesting_are_translated() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id poolHourData(first: 2) { periodStartUnix swaps(first: 3, orderBy: timestamp) { id } } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("poolHourData(limit: 2, order_by: {id: asc})"), "{query}");
+        assert!(
+            query.contains("swaps(limit: 3, order_by: [{timestamp: asc}, {id: asc}])"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_nested_variable_sort_is_converted() {
+        // A nested `orderBy: $o` gets the same treatment as a root one: the
+        // client's variable is retyped to the nested entity's `order_by` and
+        // its value rebuilt at request time.
+        init_test_schema_if_needed();
+        let payload = json!({
+            "query": "query Q($o: String!, $d: OrderDirection!) { pools(first: 1) { poolHourData(first: 3, orderBy: $o, orderDirection: $d) { id } } }",
+            "variables": {"o": "periodStartUnix", "d": "desc"}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("poolHourData(limit: 3, order_by: $o)"), "{query}");
+        assert!(query.contains("$o: [PoolHourData_order_by!]"), "{query}");
+        assert_eq!(
+            result.query["variables"]["o"],
+            json!([{"periodStartUnix": "desc"}, {"id": "desc"}])
+        );
+    }
+
+    #[test]
+    fn test_nested_where_is_converted() {
+        // Converted against the nested entity, as at the root, rather than
+        // dropped (unfiltered rows under a 200) or rejected.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id poolHourData(first: 3, where: { volumeUSD_gt: \"5\" }) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(limit: 3, order_by: {id: asc}, where: {volumeUSD: {_gt: \"5\"}})"),
+            "{query}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_nested_argument_is_rejected() {
+        // graph-node accepts exactly first/skip/orderBy/orderDirection/where on a
+        // derived field, so anything else is a filter or a mistake. Either way,
+        // dropping it answers a question that was not asked.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id poolHourData(block: { number: 100 }) { periodStartUnix } } }",
+        );
+        match convert_subgraph_to_hyperindex(&payload, None) {
+            Err(ConversionError::UnsupportedNestedArgument(field, detail)) => {
+                assert_eq!(field, "poolHourData");
+                assert_eq!(detail, "block");
+            }
+            other => panic!("expected UnsupportedNestedArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nested_order_direction_without_order_by_sorts_by_id() {
+        // Same as the root path: a direction with nothing to sort by is ignored,
+        // and graph-node's default `id` order applies.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "query { pools(first: 1) { id poolHourData(first: 2, orderDirection: desc) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(query.contains("poolHourData(limit: 2, order_by: {id: asc})"), "{query}");
+    }
+
+    #[test]
+    fn test_nested_field_first_and_order_by_translated() {
+        // Regression: nested-field args (first/orderBy/orderDirection) on
+        // sub-selections like `poolHourData(...)` and `poolDayData(...)` were
+        // silently stripped by sanitize_selection_set, so the user got
+        // unbounded/unordered nested rows. They should now be translated to
+        // Hasura's limit/order_by form - with the same `id` tie-break the root
+        // path adds, since a nested page whose sort key repeats is otherwise
+        // just as unstable as a root one.
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "{ pools(first: 1, where: { id: \"0x2a2c512beaa8eb15495726c235472d82effb7a6b\" }) { id poolHourData(first: 3, orderBy: periodStartUnix, orderDirection: desc) { periodStartUnix volumeUSD } poolDayData(first: 3, orderBy: date, orderDirection: desc) { date volumeUSD } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(limit: 3, order_by: [{periodStartUnix: desc}, {id: desc}])"),
+            "poolHourData nested args not translated:\n{}",
+            query
+        );
+        assert!(
+            query.contains("poolDayData(limit: 3, order_by: [{date: desc}, {id: desc}])"),
+            "poolDayData nested args not translated:\n{}",
+            query
+        );
+    }
+
+    #[test]
+    fn test_nested_field_skip_translated() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "{ pools(first: 1) { id poolHourData(first: 5, skip: 10) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(limit: 5, offset: 10, order_by: {id: asc})"),
+            "nested skip not translated to offset:\n{}",
+            query
+        );
+    }
+
+    #[test]
+    fn test_nested_field_orderby_default_direction() {
+        init_test_schema_if_needed();
+        let payload = create_test_payload(
+            "{ pools(first: 1) { id poolHourData(orderBy: periodStartUnix) { periodStartUnix } } }",
+        );
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        let query = result.query["query"].as_str().unwrap();
+        assert!(
+            query.contains("poolHourData(limit: 100, order_by: [{periodStartUnix: asc}, {id: asc}])"),
+            "nested orderBy without direction should default to asc:\n{}",
+            query
+        );
+    }
+
+    #[test]
     fn regression_query_with_variables_passthrough() {
         // The pre-existing test from `test_query_with_variables`, repeated
         // verbatim here to make any drift in the new path immediately visible.
@@ -7615,12 +8753,12 @@ mod tests {
     }
 
     #[test]
-    fn hasura_metadata_types_are_not_single_entity_fields() {
+    fn single_entity_fields_are_classified_from_the_schema() {
         init_test_schema_if_needed();
-        assert_eq!(schema::entity_for_single_field("swapUser"), Some("SwapUser".to_string()));
-        assert_eq!(schema::entity_for_single_field("status"), Some("Status".to_string()));
-        assert_eq!(schema::entity_for_single_field("query_root"), None);
-        assert_eq!(schema::entity_for_single_field("nonexistent"), None);
+        let id_only: HashMap<String, String> = [("id".to_string(), "\"1\"".to_string())].into();
+        assert_eq!(classify_root_field("swapUser", &id_only), ("SwapUser".to_string(), true));
+        assert_eq!(classify_root_field("status", &id_only), ("Status".to_string(), true));
+        assert_eq!(classify_root_field("swapUsers", &id_only), ("SwapUser".to_string(), false));
     }
 
     // ── block / subgraphError arguments ──────────────────────────────────────
