@@ -9,7 +9,9 @@ use crate::schema;
 pub enum ConversionError {
     #[error("Invalid GraphQL query format")]
     InvalidQueryFormat,
-    #[error("Missing required field: {0}")]
+    #[error("The \"query\" field is not a string")]
+    QueryNotString,
+    #[error("The \"{0}\" field is missing in request data")]
     MissingField(String),
     #[error("Unsupported filter: {0}")]
     UnsupportedFilter(String),
@@ -21,6 +23,18 @@ pub enum ConversionError {
     UnknownOperation(String),
     #[error("Historical queries are not supported: {0}. Hyperindex serves only the latest indexed state, so a query pinned to a past block cannot be answered")]
     UnsupportedBlockConstraint(String),
+}
+
+impl ConversionError {
+    /// Whether the request itself is malformed (no usable `query` string), which
+    /// graph-node answers with HTTP 400, rather than the query failing, which it
+    /// answers with a GraphQL error.
+    pub fn is_request_error(&self) -> bool {
+        matches!(
+            self,
+            ConversionError::MissingField(_) | ConversionError::QueryNotString
+        )
+    }
 }
 
 /// Where one half of an `order_by` pair comes from: a GraphQL variable the client
@@ -106,7 +120,7 @@ pub fn convert_subgraph_to_hyperindex(
         .get("query")
         .ok_or(ConversionError::MissingField("query".to_string()))?
         .as_str()
-        .ok_or(ConversionError::InvalidQueryFormat)?;
+        .ok_or(ConversionError::QueryNotString)?;
 
     tracing::info!("Converting query: {}", query);
 
@@ -4380,8 +4394,8 @@ mod tests {
         let result = convert_subgraph_to_hyperindex(&payload, Some("1"));
         assert!(result.is_err());
         match result {
-            Err(ConversionError::InvalidQueryFormat) => {}
-            _ => panic!("Expected InvalidQueryFormat error"),
+            Err(ConversionError::QueryNotString) => {}
+            _ => panic!("Expected QueryNotString error"),
         }
     }
 

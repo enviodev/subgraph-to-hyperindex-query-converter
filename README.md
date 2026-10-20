@@ -71,6 +71,11 @@ CONVERTER_ORDER_ID_TIEBREAK=on
 CONVERTER_DEFAULT_FIRST=100
 # Set to off/false/0 to stop sorting collections without `orderBy` by `id` (see "Ordering")
 CONVERTER_DEFAULT_ORDER_ID=on
+# Set to on to add the converter's diagnostics to error responses (see "Errors")
+CONVERTER_DEBUG_ERRORS=off
+# The subgraph name in graph-node's "only indexed up to block" error; defaults to the
+# deployment hash in HYPERINDEX_URL
+CONVERTER_DEPLOYMENT_ID=
 ```
 
 ### Run with Docker
@@ -168,6 +173,16 @@ A fragment is left untouched, as before, when the surrounding type is unknown, n
 `block: { number_gte: N }` (on any root field, or on `_meta`) is answered from the latest state once every chain has indexed block N, and with graph-node's "only indexed up to block" error before then. Literal, `$n` and `$block: Block_height` forms work.
 
 `block: { number: N }` and `block: { hash: ... }` ask for the state at a past block. Hyperindex does not keep historical state, so these are rejected rather than answered from the latest state. `subgraphError` is accepted and ignored: a Hyperindex indexer stops on a handler error, so there is no failed-but-serving state to choose.
+
+## Errors
+
+Errors take graph-node's shape:
+- **A query that can't be run** gets HTTP 200 with `{"errors": [{"message": "..."}]}` and no `data`. That covers a converter rejection, an error from Hyperindex, a `number_gte` block that isn't indexed yet, and an unreachable indexer.
+- **A request with no `query` string** gets HTTP 400 with `{"error": "GraphQL server error (client error): ..."}`.
+
+Hyperindex's error messages are passed through, but its `extensions` are dropped. The messages keep Hasura's wording rather than graph-node's (for example, `field 'foo' not found in type: 'Token'` rather than ``Type `Token` has no field `foo` ``). The `number_gte` error uses graph-node's exact wording.
+
+Full details, including the upstream errors, the converted query and the Hyperindex URL, are logged. Set `CONVERTER_DEBUG_ERRORS=on` to also return them in the response under `debug` and `subgraphResponse`, as before. The `/debug` endpoints are unchanged.
 
 ## Ordering
 
