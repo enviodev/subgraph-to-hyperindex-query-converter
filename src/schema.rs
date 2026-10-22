@@ -611,6 +611,13 @@ pub fn init_test_schema() {
         field_type: "Token".to_string(),
         is_list: false,
     });
+    // The column behind `token`, which `token: null` is tested on.
+    pair_fields.insert("token_id".to_string(), FieldInfo {
+        is_nested_entity: false,
+        nested_type_name: None,
+        field_type: "String".to_string(),
+        is_list: false,
+    });
     pair_fields.insert("from".to_string(), FieldInfo {
         is_nested_entity: false,
         nested_type_name: None,
@@ -644,6 +651,13 @@ pub fn init_test_schema() {
         nested_type_name: None,
         field_type: "String".to_string(),
         is_list: false,
+    });
+    // A non-derived `[Pool!]`, which Envio stores as an array of ids.
+    token_fields.insert("whitelistPools".to_string(), FieldInfo {
+        is_nested_entity: false,
+        nested_type_name: None,
+        field_type: "String".to_string(),
+        is_list: true,
     });
     cache.insert("Token".to_string(), token_fields);
 
