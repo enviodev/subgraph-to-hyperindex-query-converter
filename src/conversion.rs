@@ -262,7 +262,7 @@ pub fn convert_subgraph_to_hyperindex(
             if let Value::Object(map) = &mut variables {
                 for (var_name, entity_name) in &filter_variable_entities {
                     if let Some(v) = map.get(var_name).cloned() {
-                        let translated = translate_subgraph_filter_value(&v, entity_name);
+                        let translated = translate_filter_variable(&v, entity_name)?;
                         map.insert(var_name.clone(), translated);
                     }
                 }
@@ -3362,11 +3362,18 @@ fn convert_basic_filter_to_hasura_condition(
                 Some(var) => format!("${}", like_variable_name(var, filter.shape)),
                 None => format!("\"{}\"", like_pattern(value.trim_matches('"'), filter.shape)),
             };
-            let like = format!("{{{}: {}}}", filter.operator, pattern);
-            if kind == FieldKind::Relation {
-                format!("{}: {{id: {}}}", field, like)
-            } else {
-                format!("{}: {}", field, like)
+            match (kind, relation_id_column(entity_name, field)) {
+                // graph-node matches the reference's stored id, which is this column.
+                (FieldKind::Relation, Some(column)) => {
+                    format!("{}: {{{}: {}}}", column, filter.operator, pattern)
+                }
+                // Through the relation, `_not` around the match would also keep
+                // rows with no related row, so the negation goes inside.
+                (FieldKind::Relation, None) => {
+                    let operator = filter.inner_operator();
+                    return Ok(format!("{}: {{id: {{{}: {}}}}}", field, operator, pattern));
+                }
+                _ => format!("{}: {{{}: {}}}", field, filter.operator, pattern),
             }
         };
         return Ok(if filter.negated {
@@ -3478,7 +3485,28 @@ fn convert_basic_filter_to_hasura_condition(
 ///
 /// `entity_name` is the Hyperindex entity the filter applies to (e.g. `"Trade"`).
 /// It is used to detect nested-entity references via the schema cache.
+///
+/// Requests go through `translate_filter_variable`, which also refuses
+/// unsupported filters.
+#[cfg(test)]
 pub fn translate_subgraph_filter_value(value: &Value, entity_name: &str) -> Value {
+    translate_filter(value, entity_name, &mut Vec::new())
+}
+
+/// `translate_subgraph_filter_value` for a request: a filter the inline path
+/// refuses is refused here too, rather than left for Hasura to reject.
+fn translate_filter_variable(value: &Value, entity_name: &str) -> Result<Value, ConversionError> {
+    let mut unsupported = Vec::new();
+    let translated = translate_filter(value, entity_name, &mut unsupported);
+    match unsupported.into_iter().next() {
+        Some(key) => Err(ConversionError::UnsupportedFilter(key)),
+        None => Ok(translated),
+    }
+}
+
+/// The translation itself. Filters with no Hasura form are passed through
+/// as written and their keys added to `unsupported`.
+fn translate_filter(value: &Value, entity_name: &str, unsupported: &mut Vec<String>) -> Value {
     let obj = match value {
         Value::Object(m) => m,
         _ => return value.clone(),
@@ -3488,19 +3516,19 @@ pub fn translate_subgraph_filter_value(value: &Value, entity_name: &str) -> Valu
     for (key, val) in obj {
         match key.as_str() {
             "and" | "_and" => {
-                for item in translate_filter_array(val, entity_name) {
+                for item in translate_filter_array(val, entity_name, unsupported) {
                     push_and(&mut out, item);
                 }
             }
             "or" | "_or" => {
-                let arr = translate_filter_array(val, entity_name);
+                let arr = translate_filter_array(val, entity_name, unsupported);
                 insert_condition(&mut out, "_or", Value::Array(arr));
             }
             "_not" | "not" => {
-                let inner = translate_subgraph_filter_value(val, entity_name);
+                let inner = translate_filter(val, entity_name, unsupported);
                 insert_condition(&mut out, "_not", inner);
             }
-            _ => translate_leaf_filter(key, val, entity_name, &mut out),
+            _ => translate_leaf_filter(key, val, entity_name, &mut out, unsupported),
         }
     }
     Value::Object(out)
@@ -3533,11 +3561,11 @@ fn push_and(out: &mut serde_json::Map<String, Value>, item: Value) {
     }
 }
 
-fn translate_filter_array(val: &Value, entity_name: &str) -> Vec<Value> {
+fn translate_filter_array(val: &Value, entity_name: &str, unsupported: &mut Vec<String>) -> Vec<Value> {
     val.as_array()
         .map(|a| {
             a.iter()
-                .map(|v| translate_subgraph_filter_value(v, entity_name))
+                .map(|v| translate_filter(v, entity_name, unsupported))
                 .collect()
         })
         .unwrap_or_default()
@@ -3549,26 +3577,40 @@ fn translate_leaf_filter(
     value: &Value,
     entity_name: &str,
     out: &mut serde_json::Map<String, Value>,
+    unsupported: &mut Vec<String>,
 ) {
     // ORDER MATTERS — longest suffixes must be checked first, mirroring the
     // ordering in `convert_basic_filter_to_hasura_condition`. Changes here
     // must be applied to both functions.
 
     if let Some((field, filter)) = string_match_filter(key) {
+        let mut target = field.to_string();
         let condition = match field_kind(entity_name, field) {
             FieldKind::ScalarList if filter.is_list_contains() => op_wrap("_contains", value.clone()),
-            // No Hasura form; pass through like `_containsAny` below.
+            // No Hasura form; refused as on the inline path.
             FieldKind::ScalarList => {
+                unsupported.push(key.to_string());
                 insert_condition(out, key, value.clone());
                 return;
             }
-            FieldKind::Relation => {
-                let mut id_wrapper = serde_json::Map::new();
-                id_wrapper.insert("id".to_string(), like_value(value, filter));
-                Value::Object(id_wrapper)
-            }
+            FieldKind::Relation => match relation_id_column(entity_name, field) {
+                Some(column) => {
+                    target = column;
+                    like_value(value, filter)
+                }
+                // Negated inside the relation, as on the inline path.
+                None => {
+                    let inner = StringMatchFilter {
+                        operator: filter.inner_operator(),
+                        ..filter
+                    };
+                    insert_condition(out, field, id_wrapped(like_value(value, inner)));
+                    return;
+                }
+            },
             FieldKind::Other => like_value(value, filter),
         };
+        let field = target.as_str();
         if filter.negated {
             // Each negation is its own `_not`: `_not: {a, b}` would mean
             // "not (a and b)", where graph-node means "not a and not b".
@@ -3641,9 +3683,10 @@ fn translate_leaf_filter(
         return;
     }
 
-    // Unsupported in the inline path; pass through here so Hasura surfaces a
-    // useful error instead of silently dropping the filter.
+    // Unsupported, as on the inline path; kept in the output rather than
+    // silently dropped.
     if key.ends_with("_containsAny") || key.ends_with("_containsAll") {
+        unsupported.push(key.to_string());
         insert_condition(out, key, value.clone());
         return;
     }
@@ -3675,7 +3718,7 @@ fn translate_leaf_filter(
             let nested_type = schema::get_field_info(entity_name, lookup_key)
                 .and_then(|info| info.nested_type_name)
                 .unwrap_or_else(|| lookup_key.to_string());
-            let translated = translate_subgraph_filter_value(value, &nested_type);
+            let translated = translate_filter(value, &nested_type, unsupported);
             insert_condition(out, target_key, translated);
         } else {
             // Object value on a non-nested field — most commonly an already
@@ -3687,9 +3730,7 @@ fn translate_leaf_filter(
 
     if is_nested {
         // Scalar against a nested entity → ID equality.
-        let mut id_wrapper = serde_json::Map::new();
-        id_wrapper.insert("id".to_string(), op_wrap("_eq", value.clone()));
-        insert_condition(out, target_key, Value::Object(id_wrapper));
+        insert_condition(out, target_key, id_wrapped(op_wrap("_eq", value.clone())));
         return;
     }
 
@@ -3718,12 +3759,17 @@ fn nested_aware_condition(entity_name: &str, field: &str, op: &str, value: &str)
 fn nested_aware_value(entity_name: &str, field: &str, op: &str, value: &Value) -> Value {
     let condition = op_wrap(op, value.clone());
     if schema::is_nested_entity(entity_name, field) {
-        let mut id_wrapper = serde_json::Map::new();
-        id_wrapper.insert("id".to_string(), condition);
-        Value::Object(id_wrapper)
+        id_wrapped(condition)
     } else {
         condition
     }
+}
+
+/// `{id: condition}`: a condition on the id of a related entity.
+fn id_wrapped(condition: Value) -> Value {
+    let mut wrapper = serde_json::Map::new();
+    wrapper.insert("id".to_string(), condition);
+    Value::Object(wrapper)
 }
 
 /// What a filtered field is, for the operators whose Hasura spelling depends on it.
@@ -3745,6 +3791,14 @@ fn field_kind(entity_name: &str, field: &str) -> FieldKind {
     }
 }
 
+/// The `<field>_id` column Envio stores an entity reference in, when the schema
+/// has it. graph-node compares a reference on that stored id, so filtering the
+/// column matches it exactly and skips the join through the relation.
+fn relation_id_column(entity_name: &str, field: &str) -> Option<String> {
+    let column = format!("{}_id", field);
+    schema::get_field_info(entity_name, &column).map(|_| column)
+}
+
 /// graph-node's `field: null` (`is_null`) or `field_not: null` (`!is_null`).
 /// Hasura rejects `_eq: null`, and has no `_is_null` on a relation, so an
 /// entity reference is tested on its `<field>_id` column, or, without one, on
@@ -3753,9 +3807,8 @@ fn null_condition(entity_name: &str, field: &str, is_null: bool) -> String {
     if field_kind(entity_name, field) != FieldKind::Relation {
         return format!("{}: {{_is_null: {}}}", field, is_null);
     }
-    let id_column = format!("{}_id", field);
-    if schema::get_field_info(entity_name, &id_column).is_some() {
-        format!("{}: {{_is_null: {}}}", id_column, is_null)
+    if let Some(column) = relation_id_column(entity_name, field) {
+        format!("{}: {{_is_null: {}}}", column, is_null)
     } else if is_null {
         format!("_not: {{{}: {{}}}}", field)
     } else {
@@ -3775,9 +3828,8 @@ fn insert_null_condition(
         insert_condition(out, field, op_wrap("_is_null", Value::Bool(is_null)));
         return;
     }
-    let id_column = format!("{}_id", field);
-    if schema::get_field_info(entity_name, &id_column).is_some() {
-        insert_condition(out, &id_column, op_wrap("_is_null", Value::Bool(is_null)));
+    if let Some(column) = relation_id_column(entity_name, field) {
+        insert_condition(out, &column, op_wrap("_is_null", Value::Bool(is_null)));
     } else if is_null {
         let mut negated = serde_json::Map::new();
         negated.insert(field.to_string(), empty());
@@ -3849,7 +3901,17 @@ impl StringMatchFilter {
     /// share with Hasura's array `_contains` ("holds every given item"); there
     /// is no case-insensitive or prefix form of it.
     fn is_list_contains(&self) -> bool {
-        self.shape == LikeShape::Contains && self.operator == "_like"
+        self.shape == LikeShape::Contains && !self.suffix.ends_with("_nocase")
+    }
+
+    /// The operator for a match that is negated inside a relation (`_nlike`)
+    /// rather than wrapped in `_not`; the plain operator when not negated.
+    fn inner_operator(&self) -> &'static str {
+        match (self.negated, self.operator) {
+            (true, "_like") => "_nlike",
+            (true, "_ilike") => "_nilike",
+            (_, operator) => operator,
+        }
     }
 }
 
@@ -9999,36 +10061,44 @@ mod tests {
     }
 
     #[test]
-    fn string_match_on_a_relation_goes_through_its_id() {
-        // QuickSwap's `token0_contains_nocase` under two aliases.
+    fn string_match_on_a_relation_reads_its_id_column() {
+        // QuickSwap's `token0_contains_nocase` under two aliases. `Pair.token`
+        // is stored in `token_id`, which graph-node also matches on.
         let query = converted_query(
             "{ pools0: pairs(first: 100, where: {token_contains_nocase: \"0xAB\"}, orderBy: name, orderDirection: desc, subgraphError: allow) { id } pools1: pairs(first: 100, where: {token_not_contains_nocase: \"0xAB\"}, subgraphError: allow) { id } }",
         );
-        assert!(query.contains("where: {token: {id: {_ilike: \"%0xAB%\"}}}"), "{query}");
-        assert!(query.contains("where: {_not: {token: {id: {_ilike: \"%0xAB%\"}}}}"), "{query}");
+        assert!(query.contains("where: {token_id: {_ilike: \"%0xAB%\"}}"), "{query}");
+        // `NOT (token_id ILIKE ...)`, which, as in graph-node, keeps no null references.
+        assert!(query.contains("where: {_not: {token_id: {_ilike: \"%0xAB%\"}}}"), "{query}");
         assert!(!query.contains("token: {_ilike"), "{query}");
     }
 
     #[test]
-    fn every_string_match_form_on_a_relation() {
+    fn string_match_on_a_relation_without_an_id_column_goes_through_the_relation() {
         let query = converted_query(
-            "query { pairs(where: {token_starts_with: \"0x1\", fee_ends_with_nocase: \"ff\"}) { id } }",
+            "query { swaps(where: {tokenIn_starts_with: \"0x1\", sender_ends_with_nocase: \"ff\"}) { id } }",
         );
-        assert!(query.contains("token: {id: {_like: \"0x1%\"}}"), "{query}");
-        assert!(query.contains("fee: {id: {_ilike: \"%ff\"}}"), "{query}");
-        let query = converted_query("query { pairs(where: {token_not_contains: \"0x1\"}) { id } }");
-        assert!(query.contains("where: {_not: {token: {id: {_like: \"%0x1%\"}}}}"), "{query}");
+        assert!(query.contains("tokenIn: {id: {_like: \"0x1%\"}}"), "{query}");
+        assert!(query.contains("sender: {id: {_ilike: \"%ff\"}}"), "{query}");
+        // Negated inside the relation: `_not: {tokenIn: {...}}` would also keep
+        // swaps with no `tokenIn`, which graph-node's `NOT LIKE` does not.
+        let query = converted_query(
+            "query { swaps(where: {tokenIn_not_contains: \"0x1\", sender_not_starts_with_nocase: \"0xA\"}) { id } }",
+        );
+        assert!(query.contains("tokenIn: {id: {_nlike: \"%0x1%\"}}"), "{query}");
+        assert!(query.contains("sender: {id: {_nilike: \"0xA%\"}}"), "{query}");
+        assert!(!query.contains("_not"), "{query}");
     }
 
     #[test]
     fn string_match_on_a_relation_inside_a_relation_filter_and_an_or() {
         let query = converted_query("query { trades(where: {pair_: {token_contains: \"x\"}}) { id } }");
-        assert!(query.contains("where: {pair: {token: {id: {_like: \"%x%\"}}}}"), "{query}");
+        assert!(query.contains("where: {pair: {token_id: {_like: \"%x%\"}}}"), "{query}");
         let query = converted_query(
             "query { pairs(where: {or: [{token_contains: \"a\"}, {name: \"b\"}]}) { id } }",
         );
         assert!(
-            query.contains("_or: [{token: {id: {_like: \"%a%\"}}}, {name: {_eq: \"b\"}}]"),
+            query.contains("_or: [{token_id: {_like: \"%a%\"}}, {name: {_eq: \"b\"}}]"),
             "{query}"
         );
     }
@@ -10042,13 +10112,13 @@ mod tests {
         });
         let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
         let query = result.query["query"].as_str().unwrap();
-        assert!(query.contains("where: {token: {id: {_like: $t__contains}}}"), "{query}");
+        assert!(query.contains("where: {token_id: {_like: $t__contains}}"), "{query}");
         assert!(query.starts_with("query Q($t__contains: String!)"), "{query}");
         assert_eq!(result.query["variables"], json!({"t__contains": "%0xab%"}));
     }
 
     #[test]
-    fn variable_string_match_on_a_relation_goes_through_its_id() {
+    fn variable_string_match_on_a_relation() {
         init_test_schema_if_needed();
         let out = translate_subgraph_filter_value(
             &json!({"token_contains_nocase": "0xab", "token_not_ends_with": "ff", "name_contains": "E"}),
@@ -10057,13 +10127,25 @@ mod tests {
         assert_eq!(
             out,
             json!({
-                "token": {"id": {"_ilike": "%0xab%"}},
-                "_not": {"token": {"id": {"_like": "%ff"}}},
+                "token_id": {"_ilike": "%0xab%"},
+                "_not": {"token_id": {"_like": "%ff"}},
                 "name": {"_like": "%E%"}
             })
         );
         let out = translate_subgraph_filter_value(&json!({"pair_": {"token_starts_with": "0x"}}), "Trade");
-        assert_eq!(out, json!({"pair": {"token": {"id": {"_like": "0x%"}}}}));
+        assert_eq!(out, json!({"pair": {"token_id": {"_like": "0x%"}}}));
+        // Without an id column: through the relation, negated inside it.
+        let out = translate_subgraph_filter_value(
+            &json!({"tokenIn_contains": "0x1", "sender_not_contains_nocase": "0xA"}),
+            "Swap",
+        );
+        assert_eq!(
+            out,
+            json!({
+                "tokenIn": {"id": {"_like": "%0x1%"}},
+                "sender": {"id": {"_nilike": "%0xA%"}}
+            })
+        );
     }
 
     #[test]
@@ -10122,6 +10204,32 @@ mod tests {
         // No Hasura form: passed through for Hasura to reject, like `_containsAny`.
         let out = translate_subgraph_filter_value(&json!({"whitelistPools_contains_nocase": ["0xa"]}), "Token");
         assert_eq!(out, json!({"whitelistPools_contains_nocase": ["0xa"]}));
+    }
+
+    #[test]
+    fn where_variable_refuses_the_filters_the_inline_path_refuses() {
+        init_test_schema_if_needed();
+        for (filter, key) in [
+            (json!({"whitelistPools_contains_nocase": ["0xa"]}), "whitelistPools_contains_nocase"),
+            (json!({"or": [{"name": "a"}, {"whitelistPools_starts_with": ["0xa"]}]}), "whitelistPools_starts_with"),
+            (json!({"name_containsAny": ["a"]}), "name_containsAny"),
+        ] {
+            let payload = json!({
+                "query": "query Q($w: Token_filter) { tokens(where: $w) { id } }",
+                "variables": {"w": filter}
+            });
+            match convert_subgraph_to_hyperindex(&payload, None) {
+                Err(ConversionError::UnsupportedFilter(found)) => assert_eq!(found, key),
+                other => panic!("expected UnsupportedFilter for {key}, got {:?}", other.map(|r| r.query)),
+            }
+        }
+        // A supported one still converts.
+        let payload = json!({
+            "query": "query Q($w: Token_filter) { tokens(where: $w) { id } }",
+            "variables": {"w": {"whitelistPools_contains": ["0xa"]}}
+        });
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        assert_eq!(result.query["variables"]["w"], json!({"whitelistPools": {"_contains": ["0xa"]}}));
     }
 
     #[test]
