@@ -15,6 +15,8 @@ pub enum ConversionError {
     MissingField(String),
     #[error("Unsupported filter: {0}")]
     UnsupportedFilter(String),
+    #[error("Unsupported filter `{0}` for value `null`")]
+    NullFilterValue(String),
     #[error("Nested field `{0}` has arguments that cannot be translated: {1}")]
     UnsupportedNestedArgument(String, String),
     #[error("_meta fields with no Hyperindex equivalent: {0}. Only _meta {{ deployment block {{ number timestamp }} }} can be served (block.timestamp needs an indexer with Hasura's _meta, deployment a HYPERINDEX_URL with a deployment hash), and a partial answer would look like a complete one to the caller")]
@@ -216,7 +218,7 @@ pub fn convert_subgraph_to_hyperindex(
         limit_variables,
         where_defaults,
         required_where_variables,
-    } = convert_query_structure(query, chain_id)?;
+    } = convert_query_structure(query, chain_id, payload.get("variables"))?;
     let defaults = graph_node_defaults();
 
     // Variables are read before any are dropped from the forwarded payload: a
@@ -678,12 +680,13 @@ struct LimitVariable {
 fn convert_query_structure(
     query: &str,
     chain_id: Option<&str>,
+    variables: Option<&Value>,
 ) -> Result<MainConversion, ConversionError> {
     // Extract fragments and main query
     let (fragments, main_query) = extract_fragments_and_main_query(query)?;
 
     // Convert the main query
-    let main = convert_main_query(&main_query, chain_id, &fragments)?;
+    let main = convert_main_query(&main_query, chain_id, &fragments, variables)?;
 
     // Combine fragments with converted main query
     let fragments = main.fragments_override.clone().unwrap_or(fragments);
@@ -1023,6 +1026,7 @@ fn convert_main_query(
     main_query: &str,
     chain_id: Option<&str>,
     fragments_text: &str,
+    variables: Option<&Value>,
 ) -> Result<MainConversion, ConversionError> {
     // Extract query header (name and variable definitions) and body separately
     let (query_header, stripped_query) = if main_query.trim().starts_with("query") {
@@ -1064,11 +1068,13 @@ fn convert_main_query(
     // Build mapping from Hyperindex field names to original query field names
     let mut field_name_map: HashMap<String, String> = HashMap::new();
     // Parse variable declarations once for the whole query.
+    let header_var_types: HashMap<String, String> = query_header
+        .as_deref()
+        .map(parse_variable_declarations)
+        .unwrap_or_default();
     let mut ctx = ArgContext {
-        header_var_types: query_header
-            .as_deref()
-            .map(parse_variable_declarations)
-            .unwrap_or_default(),
+        null_variables: null_variables(&header_var_types, variables),
+        header_var_types,
         defaults: graph_node_defaults(),
         ..ArgContext::default()
     };
@@ -1304,12 +1310,7 @@ fn convert_main_query(
     // `$q` itself goes if nothing else reads it.
     let like_variables = like_variables(&referenced, &ctx.header_var_types);
     for spec in &like_variables {
-        let non_null = ctx.header_var_types[&spec.source]
-            .split('=')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .ends_with('!');
+        let non_null = is_non_null_declaration(&ctx.header_var_types[&spec.source]);
         let ty = if non_null { "String!" } else { "String" };
         ctx.order_by_retypes.insert(spec.target.clone(), ty.to_string());
         ctx.dead_candidates.push(spec.source.clone());
@@ -1332,7 +1333,7 @@ fn convert_main_query(
             continue;
         };
         let ty = declared.split('=').next().unwrap_or_default().trim();
-        if ty.ends_with('!') {
+        if is_non_null_declaration(declared) {
             required_where_variables.insert(var.clone());
         }
         if let Some(default) = declared_default(declared) {
@@ -1350,7 +1351,7 @@ fn convert_main_query(
             Some(LimitVariable {
                 name: name.clone(),
                 default: declared_default(declared),
-                non_null: declared.split('=').next().unwrap_or_default().trim().ends_with('!'),
+                non_null: is_non_null_declaration(declared),
             })
         })
         .collect();
@@ -1534,6 +1535,84 @@ struct ArgContext {
     synth_counter: usize,
     /// graph-node's page size and sort for collections that omit them.
     defaults: GraphNodeDefaults,
+    /// Nullable variables this request leaves null (see `null_variables`).
+    null_variables: HashSet<String>,
+}
+
+/// The declared nullable variables that are null for this request: sent as
+/// `null`, or left out with no default (or a `null` one). graph-node reads such
+/// a variable under a filter as the literal `null`. A non-null variable left
+/// null is an error there and in Hasura alike, so it is not counted.
+fn null_variables(
+    header_var_types: &HashMap<String, String>,
+    variables: Option<&Value>,
+) -> HashSet<String> {
+    header_var_types
+        .iter()
+        .filter(|(_, declared)| !is_non_null_declaration(declared))
+        .filter(|(name, declared)| match variables.and_then(|v| v.get(name.as_str())) {
+            Some(value) => value.is_null(),
+            // A default that does not parse is left to Hasura, as before.
+            None => !declared.contains('=')
+                || declared_default(declared).map_or(false, |d| d.is_null()),
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Whether a declared variable type (`String!`, `[ID!]! = []`) is non-null.
+fn is_non_null_declaration(declared: &str) -> bool {
+    declared.split('=').next().unwrap_or_default().trim().ends_with('!')
+}
+
+/// `text` with each `$var` in `null_vars` written as `null`; the names written
+/// are added to `nulled`. Strings are left alone.
+fn substitute_null_variables(
+    text: &str,
+    null_vars: &HashSet<String>,
+    nulled: &mut HashSet<String>,
+) -> String {
+    if null_vars.is_empty() || !text.contains('$') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_str = false;
+    let mut escape = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        if c != '$' {
+            in_str = c == '"';
+            out.push(c);
+            continue;
+        }
+        let mut name = String::new();
+        while let Some(&next) = chars.peek() {
+            if !(next.is_alphanumeric() || next == '_') {
+                break;
+            }
+            name.push(next);
+            chars.next();
+        }
+        if null_vars.contains(&name) {
+            out.push_str("null");
+            nulled.insert(name);
+        } else {
+            out.push('$');
+            out.push_str(&name);
+        }
+    }
+    out
 }
 
 /// The Hyperindex entity a root field reads, and whether it is a primary-key
@@ -1566,7 +1645,21 @@ fn convert_collection_args(
     let limit = params.get("first").cloned();
     let offset = params.get("skip").cloned();
 
-    let mut converted_params = params.clone();
+    // A variable this request leaves null is read in a filter as the literal
+    // `null`, as graph-node reads it, so the rules for `null` apply to it. One
+    // no longer read anywhere is dropped (see `dead_candidates`).
+    let mut nulled = HashSet::new();
+    let mut converted_params: HashMap<String, String> = params
+        .iter()
+        .map(|(key, value)| {
+            let value = match key.as_str() {
+                "first" | "skip" | "orderBy" | "orderDirection" => value.clone(),
+                _ => substitute_null_variables(value, &ctx.null_variables, &mut nulled),
+            };
+            (key.clone(), value)
+        })
+        .collect();
+    ctx.dead_candidates.extend(nulled);
 
     // Add chainId to params if provided
     if let Some(chain_id) = chain_id {
@@ -3348,6 +3441,11 @@ fn convert_basic_filter_to_hasura_condition(
     // Handle different filter patterns - check longer suffixes first
     if let Some((field, filter)) = string_match_filter(key) {
         let value = value.trim();
+        // graph-node rejects a null pattern; read as text, `null` would match
+        // values containing "null".
+        if value == "null" {
+            return Err(ConversionError::NullFilterValue(key.to_string()));
+        }
         let kind = field_kind(entity_name, field);
         let condition = if kind == FieldKind::ScalarList {
             if !filter.is_list_contains() {
@@ -3496,17 +3594,17 @@ pub fn translate_subgraph_filter_value(value: &Value, entity_name: &str) -> Valu
 /// `translate_subgraph_filter_value` for a request: a filter the inline path
 /// refuses is refused here too, rather than left for Hasura to reject.
 fn translate_filter_variable(value: &Value, entity_name: &str) -> Result<Value, ConversionError> {
-    let mut unsupported = Vec::new();
-    let translated = translate_filter(value, entity_name, &mut unsupported);
-    match unsupported.into_iter().next() {
-        Some(key) => Err(ConversionError::UnsupportedFilter(key)),
+    let mut refused = Vec::new();
+    let translated = translate_filter(value, entity_name, &mut refused);
+    match refused.into_iter().next() {
+        Some(error) => Err(error),
         None => Ok(translated),
     }
 }
 
-/// The translation itself. Filters with no Hasura form are passed through
-/// as written and their keys added to `unsupported`.
-fn translate_filter(value: &Value, entity_name: &str, unsupported: &mut Vec<String>) -> Value {
+/// The translation itself. Filters the inline path refuses are passed through
+/// as written, with the inline path's error added to `refused`.
+fn translate_filter(value: &Value, entity_name: &str, refused: &mut Vec<ConversionError>) -> Value {
     let obj = match value {
         Value::Object(m) => m,
         _ => return value.clone(),
@@ -3516,19 +3614,19 @@ fn translate_filter(value: &Value, entity_name: &str, unsupported: &mut Vec<Stri
     for (key, val) in obj {
         match key.as_str() {
             "and" | "_and" => {
-                for item in translate_filter_array(val, entity_name, unsupported) {
+                for item in translate_filter_array(val, entity_name, refused) {
                     push_and(&mut out, item);
                 }
             }
             "or" | "_or" => {
-                let arr = translate_filter_array(val, entity_name, unsupported);
+                let arr = translate_filter_array(val, entity_name, refused);
                 insert_condition(&mut out, "_or", Value::Array(arr));
             }
             "_not" | "not" => {
-                let inner = translate_filter(val, entity_name, unsupported);
+                let inner = translate_filter(val, entity_name, refused);
                 insert_condition(&mut out, "_not", inner);
             }
-            _ => translate_leaf_filter(key, val, entity_name, &mut out, unsupported),
+            _ => translate_leaf_filter(key, val, entity_name, &mut out, refused),
         }
     }
     Value::Object(out)
@@ -3561,11 +3659,11 @@ fn push_and(out: &mut serde_json::Map<String, Value>, item: Value) {
     }
 }
 
-fn translate_filter_array(val: &Value, entity_name: &str, unsupported: &mut Vec<String>) -> Vec<Value> {
+fn translate_filter_array(val: &Value, entity_name: &str, refused: &mut Vec<ConversionError>) -> Vec<Value> {
     val.as_array()
         .map(|a| {
             a.iter()
-                .map(|v| translate_filter(v, entity_name, unsupported))
+                .map(|v| translate_filter(v, entity_name, refused))
                 .collect()
         })
         .unwrap_or_default()
@@ -3577,19 +3675,22 @@ fn translate_leaf_filter(
     value: &Value,
     entity_name: &str,
     out: &mut serde_json::Map<String, Value>,
-    unsupported: &mut Vec<String>,
+    refused: &mut Vec<ConversionError>,
 ) {
     // ORDER MATTERS — longest suffixes must be checked first, mirroring the
     // ordering in `convert_basic_filter_to_hasura_condition`. Changes here
     // must be applied to both functions.
 
     if let Some((field, filter)) = string_match_filter(key) {
+        if value.is_null() {
+            refused.push(ConversionError::NullFilterValue(key.to_string()));
+        }
         let mut target = field.to_string();
         let condition = match field_kind(entity_name, field) {
             FieldKind::ScalarList if filter.is_list_contains() => op_wrap("_contains", value.clone()),
             // No Hasura form; refused as on the inline path.
             FieldKind::ScalarList => {
-                unsupported.push(key.to_string());
+                refused.push(ConversionError::UnsupportedFilter(key.to_string()));
                 insert_condition(out, key, value.clone());
                 return;
             }
@@ -3686,7 +3787,7 @@ fn translate_leaf_filter(
     // Unsupported, as on the inline path; kept in the output rather than
     // silently dropped.
     if key.ends_with("_containsAny") || key.ends_with("_containsAll") {
-        unsupported.push(key.to_string());
+        refused.push(ConversionError::UnsupportedFilter(key.to_string()));
         insert_condition(out, key, value.clone());
         return;
     }
@@ -3718,7 +3819,7 @@ fn translate_leaf_filter(
             let nested_type = schema::get_field_info(entity_name, lookup_key)
                 .and_then(|info| info.nested_type_name)
                 .unwrap_or_else(|| lookup_key.to_string());
-            let translated = translate_filter(value, &nested_type, unsupported);
+            let translated = translate_filter(value, &nested_type, refused);
             insert_condition(out, target_key, translated);
         } else {
             // Object value on a non-nested field — most commonly an already
@@ -9669,14 +9770,19 @@ mod tests {
     }
 
     #[test]
-    fn null_pattern_variable_is_left_unset() {
+    fn null_pattern_variable_is_refused() {
+        // graph-node refuses a null pattern, as for a literal `null`.
         init_test_schema_if_needed();
-        let payload = json!({
-            "query": "query Q($q: String) { pairs(where: {name_contains: $q}) { id } }",
-            "variables": {"q": null}
-        });
-        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
-        assert_eq!(result.query["variables"], json!({}));
+        for variables in [json!({"q": null}), json!({})] {
+            let payload = json!({
+                "query": "query Q($q: String) { pairs(where: {name_contains: $q}) { id } }",
+                "variables": variables
+            });
+            match convert_subgraph_to_hyperindex(&payload, None) {
+                Err(ConversionError::NullFilterValue(key)) => assert_eq!(key, "name_contains"),
+                other => panic!("expected NullFilterValue, got {:?}", other.map(|r| r.query)),
+            }
+        }
     }
 
     #[test]
@@ -10264,5 +10370,167 @@ mod tests {
         );
         let out = translate_subgraph_filter_value(&json!({"tokenIn": null, "sender_not": null}), "Swap");
         assert_eq!(out, json!({"_not": {"tokenIn": {}}, "sender": {}}));
+    }
+
+    // ── Null and unset filter variables ─────────────────────────────────────
+
+    /// The converted query text and forwarded variables for a request.
+    fn convert_request(query: &str, variables: Value) -> (String, Value) {
+        init_test_schema_if_needed();
+        let payload = json!({"query": query, "variables": variables});
+        let result = convert_subgraph_to_hyperindex(&payload, None).unwrap();
+        (
+            result.query["query"].as_str().unwrap().to_string(),
+            result.query["variables"].clone(),
+        )
+    }
+
+    #[test]
+    fn null_or_unset_variable_under_equality_tests_for_null() {
+        // graph-node reads both as `name: null`.
+        for variables in [json!({"n": null}), json!({})] {
+            let (query, sent) =
+                convert_request("query Q($n: String) { tokens(where: {name: $n}) { id } }", variables);
+            assert!(query.contains("where: {name: {_is_null: true}}"), "{query}");
+            // Nothing reads `$n` any more, so it is neither declared nor sent.
+            assert!(!query.contains("$n"), "{query}");
+            assert_eq!(sent, json!({}));
+        }
+        let (query, _) =
+            convert_request("query Q($n: String) { tokens(where: {name_not: $n}) { id } }", json!({}));
+        assert!(query.contains("where: {name: {_is_null: false}}"), "{query}");
+    }
+
+    #[test]
+    fn null_variable_on_a_relation_tests_the_reference() {
+        let (query, _) =
+            convert_request("query Q($t: String) { pairs(where: {token: $t}) { id } }", json!({}));
+        assert!(query.contains("where: {token_id: {_is_null: true}}"), "{query}");
+        let (query, _) = convert_request(
+            "query Q($t: String) { swaps(where: {tokenIn: $t}) { id } }",
+            json!({"t": null}),
+        );
+        assert!(query.contains("where: {_not: {tokenIn: {}}}"), "{query}");
+    }
+
+    #[test]
+    fn declared_defaults_and_non_null_variables() {
+        // Left out with a default: the default is the value, as before.
+        let (query, sent) = convert_request(
+            "query Q($n: String = \"W\") { tokens(where: {name: $n}) { id } }",
+            json!({}),
+        );
+        assert!(query.contains("name: {_eq: $n}"), "{query}");
+        assert!(query.contains("$n: String = \"W\""), "{query}");
+        assert_eq!(sent, json!({}));
+        // An explicit null overrides the default.
+        let (query, _) = convert_request(
+            "query Q($n: String = \"W\") { tokens(where: {name: $n}) { id } }",
+            json!({"n": null}),
+        );
+        assert!(query.contains("name: {_is_null: true}"), "{query}");
+        // A `null` default.
+        let (query, _) = convert_request(
+            "query Q($n: String = null) { tokens(where: {name: $n}) { id } }",
+            json!({}),
+        );
+        assert!(query.contains("name: {_is_null: true}"), "{query}");
+        // Non-null and left out is an error in graph-node and Hasura alike.
+        let (query, _) =
+            convert_request("query Q($n: String!) { tokens(where: {name: $n}) { id } }", json!({}));
+        assert!(query.contains("name: {_eq: $n}"), "{query}");
+        // A value: unchanged.
+        let (query, sent) =
+            convert_request("query Q($n: String) { tokens(where: {name: $n}) { id } }", json!({"n": "W"}));
+        assert!(query.contains("name: {_eq: $n}"), "{query}");
+        assert_eq!(sent, json!({"n": "W"}));
+    }
+
+    #[test]
+    fn null_variable_still_read_elsewhere_is_kept() {
+        // `first: $n` still reads it (null there is graph-node's default page).
+        let (query, sent) = convert_request(
+            "query Q($n: Int) { tokens(first: $n, where: {amount: $n}) { id } }",
+            json!({"n": null}),
+        );
+        assert!(query.contains("limit: $n"), "{query}");
+        assert!(query.contains("where: {amount: {_is_null: true}}"), "{query}");
+        assert!(query.starts_with("query Q($n: Int)"), "{query}");
+        assert_eq!(sent, json!({"n": 100}));
+    }
+
+    #[test]
+    fn null_variable_under_other_operators_reads_as_null() {
+        // graph-node rejects `amount_gt: null` and `_in: null`; so does Hasura.
+        let (query, sent) = convert_request(
+            "query Q($n: BigInt) { tokens(where: {amount: $n, amount_gt: $n, name_in: $n}) { id } }",
+            json!({"n": null}),
+        );
+        assert!(query.contains("{amount: {_is_null: true}}"), "{query}");
+        assert!(query.contains("{amount: {_gt: null}}"), "{query}");
+        assert!(query.contains("name: {_in: null}"), "{query}");
+        assert!(!query.contains("$n"), "{query}");
+        assert_eq!(sent, json!({}));
+    }
+
+    #[test]
+    fn substitution_leaves_strings_and_other_variables_alone() {
+        let null_vars: HashSet<String> = ["n".to_string()].into();
+        let mut nulled = HashSet::new();
+        let out = substitute_null_variables(
+            "{name: $n, symbol: \"$n\", alias: \"a\\\"$n\", label: $name, x: [$n]}",
+            &null_vars,
+            &mut nulled,
+        );
+        assert_eq!(out, "{name: null, symbol: \"$n\", alias: \"a\\\"$n\", label: $name, x: [null]}");
+        assert_eq!(nulled, null_vars);
+    }
+
+    #[test]
+    fn null_variable_in_relation_filters_or_items_and_nested_lists() {
+        let (query, _) =
+            convert_request("query Q($n: String) { trades(where: {pair_: {name: $n}}) { id } }", json!({}));
+        assert!(query.contains("where: {pair: {name: {_is_null: true}}}"), "{query}");
+        let (query, _) = convert_request(
+            "query Q($n: String) { pairs(where: {or: [{name: $n}, {name: \"b\"}]}) { id } }",
+            json!({}),
+        );
+        assert!(query.contains("_or: [{name: {_is_null: true}}, {name: {_eq: \"b\"}}]"), "{query}");
+        let (query, _) = convert_request(
+            "query Q($n: String) { swapUsers { swap(where: {trader: $n}) { id } } }",
+            json!({}),
+        );
+        assert!(query.contains("trader: {_is_null: true}"), "{query}");
+        assert!(!query.contains("$n"), "{query}");
+    }
+
+    #[test]
+    fn where_variable_refuses_a_null_pattern_as_the_inline_path_does() {
+        init_test_schema_if_needed();
+        for filter in [json!({"name_contains": null}), json!({"or": [{"name_starts_with_nocase": null}]})] {
+            let payload = json!({
+                "query": "query Q($w: Token_filter) { tokens(where: $w) { id } }",
+                "variables": {"w": filter}
+            });
+            match convert_subgraph_to_hyperindex(&payload, None) {
+                Err(ConversionError::NullFilterValue(_)) => {}
+                other => panic!("expected NullFilterValue, got {:?}", other.map(|r| r.query)),
+            }
+        }
+    }
+
+    #[test]
+    fn null_string_match_pattern_is_refused() {
+        init_test_schema_if_needed();
+        for key in ["name_contains", "name_not_starts_with_nocase"] {
+            let payload = create_test_payload(&format!("query {{ tokens(where: {{{key}: null}}) {{ id }} }}"));
+            match convert_subgraph_to_hyperindex(&payload, None) {
+                Err(ConversionError::NullFilterValue(found)) => assert_eq!(found, key),
+                other => panic!("expected NullFilterValue for {key}, got {:?}", other.map(|r| r.query)),
+            }
+        }
+        // The text "null" is still a pattern.
+        let query = converted_query("query { tokens(where: {name_contains: \"null\"}) { id } }");
+        assert!(query.contains("name: {_like: \"%null%\"}"), "{query}");
     }
 }

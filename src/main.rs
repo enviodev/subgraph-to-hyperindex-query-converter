@@ -426,6 +426,8 @@ fn conversion_error_reasoning(e: &conversion::ConversionError) -> &'static str {
             "The request body's 'query' field must be a string.",
         conversion::ConversionError::UnsupportedFilter(_filter) =>
             "This filter is not currently supported by the converter. Consider a supported equivalent or remove it.",
+        conversion::ConversionError::NullFilterValue(_) =>
+            "graph-node rejects null for a string filter (_contains, _starts_with, _ends_with and their _not_/_nocase forms). Pass a string, or leave the filter out.",
         conversion::ConversionError::UnsupportedNestedArgument(_, _) =>
             "graph-node takes only first, skip, orderBy, orderDirection and where on a nested field. Anything else is rejected rather than converted or dropped, because the answer would not be to the question that was asked.",
         conversion::ConversionError::ComplexMetaQuery(_) =>
