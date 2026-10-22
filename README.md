@@ -134,9 +134,15 @@ query {
 | `field_ends_with: val` | `field: { _like: "%val" }` |
 | `field_contains_nocase: val` (and the other `_nocase` forms) | `field: { _ilike: "%val%" }` |
 | `field_not_contains: val` (and the other `_not_` forms) | `_not: { field: { _like: "%val%" } }` |
+| `ref_contains: val` (any string filter on an entity reference) | `ref: { id: { _like: "%val%" } }` |
+| `list_contains: [...]` / `list_not_contains: [...]` | `list: { _contains: [...] }` / `_not: { list: { _contains: [...] } }` |
+| `field: null` / `field_not: null` | `field: { _is_null: true }` / `field: { _is_null: false }` |
+| `ref: null` / `ref_not: null` | `ref_id: { _is_null: true }` / `ref_id: { _is_null: false }` |
 | `and: [{...}, {...}]` / `or: [...]` | `_and: [...]` / `_or: [...]` |
 
 The plain string forms are case-sensitive, as in graph-node; only `_nocase` ignores case. Patterns are built exactly as graph-node builds them: `%` and `_` in a value are not escaped, so they act as wildcards, and `_contains` leaves a value that already starts or ends with `%` as it is.
+
+On a list field, `_contains` is array containment (the list holds every given item), as in graph-node; the `_nocase`, `_starts_with` and `_ends_with` forms have no Hasura equivalent there and are refused. An entity reference without an `<field>_id` column is tested for null on whether the related row exists.
 
 A string filter given a variable (`name_contains: $q`) reads a pattern variable, `$q__contains`, whose value is built from `$q`'s at request time; `$q` is dropped if nothing else uses it. Several conditions on one field (`amount_gt` and `amount_lt`) are all kept, inline or in a `where` variable, and each `_not_*` filter negates only its own condition.
 
