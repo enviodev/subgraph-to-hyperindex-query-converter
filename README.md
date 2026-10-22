@@ -142,6 +142,8 @@ query {
 
 The plain string forms are case-sensitive, as in graph-node; only `_nocase` ignores case. Patterns are built exactly as graph-node builds them: `%` and `_` in a value are not escaped, so they act as wildcards, and `_contains` leaves a value that already starts or ends with `%` as it is.
 
+A filter variable that is null for the request, sent as `null` or left out with no default, is read as a literal `null`, as graph-node reads it: under `field: $v` and `field_not: $v` it becomes the null test above, and `$v` is dropped if nothing else uses it. A declared default (`$v: String = "x"`) is used when the variable is left out. Other operators reject null, as in graph-node: a literal `null` under a string filter (`name_contains: null`) is refused, and a null variable under one, or under `_gt`, `_in` and the like, is passed on for Hasura to reject.
+
 A string filter or null test on an entity reference reads the reference's stored id, the `<field>_id` column, as graph-node does. Without that column it goes through the relation: `ref: { id: { _like: ... } }`, with the `_not_` forms negated inside it (`_nlike`, `_nilike`) so that rows with no reference are not matched, and a null test checks whether the related row exists.
 
 On a list field, `_contains` is array containment (the list holds every given item), as in graph-node; the `_nocase`, `_starts_with` and `_ends_with` forms have no Hasura equivalent there and are refused, inline or in a `where` variable, as are `_containsAny` and `_containsAll`.
